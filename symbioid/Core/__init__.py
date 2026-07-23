@@ -41,6 +41,7 @@ from symbioid.Core.formation import (
     complete_follows_set,
     complete_formation,
     complete_integrate_set,
+    console_emit_enabled,
     digital_root,
     emit_six_set,
     ensure_sensor_thought,
@@ -50,6 +51,7 @@ from symbioid.Core.formation import (
     rodin_halve,
     rodin_halve_sequence,
     rodin_sequence,
+    set_console_emit,
     six_set_labels,
     six_set_poles,
 )
@@ -96,4 +98,6 @@ __all__ = [
     "six_set_poles",
     "format_six_set_line",
     "emit_six_set",
+    "set_console_emit",
+    "console_emit_enabled",
 ]

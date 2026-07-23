@@ -61,6 +61,10 @@ class Innerface(Process):
     integrate_count: int = field(default=0, init=False, repr=False)
     depth_fold_count: int = field(default=0, init=False, repr=False)
     integrate_blocked_cross_channel: int = field(default=0, init=False, repr=False)
+    # Thoughts removed after being superseded by Integrate / depth-fold
+    thoughts_pruned: int = field(default=0, init=False, repr=False)
+    # Auto-GC after integrate (can disable for debugging)
+    auto_prune: bool = True
 
     def process(self) -> Optional[threading.Thread]:
         thread = super().process()
@@ -328,12 +332,138 @@ class Innerface(Process):
         emit_kind = "depth" if depth_fold else "integrate"
         self._emit_completed_set(emit_kind, store)
 
+        # Drop scaffolding from six-sets no longer active (now integrated)
+        if self.auto_prune:
+            self.prune_inactive_thoughts()
+
         # Notify Outerface that active integrates changed (H3 harvest)
         if host is not None and host.outerface is not None:
             host.outerface.post({"kind": "active_integrates_changed"})
 
         # Depth plateau is applied at end of batch / accept (not mid-stream)
         return store
+
+    def _store_for_set_id(self, set_id: str) -> Optional[dict[str, Thought]]:
+        with self._local_lock:
+            if set_id in self.completed_formations:
+                return self.completed_formations[set_id]
+            if set_id in self.completed_syncs:
+                return self.completed_syncs[set_id]
+            if set_id in self.completed_integrates:
+                return self.completed_integrates[set_id]
+        return None
+
+    def _protected_thought_ids(self) -> set[str]:
+        """
+        Thoughts that must not be GC'd: seeds, laws, awareness, active six-sets,
+        live sensor/actuator poles, last observations, Outerface beliefs.
+        """
+        host = self.host
+        protected: set[str] = set()
+        if host is None:
+            return protected
+
+        with host.graph_lock:
+            twin = host.twin_seed_thoughts()
+            if twin:
+                protected.update(twin.keys())
+            if getattr(host, "agent", None) is not None:
+                protected.add(host.agent.id)
+            if getattr(host, "system", None) is not None:
+                protected.add(host.system.id)
+            if getattr(host, "environment", None) is not None:
+                protected.add(host.environment.id)
+            for law in getattr(host, "laws", None) or []:
+                link = law.link
+                protected.add(link.id)
+                protected.add(link.source.id)
+                protected.add(link.link_type.id)
+                protected.add(link.target.id)
+            for store in (host.awareness_sets or {}).values():
+                protected.update(store.keys())
+            # Stable sensor / actuator grounding poles
+            for sen in host.sensors:
+                protected.add(f"{host.id}:sensor:{sen.id}")
+            for act in host.actuators:
+                protected.add(f"{host.id}:actuator:{act.id}")
+                protected.add(f"{host.id}:sensor:{act.id}")  # awareness may use same pattern
+
+        with self._local_lock:
+            # All thoughts still in an *active* six-set
+            for sid in list(self.active_ids.keys()):
+                store = (
+                    self.completed_formations.get(sid)
+                    or self.completed_syncs.get(sid)
+                    or self.completed_integrates.get(sid)
+                )
+                if store:
+                    protected.update(store.keys())
+            # Latest observation poles (may feed next temporal integrate)
+            for obs in self._last_obs_by_sensor.values():
+                protected.add(obs.id)
+
+        # Outerface beliefs remain live expectations
+        of = getattr(host, "outerface", None)
+        if of is not None:
+            with of._local_lock:
+                for store in (getattr(of, "beliefs", None) or {}).values():
+                    if isinstance(store, dict):
+                        protected.update(store.keys())
+                for bid in getattr(of, "active_belief_ids", None) or set():
+                    store = (getattr(of, "beliefs", None) or {}).get(bid)
+                    if isinstance(store, dict):
+                        protected.update(store.keys())
+
+        return protected
+
+    def prune_inactive_thoughts(self) -> int:
+        """
+        Remove host Thoughts that belonged only to *inactive* six-sets after
+        those sets were properly Integrated / depth-folded.
+
+        Keeps: twin seed, constitution, awareness terminators, sensor poles,
+        observations still poles of active integrates, Outerface beliefs,
+        and any Thought still referenced by an active six-set.
+
+        Returns number of Thoughts removed from ``host.thoughts``.
+        """
+        host = self.host
+        if host is None:
+            return 0
+
+        protected = self._protected_thought_ids()
+
+        # Candidates: thoughts that appear in at least one *inactive* completed set
+        inactive_ids: set[str] = set()
+        with self._local_lock:
+            active = set(self.active_ids.keys())
+            for sid, store in (
+                list(self.completed_formations.items())
+                + list(self.completed_syncs.items())
+                + list(self.completed_integrates.items())
+            ):
+                if sid in active:
+                    continue
+                inactive_ids.update(store.keys())
+
+        removable = inactive_ids - protected
+        if not removable:
+            return 0
+
+        removed = 0
+        with host.graph_lock:
+            for tid in removable:
+                if tid in host.thoughts:
+                    del host.thoughts[tid]
+                    removed += 1
+
+        if removed:
+            with self._local_lock:
+                self.thoughts_pruned += removed
+        # Archives (completed_formations / syncs / integrates) keep metadata for
+        # ticks/stats; live graph is host.thoughts only.
+
+        return removed
 
     def maybe_depth_fold(self, *, with_labels: bool = True) -> int:
         """

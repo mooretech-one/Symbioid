@@ -4,7 +4,7 @@ Personal **experimentation sandbox** for Antelligence / Symbioid architecture id
 
 | | |
 |--|--|
-| **Path** | `~/Desktop/Areas/Personal/symbioid` |
+| **Path** | `~/Desktop/Areas/Personal/Symbioid` |
 | **Python** | **3.12** via local **`.venv`** (required on this Ubuntu tower — PEP 668) |
 | **Sibling PoC** | `~/Desktop/Areas/Personal/antelligence-poc` (runnable PR-0…PR-3 simulator) |
 | **Design** | `~/Desktop/Grok/Work-Log/2026-07-22-design-antelligence-python-poc.md` |
@@ -15,7 +15,7 @@ This repo is a **scratch lab**, not a replacement for `antelligence-poc`. Promot
 ## Setup (once)
 
 ```bash
-cd ~/Desktop/Areas/Personal/symbioid
+cd ~/Desktop/Areas/Personal/Symbioid
 python3 -m venv .venv          # already created if you used the setup pass
 .venv/bin/pip install -U pip
 # optional while experimenting:
@@ -25,7 +25,7 @@ python3 -m venv .venv          # already created if you used the setup pass
 ## Everyday use
 
 ```bash
-cd ~/Desktop/Areas/Personal/symbioid
+cd ~/Desktop/Areas/Personal/Symbioid
 source .venv/bin/activate      # or always prefix with .venv/bin/
 python -V                      # should be the venv 3.12.x
 ```
@@ -145,15 +145,99 @@ Six-Thought self-description (labels optional): System, Environment, ExistsIn,
 SystemExistsInEnvironment, ExistsAround, EnvironmentExistsAroundSystem.
 
 ```bash
-cd ~/Desktop/Areas/Personal/symbioid
+cd ~/Desktop/Areas/Personal/Symbioid
 source .venv/bin/activate
 # optional: .venv/bin/pip install pytest pygame
 PYTHONPATH=. python main.py          # sin/cos hand feedback
 PYTHONPATH=. python pong_demo.py     # Pong: Symbioid drives both paddles
 PYTHONPATH=. python tetris_demo.py   # Tetris: placement learner (feature weights)
+PYTHONPATH=. python pong_demo.py --verbose    # six-set / event console dumps
+PYTHONPATH=. python tetris_demo.py --verbose
 PYTHONPATH=. python -c "from symbioid import Symbioid; print(Symbioid())"
 PYTHONPATH=. python -m pytest -q
 ```
+
+Console dumps are **off by default** (`set_console_emit(False)`). Pass `--verbose` / `-v` for formation and coach logs. HUDs always show a live **Thoughts** count (Tetris also splits active vs inactive and plots them over 1024 turns).
+
+## Demo interface configurations (Sensors / Actuators)
+
+Both demos build a `Symbioid` host, attach `Sensor.transfer` callables that read a physics `world`, sample on a fixed frame cadence, and hand off formations to Interface → Innerface. Game policies (paddle intercept / Tetris coach) write **actuator outputs**; the world is stepped from those values (or mirrored bytes). Each `add_sensor` / `add_actuator` also installs **awareness** six-sets (`Agent Has …`) as integration terminators.
+
+Shared face settings in both demos:
+
+| Setting | Value | Effect |
+|---------|--------|--------|
+| `interface.continuous_inputs` | `False` | Sample only when the demo calls `sample_into_symbioid` |
+| `outerface.wait_for_feedback` | `False` | Do not block the face loop on Feedback |
+| Sample cadence | every **4** frames | One formation batch per sample tick |
+
+### Pong (`pong_demo.py`)
+
+Host label: `pong-learner`. Policy: `DualPaddleCoach` (intercept + LMS) writes paddle Y; Symbioid sensors track ball and tracking error.
+
+**Sensors (4)**
+
+| Label | Transfer (from `PongWorld`) | Range / notes |
+|-------|----------------------------|---------------|
+| `ball_y` | `world.ball_y` | ≈ [−1, 1] playfield Y |
+| `ball_vy` | `world.ball_vy * 20` | scaled vertical velocity (readability) |
+| `left_err` | `ball_y − left_y` | left paddle tracking error |
+| `right_err` | `ball_y − right_y` | right paddle tracking error |
+
+**Actuators (2)**
+
+| Label | Initial `output` | `output_step` | Role |
+|-------|------------------|---------------|------|
+| `left` | `0.0` | `0.02` | Left paddle Y in [−1, 1] |
+| `right` | `0.0` | `0.02` | Right paddle Y in [−1, 1] |
+
+**Loop**
+
+```text
+PongWorld ──sensor_world()──► Sensor.transfer ──sample──► Interface → Innerface
+    ▲
+    │  set_paddles(left.output, right.output)
+DualPaddleCoach.control ──writes──► actuators left / right
+```
+
+Sample world map includes actuator values (`w["left"]`, `w["right"]`) so transfers and future feedback can close the loop. Learning of intercept (bias, gain, `vy_trust`) lives in `symbioid/world/paddle_learn.py`, not in Outerface action selection.
+
+### Tetris (`tetris_demo.py`)
+
+Host label: `tetris-byte-learner`. Policy: `TetrisCoach` discovers a secret byte→command map, then places pieces (1-ply sim + learned board value). Control is a **single normalized byte**; the world cipher maps only a few of 0–255 to left/right/rotate/hard.
+
+**Sensors (9)**
+
+| Label | Transfer (from `TetrisWorld`) | Scaling |
+|-------|------------------------------|---------|
+| `max_height` | tallest column | `/ rows` → ~[0, 1] |
+| `agg_height` | sum of column heights | `/ (rows × cols)` → ~[0, 1] |
+| `mean_height` | mean column height | `/ rows` → ~[0, 1] |
+| `height_range` | max − min column height | `/ rows` → ~[0, 1] |
+| `holes` | enclosed empty cells | `min(1, holes/20)` |
+| `bumpiness` | Σ \|Δheight\| between neighbors | `min(1, bump/30)` |
+| `lines` | lines cleared this game | `min(1, lines/50)` |
+| `piece_id` | active piece kind | index in I…L `/ 6` → [0, 1] |
+| `last_byte` | last control byte applied | `last_byte / 255` → [0, 1] |
+
+**Actuators (1)**
+
+| Label | Initial `output` | `output_step` | Role |
+|-------|------------------|---------------|------|
+| `byte` | `0.0` | `1/255` | Command register ∈ [0, 1]; maps to integer byte via `× 255` |
+
+**Loop**
+
+```text
+TetrisWorld ──sensor_world()──► Sensor.transfer ──sample──► Interface → Innerface
+     ▲
+     │  step_byte(code)          cipher: few live bytes → left|right|rotate|hard
+TetrisCoach.tick ──writes──► actuator "byte".output = code/255
+```
+
+The coach does **not** use `Actuator.request_fire` for moves; it writes the byte channel and steps the world directly. Symbioid still forms Thoughts/Beliefs from board sensors. Placement search uses world physics (`simulate_placement`) scored by a height-shaped + learned evaluator; the secret control map is learned from observation only (never from reading `cipher`).
+
+**UI extras (Tetris):** 5 s pause after top-out for Innerface catch-up; dual plots of **Active** vs **Inactive** Thought counts over a 1024-turn window; highscores sorted best-first (`#ddd ssssss`).
 
 ## Single-file executables (Pong + Tetris)
 
@@ -168,7 +252,7 @@ Package each demo with **PyInstaller** into one binary per OS/arch (no Python in
 ### Build on this machine
 
 ```bash
-cd ~/Desktop/Areas/Personal/symbioid
+cd ~/Desktop/Areas/Personal/Symbioid
 source .venv/bin/activate
 pip install -r requirements-build.txt   # pygame + pyinstaller
 python build_demos.py                   # both demos, onefile + console

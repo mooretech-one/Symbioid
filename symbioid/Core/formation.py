@@ -518,6 +518,22 @@ def format_six_set_line(kind: str, store: dict[str, Thought], *, index: Optional
     return f"{title}: {body}"
 
 
+# Console six-set / belief spam (demos default this off; --verbose turns it on).
+_console_emit: bool = True
+
+
+def set_console_emit(enabled: bool) -> None:
+    """Enable/disable process-loop console dumps (six-sets, belief confirm/challenge)."""
+    global _console_emit
+    _console_emit = bool(enabled)
+
+
+def console_emit_enabled() -> bool:
+    return _console_emit
+
+
 def emit_six_set(kind: str, store: dict[str, Thought], *, index: Optional[int] = None) -> None:
     """Print a six-set at the moment it is completed (only process-loop output)."""
+    if not _console_emit:
+        return
     print(format_six_set_line(kind, store, index=index), flush=True)

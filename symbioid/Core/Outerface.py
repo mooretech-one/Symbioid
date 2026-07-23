@@ -19,6 +19,7 @@ from symbioid.Core.Process import Process
 from symbioid.Core.Thought import Thought
 from symbioid.Core.formation import (
     complete_belief_set,
+    console_emit_enabled,
     emit_six_set,
     six_set_poles,
 )
@@ -359,29 +360,32 @@ class Outerface(Process):
             if err_pred <= tol:
                 with self._local_lock:
                     self.belief_confirms += 1
-                print(
-                    f"[confirm] Feedback[{sensor_label}] expected {predicted_reading:.4f} "
-                    f"got {act_val:.4f} (err={err_pred:.4f})",
-                    flush=True,
-                )
+                if console_emit_enabled():
+                    print(
+                        f"[confirm] Feedback[{sensor_label}] expected {predicted_reading:.4f} "
+                        f"got {act_val:.4f} (err={err_pred:.4f})",
+                        flush=True,
+                    )
                 return "confirm"
             # Stale: actual closer to pre-fire prior than to post-fire prediction
             if prior_reading is not None and abs(act_val - prior_reading) + 1e-12 < err_pred:
                 with self._local_lock:
                     self.belief_stale_skips += 1
-                print(
-                    f"[stale] Feedback[{sensor_label}] got {act_val:.4f} "
-                    f"(prior {prior_reading:.4f}; predicted {predicted_reading:.4f}) — keep prediction",
-                    flush=True,
-                )
+                if console_emit_enabled():
+                    print(
+                        f"[stale] Feedback[{sensor_label}] got {act_val:.4f} "
+                        f"(prior {prior_reading:.4f}; predicted {predicted_reading:.4f}) — keep prediction",
+                        flush=True,
+                    )
                 return "stale"
             with self._local_lock:
                 self.belief_challenges += 1
-            print(
-                f"[challenge] Feedback[{sensor_label}] expected {predicted_reading:.4f} "
-                f"got {act_val:.4f} (err={err_pred:.4f}) → correct expectation",
-                flush=True,
-            )
+            if console_emit_enabled():
+                print(
+                    f"[challenge] Feedback[{sensor_label}] expected {predicted_reading:.4f} "
+                    f"got {act_val:.4f} (err={err_pred:.4f}) → correct expectation",
+                    flush=True,
+                )
             return "challenge"
 
         # No prediction: compare to current Belief expectation
@@ -393,19 +397,21 @@ class Outerface(Process):
         if err <= tol:
             with self._local_lock:
                 self.belief_confirms += 1
-            print(
-                f"[confirm] Feedback[{sensor_label}] expected {exp_val:.4f} "
-                f"got {act_val:.4f} (err={err:.4f})",
-                flush=True,
-            )
+            if console_emit_enabled():
+                print(
+                    f"[confirm] Feedback[{sensor_label}] expected {exp_val:.4f} "
+                    f"got {act_val:.4f} (err={err:.4f})",
+                    flush=True,
+                )
             return "confirm"
         with self._local_lock:
             self.belief_challenges += 1
-        print(
-            f"[challenge] Feedback[{sensor_label}] expected {exp_val:.4f} "
-            f"got {act_val:.4f} (err={err:.4f}) → correct expectation",
-            flush=True,
-        )
+        if console_emit_enabled():
+            print(
+                f"[challenge] Feedback[{sensor_label}] expected {exp_val:.4f} "
+                f"got {act_val:.4f} (err={err:.4f}) → correct expectation",
+                flush=True,
+            )
         return "challenge"
 
     def _update_belief_expectation(

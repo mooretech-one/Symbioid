@@ -9,13 +9,18 @@ the cipher table; it must discover which bytes do what by watching the world.
 Drop quality is also learned from **real locks only** (no simulate_placement
 oracle for scoring). Highscores track (game #, score) across top-outs.
 
+Console: quiet by default; pass ``--verbose`` for six-set / event dumps.
+On-screen: live Thought count always shown.
+
 Quit: Esc.  R restarts after top-out (also auto-restarts).
 
   PYTHONPATH=. .venv/bin/python tetris_demo.py
+  PYTHONPATH=. .venv/bin/python tetris_demo.py --verbose
 """
 
 from __future__ import annotations
 
+import argparse
 import sys
 
 try:
@@ -24,7 +29,7 @@ except ImportError:
     print("pygame required:  .venv/bin/pip install pygame", file=sys.stderr)
     sys.exit(1)
 
-from symbioid import Symbioid, format_six_set_line
+from symbioid import Symbioid, format_six_set_line, set_console_emit
 from symbioid.world.tetris import (
     ActionCipher,
     PIECE_COLORS,
@@ -39,11 +44,70 @@ CELL = 28
 COLS, ROWS = 10, 20
 BOARD_W, BOARD_H = COLS * CELL, ROWS * CELL
 SIDE = 280
-W, H = BOARD_W + SIDE + 40, BOARD_H + 40
+# Plots under the board: Active / Inactive Thoughts vs game turns
+PLOT_H = 100  # height per plot panel
+PLOT_GAP = 8
+PLOT_MARGIN = 12
+PLOT_HISTORY = 1024  # game turns (piece locks) on the x-axis window
+MARGIN_X = 20
+MARGIN_Y = 20
+FOOTER_H = 28
+W = BOARD_W + SIDE + MARGIN_X * 2 + 24
+H = (
+    MARGIN_Y
+    + BOARD_H
+    + PLOT_MARGIN
+    + PLOT_H
+    + PLOT_GAP
+    + PLOT_H
+    + FOOTER_H
+    + MARGIN_Y
+)
 FPS = 30
 CMD_EVERY = 2
 GRAVITY_INTERVAL = 18
-RESTART_DELAY_FRAMES = FPS * 2
+# Pause after top-out so Innerface formations can catch up before next game
+RESTART_DELAY_FRAMES = FPS * 1
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Symbioid Tetris learning demo")
+    p.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        default=False,
+        help="Enable console dumps (six-sets, map events, coach logs). Default: off.",
+    )
+    return p.parse_args(argv)
+
+
+def thought_count(s: Symbioid) -> int:
+    return len(s.thoughts)
+
+
+def thought_counts_active_inactive(s: Symbioid) -> tuple[int, int]:
+    """
+    Active = Thoughts currently in an Innerface *active* six-set.
+    Inactive = other Thoughts still on the host graph (seeds, laws, awareness,
+    superseded scaffolding not yet pruned, etc.).
+    """
+    active_tids: set[str] = set()
+    inner = s.innerface
+    with inner._local_lock:
+        for sid in inner.active_ids:
+            store = (
+                inner.completed_formations.get(sid)
+                or inner.completed_syncs.get(sid)
+                or inner.completed_integrates.get(sid)
+            )
+            if store:
+                active_tids.update(store.keys())
+    with s.graph_lock:
+        host_ids = set(s.thoughts.keys())
+    n_active = len(active_tids & host_ids)
+    n_inactive = max(0, len(host_ids) - n_active)
+    return n_active, n_inactive
 
 
 def build_symbioid(world: TetrisWorld) -> Symbioid:
@@ -106,15 +170,100 @@ def sample_into_symbioid(s: Symbioid, world: TetrisWorld, tick: int) -> None:
         s.innerface.post(handoffs[0])
 
 
+def draw_thought_plot(
+    screen: pygame.Surface,
+    history: list[int],
+    font_sm: pygame.font.Font,
+    *,
+    ox: int,
+    oy: int,
+    width: int,
+    height: int,
+    title: str,
+    line_color: tuple[int, int, int],
+    marker_color: tuple[int, int, int],
+    show_x_labels: bool = True,
+) -> None:
+    """One line plot of a Thought-count series over the last PLOT_HISTORY turns."""
+    pygame.draw.rect(
+        screen, (20, 24, 40), (ox - 2, oy - 2, width + 4, height + 4), border_radius=4
+    )
+    pygame.draw.rect(screen, (8, 10, 18), (ox, oy, width, height))
+
+    pad_l, pad_r, pad_t, pad_b = 36, 8, 14, 20 if show_x_labels else 8
+    plot_x = ox + pad_l
+    plot_y = oy + pad_t
+    plot_w = max(1, width - pad_l - pad_r)
+    plot_h = max(1, height - pad_t - pad_b)
+
+    pygame.draw.rect(screen, (40, 48, 70), (plot_x, plot_y, plot_w, plot_h), width=1)
+
+    # Title + live value
+    cur = history[-1] if history else 0
+    screen.blit(
+        font_sm.render(f"{title}: {cur} ", True, line_color),
+        (ox + 80, oy + 1),
+    )
+
+    if len(history) < 2:
+        screen.blit(
+            font_sm.render("waiting for turns…", True, (100, 110, 130)),
+            (plot_x + 8, plot_y + max(0, plot_h // 2 - 6)),
+        )
+        return
+
+    data = history[-PLOT_HISTORY:]
+    n = len(data)
+    y_min = min(data)
+    y_max = max(data)
+    if y_max <= y_min:
+        y_max = y_min + 1
+    span = y_max - y_min
+    y_min = max(0, y_min - max(1, span // 10))
+    y_max = y_max + max(1, span // 10)
+
+    def sx(i: int) -> int:
+        return plot_x + int(i * (plot_w - 1) / max(1, PLOT_HISTORY - 1))
+
+    def sy(v: int) -> int:
+        t = (v - y_min) / (y_max - y_min)
+        return plot_y + plot_h - 1 - int(t * (plot_h - 1))
+
+    for tick in (0, 256, 512, 768, 1024):
+        tx = plot_x + int(tick * (plot_w - 1) / max(1, PLOT_HISTORY - 1))
+        pygame.draw.line(
+            screen, (30, 36, 55), (tx, plot_y), (tx, plot_y + plot_h - 1), 1
+        )
+        if show_x_labels:
+            label = font_sm.render(str(tick), True, (90, 100, 120))
+            screen.blit(label, (tx - label.get_width() // 2, plot_y + plot_h + 2))
+
+    for v, label_s in ((y_min, str(y_min)), (y_max, str(y_max))):
+        ly = sy(v)
+        lab = font_sm.render(label_s, True, (90, 100, 120))
+        screen.blit(lab, (ox + 2, ly - lab.get_height() // 2))
+
+    offset = PLOT_HISTORY - n
+    points = [(sx(offset + i), sy(v)) for i, v in enumerate(data)]
+    if len(points) >= 2:
+        pygame.draw.lines(screen, line_color, False, points, 2)
+    pygame.draw.circle(screen, marker_color, points[-1], 3)
+
+
 def draw(
     screen: pygame.Surface,
     world: TetrisWorld,
     coach: TetrisCoach,
+    s: Symbioid,
+    active_history: list[int],
+    inactive_history: list[int],
     font: pygame.font.Font,
     font_sm: pygame.font.Font,
+    *,
+    pause_seconds_left: float | None = None,
 ) -> None:
     screen.fill((12, 14, 28))
-    ox, oy = 20, 20
+    ox, oy = MARGIN_X, MARGIN_Y
 
     pygame.draw.rect(
         screen, (20, 24, 40), (ox - 2, oy - 2, BOARD_W + 4, BOARD_H + 4), border_radius=4
@@ -168,14 +317,27 @@ def draw(
                 )
 
     sx = ox + BOARD_W + 24
+    n_act, n_inact = thought_counts_active_inactive(s)
+    n_th = n_act + n_inact
     screen.blit(font.render("Symbioid Tetris", True, (200, 210, 230)), (sx, oy))
+    # Live Thought counters — primary status when console is quiet
+    #tc = font.render(f"Thoughts: {n_th}", True, (255, 220, 120))
+    #screen.blit(tc, (sx, oy + 26))
+    #screen.blit(
+    #    font_sm.render(
+    #        f"active {n_act}   inactive {n_inact}",
+    #        True,
+    #        (160, 200, 180),
+    #    ),
+    #    (sx, oy + 48),
+    #)
     screen.blit(
         font_sm.render(
             f"game #{coach.game_number}   score {world.score}",
             True,
             (180, 190, 210),
         ),
-        (sx, oy + 30),
+        (sx, oy + 68),
     )
     screen.blit(
         font_sm.render(
@@ -183,7 +345,7 @@ def draw(
             True,
             (180, 190, 210),
         ),
-        (sx, oy + 48),
+        (sx, oy + 86),
     )
 
     # Byte stream (what the agent emits — not the secret cipher)
@@ -194,11 +356,11 @@ def draw(
             True,
             (160, 220, 180),
         ),
-        (sx, oy + 72),
+        (sx, oy + 106),
     )
     screen.blit(
         font_sm.render(f"intent {coach.last_intent}", True, (140, 180, 160)),
-        (sx, oy + 90),
+        (sx, oy + 124),
     )
     scan = getattr(coach, "_scan_passes", 0)
     status = (
@@ -212,11 +374,11 @@ def draw(
             True,
             (220, 200, 120) if coach.map_complete() else (200, 140, 100),
         ),
-        (sx, oy + 108),
+        (sx, oy + 142),
     )
     # Discovered beliefs only (never ground-truth cipher)
-    screen.blit(font_sm.render("learned map:", True, (140, 150, 170)), (sx, oy + 130))
-    y = oy + 148
+    screen.blit(font_sm.render("learned map:", True, (140, 150, 170)), (sx, oy + 164))
+    y = oy + 182
     for line in _wrap(coach.map_progress(), 34):
         screen.blit(font_sm.render(line, True, (180, 190, 210)), (sx, y))
         y += 16
@@ -244,37 +406,65 @@ def draw(
 
     # Highscores
     screen.blit(
-        font_sm.render("highscores  #game  score", True, (200, 190, 120)), (sx, y)
+        font_sm.render("highscores  best first", True, (200, 190, 120)), (sx, y)
     )
     y += 18
     if not coach.highscores:
         screen.blit(font_sm.render("(finish a game…)", True, (100, 110, 130)), (sx, y))
         y += 16
     else:
-        best = coach.best_score()
-        for line in coach.highscore_lines(limit=10):
-            try:
-                sc = int(line.split()[-1])
-                color = (240, 210, 100) if sc == best else (160, 170, 190)
-            except (ValueError, IndexError):
-                color = (160, 170, 190)
+        # Already sorted best-first; highlight the top row only
+        for i, line in enumerate(coach.highscore_lines(limit=10)):
+            color = (240, 210, 100) if i == 0 else (160, 170, 190)
             screen.blit(font_sm.render(line, True, color), (sx, y))
             y += 15
-        y += 2
-        screen.blit(font_sm.render(f"best  {best}", True, (240, 210, 100)), (sx, y))
-        y += 18
+        y += 4
 
-    # if world.game_over:
-        # overlay = font.render("TOP OUT — R restart", True, (240, 120, 120))
-        # screen.blit(overlay, (ox + 16, oy + BOARD_H // 2 - 10))
+    #if world.game_over:
+    #    msg = "TOP OUT"
+       # if pause_seconds_left is not None and pause_seconds_left > 0:
+       #     msg = f"TOP OUT — pause {pause_seconds_left:.1f}s (Innerface catch-up)"
+       # else:
+       #     msg = "TOP OUT — R restart"
+     #   overlay = font.render(msg, True, (240, 120, 120))
+     #   screen.blit(overlay, (ox + 8, oy + BOARD_H // 2 - 10))
+
+    # Two plots under the board: Active / Inactive Thoughts over turns
+    plot_oy = oy + BOARD_H + PLOT_MARGIN
+    draw_thought_plot(
+        screen,
+        active_history,
+        font_sm,
+        ox=ox,
+        oy=plot_oy,
+        width=BOARD_W,
+        height=PLOT_H,
+        title="Active Thoughts",
+        line_color=(100, 220, 140),
+        marker_color=(180, 255, 160),
+        show_x_labels=False,
+    )
+    draw_thought_plot(
+        screen,
+        inactive_history,
+        font_sm,
+        ox=ox,
+        oy=plot_oy + PLOT_H + PLOT_GAP,
+        width=BOARD_W,
+        height=PLOT_H,
+        title="Inactive Thoughts",
+        line_color=(120, 170, 255),
+        marker_color=(180, 210, 255),
+        show_x_labels=True,
+    )
 
     screen.blit(
         font_sm.render(
-            "Any byte 0..255; only a few secret ones move. Discover map, then play. Esc.",
+            "Secret bytes → play. Esc quit.  --verbose for console dumps.",
             True,
             (120, 130, 160),
         ),
-        (20, H - 24),
+        (MARGIN_X, H - FOOTER_H + 4),
     )
 
 
@@ -294,7 +484,11 @@ def _wrap(text: str, width: int) -> list[str]:
     return lines or [text]
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    set_console_emit(args.verbose)
+    log = print if args.verbose else (lambda *a, **k: None)
+
     # Fresh secret cipher each run (4 live bytes among 256)
     rng_world = __import__("random").Random()
     cipher = ActionCipher.random(rng_world)
@@ -310,13 +504,13 @@ def main() -> None:
 
     twin = s.twin_seed_thoughts()
     if twin:
-        print(format_six_set_line("twin", twin, index=0), flush=True)
-    print(
+        log(format_six_set_line("twin", twin, index=0), flush=True)
+    log(
         "Tetris + Symbioid: SECRET byte map "
         f"({len(cipher)} live / 256). Agent must discover it.",
         flush=True,
     )
-    print("(Cipher hidden from learner; not printed here.)", flush=True)
+    log("(Cipher hidden from learner; not printed here.)", flush=True)
 
     s.start_processes()
     pygame.init()
@@ -330,6 +524,19 @@ def main() -> None:
     log_every = 90
     game_over_at: int | None = None
     was_mapped = False
+    # Thought counts once per game turn (piece lock)
+    active_history: list[int] = []
+    inactive_history: list[int] = []
+    last_pieces_for_plot = world.pieces_placed
+
+    def _record_thought_sample() -> None:
+        a, i = thought_counts_active_inactive(s)
+        active_history.append(a)
+        inactive_history.append(i)
+        if len(active_history) > PLOT_HISTORY:
+            del active_history[: len(active_history) - PLOT_HISTORY]
+        if len(inactive_history) > PLOT_HISTORY:
+            del inactive_history[: len(inactive_history) - PLOT_HISTORY]
 
     try:
         running = True
@@ -343,7 +550,8 @@ def main() -> None:
                     elif event.key == pygame.K_r and world.game_over:
                         entry = coach.on_new_game(world, record=True)
                         game_over_at = None
-                        print(
+                        last_pieces_for_plot = world.pieces_placed
+                        log(
                             f"[restart] {entry} | map {coach.map_progress()}",
                             flush=True,
                         )
@@ -353,11 +561,16 @@ def main() -> None:
 
             if not world.game_over and frame % CMD_EVERY == 0:
                 prev_event = world.last_event
+                prev_pieces = world.pieces_placed
                 code = coach.tick(world)
                 s.actuators[0].output = code / 255.0
+                # One sample per game turn (piece lock)
+                if world.pieces_placed > prev_pieces:
+                    _record_thought_sample()
+                    last_pieces_for_plot = world.pieces_placed
                 if coach.map_complete() and not was_mapped:
                     was_mapped = True
-                    print(
+                    log(
                         f"[map complete] {coach.map_progress()} "
                         f"after {len(coach.bytes_tried)} bytes tried",
                         flush=True,
@@ -367,41 +580,61 @@ def main() -> None:
                     "top_out",
                     "lock",
                 ):
-                    print(
+                    log(
                         f"[{world.last_event}] g#{coach.game_number} "
                         f"score={world.score} byte=0x{code:02X} "
                         f"seen={coach.last_effect} | {coach.map_progress()}",
                         flush=True,
                     )
 
+            pause_left = None
             if world.game_over:
                 if game_over_at is None:
                     game_over_at = frame
-                    print(
+                    # Final sample at game end
+                    _record_thought_sample()
+                    log(
                         f"[top_out] game #{coach.game_number} "
                         f"final_score={world.score} "
-                        f"tried={len(coach.bytes_tried)}/256",
+                        f"tried={len(coach.bytes_tried)}/256 "
+                        f"— pausing {RESTART_DELAY_FRAMES / FPS:.0f}s for Innerface",
                         flush=True,
                     )
-                elif frame - game_over_at >= RESTART_DELAY_FRAMES:
+                elapsed = frame - game_over_at
+                pause_left = max(0.0, (RESTART_DELAY_FRAMES - elapsed) / FPS)
+                # Sensors still sample above each frame%sample_every so Innerface
+                # can drain the formation queue during the pause.
+                if elapsed >= RESTART_DELAY_FRAMES:
                     entry = coach.on_new_game(world, record=True)
                     game_over_at = None
-                    print(
+                    last_pieces_for_plot = world.pieces_placed
+                    log(
                         f"[auto-restart] {entry} best={coach.best_score()} "
                         f"highscores={coach.highscores[-6:]}",
                         flush=True,
                     )
 
             if frame > 0 and frame % log_every == 0 and not world.game_over:
-                print(
+                log(
                     f"t={frame} g#{coach.game_number} score={world.score} "
+                    f"Thoughts={thought_count(s)} "
                     f"0x{coach.last_byte:02X}→{coach.last_effect} "
                     f"intent={coach.last_intent} tried={len(coach.bytes_tried)} "
                     f"| {coach.map_progress()}",
                     flush=True,
                 )
 
-            draw(screen, world, coach, font, font_sm)
+            draw(
+                screen,
+                world,
+                coach,
+                s,
+                active_history,
+                inactive_history,
+                font,
+                font_sm,
+                pause_seconds_left=pause_left,
+            )
             pygame.display.flip()
             clock.tick(FPS)
             frame += 1
@@ -410,11 +643,12 @@ def main() -> None:
         pygame.quit()
         if not world.game_over and world.pieces_placed > 0:
             coach.record_game_score(world)
-        print(
+        log(
             f"\nstopped: game=#{coach.game_number} score={world.score}\n"
             f"  {coach.summary()}\n"
             f"  highscores: {coach.highscores}\n"
-            f"  formations={len(s.innerface.completed_formations)} "
+            f"  Thoughts={thought_count(s)} "
+            f"formations={len(s.innerface.completed_formations)} "
             f"beliefs={len(s.outerface.active_belief_ids)}",
             flush=True,
         )

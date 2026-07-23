@@ -918,8 +918,15 @@ class TetrisCoach:
         return max(s for _, s in self.highscores)
 
     def highscore_lines(self, limit: int = 12) -> list[str]:
-        rows = list(reversed(self.highscores[-limit:]))
-        return [f"#{n:<3d}  {score}" for n, score in rows]
+        """Format highscores for HUD: best score first — ``#ddd ssssss``."""
+        # Sort by score desc, then game number desc for stable ties
+        rows = sorted(
+            self.highscores,
+            key=lambda t: (t[1], t[0]),
+            reverse=True,
+        )[:limit]
+        # #ddd = 3-digit game no; ssssss = 6-wide right-aligned score
+        return [f"#{n:03d} {score:>6d}" for n, score in rows]
 
     def drop_model_summary(self) -> str:
         n = len(self.experiences)

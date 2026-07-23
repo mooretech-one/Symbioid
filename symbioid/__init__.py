@@ -25,6 +25,7 @@ from symbioid.Core import (
     complete_integrate_set,
     constitutional_seed,
     digital_root,
+    console_emit_enabled,
     emit_six_set,
     ensure_sensor_thought,
     format_six_set_line,
@@ -34,6 +35,7 @@ from symbioid.Core import (
     rodin_halve,
     rodin_halve_sequence,
     rodin_sequence,
+    set_console_emit,
     six_set_labels,
 )
 
@@ -72,6 +74,8 @@ __all__ = [
     "six_set_labels",
     "format_six_set_line",
     "emit_six_set",
+    "set_console_emit",
+    "console_emit_enabled",
 ]
 
 __version__ = "0.0.7"

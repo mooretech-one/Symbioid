@@ -274,7 +274,16 @@ def test_highscore_list_records_game_number_and_score():
         coach.act(w)
     coach.on_new_game(w, record=True)
     assert len(coach.highscores) == 2
-    assert coach.highscore_lines()[0].startswith("#2")
+    # Ordered by score (highest first); format "#ddd ssssss"
+    lines = coach.highscore_lines()
+    scores = [int(line.split()[-1]) for line in lines]
+    assert scores == sorted(scores, reverse=True)
+    for line in lines:
+        assert len(line) == 11  # "#001" + " " + "  4700"
+        assert line[0] == "#"
+        assert line[4] == " "
+        int(line[1:4])
+        int(line[5:].lstrip() or "0")
 
 
 def test_piece_cells_count():

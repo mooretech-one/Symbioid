@@ -453,6 +453,27 @@ def test_temporal_integrate_last_two_same_sensor():
     assert s.innerface.active_set_summary().get("integrate", 0) == 1
 
 
+def test_prune_removes_superseded_sense_scaffolding():
+    """After Integrate, inactive formation scaffolding is GC'd; poles remain."""
+    s = Symbioid(label="prune")
+    s.innerface.auto_prune = True
+    eye = s.add_sensor(label="eye")
+    h1 = s.interface.start_formation_for_sensor(eye, force=True, sense=eye.sample(tick=1))
+    s.innerface.accept_formation(h1)
+    n_after_first = len(s.thoughts)
+    h2 = s.interface.start_formation_for_sensor(eye, force=True, sense=eye.sample(tick=2))
+    s.innerface.accept_formation(h2)
+    # Integrate should have pruned superseded sense scaffolding
+    assert s.innerface.thoughts_pruned > 0
+    n_after_int = len(s.thoughts)
+    # Graph should not keep growing unboundedly for two samples
+    assert n_after_int < n_after_first + 20
+    # Active integrate store still present
+    assert s.innerface.active_set_summary().get("integrate", 0) == 1
+    # Sensor grounding pole still registered
+    assert any(tid.endswith(f"sensor:{eye.id}") or f":sensor:{eye.id}" in tid for tid in s.thoughts)
+
+
 def test_h2_depth_fold_only_above_soft_cap():
     """H2: depth fold only when active integrates exceed max (many may coexist)."""
     s = Symbioid(label="depth")

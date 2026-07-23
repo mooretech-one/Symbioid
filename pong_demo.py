@@ -5,18 +5,18 @@ Pong + Symbioid: both paddles **learn** to intercept the ball.
 Sensors → ball / tracking error (Symbioid faces still form Thoughts & Beliefs).
 Actuators ``left`` / ``right`` ← PaddleLearner policies (intercept + online updates).
 
-Learning:
-  - Predict intercept Y (with wall bounces) + learnable bias / vy_trust / gain
-  - Exploration noise decays with hits
-  - Hits and misses update parameters so play improves over time
+Console: quiet by default; pass ``--verbose`` for six-set / event dumps.
+On-screen: live Thought count always shown.
 
 Quit: Esc or close window.
 
   PYTHONPATH=. .venv/bin/python pong_demo.py
+  PYTHONPATH=. .venv/bin/python pong_demo.py --verbose
 """
 
 from __future__ import annotations
 
+import argparse
 import sys
 
 try:
@@ -25,7 +25,7 @@ except ImportError:
     print("pygame required:  .venv/bin/pip install pygame", file=sys.stderr)
     sys.exit(1)
 
-from symbioid import Symbioid, format_six_set_line
+from symbioid import Symbioid, format_six_set_line, set_console_emit
 from symbioid.world.paddle_learn import DualPaddleCoach
 from symbioid.world.pong import PongWorld
 
@@ -40,6 +40,18 @@ def ny(y: float) -> int:
 
 def nx(x: float) -> int:
     return int((x + 1.0) * 0.5 * (W - 40) + 20)
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Symbioid Pong learning demo")
+    p.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        default=False,
+        help="Enable console dumps (six-sets, hits, coach logs). Default: off.",
+    )
+    return p.parse_args(argv)
 
 
 def build_symbioid(world: PongWorld) -> Symbioid:
@@ -85,10 +97,15 @@ def sample_into_symbioid(s: Symbioid, world: PongWorld, tick: int) -> None:
         s.innerface.post(handoffs[0])
 
 
+def thought_count(s: Symbioid) -> int:
+    return len(s.thoughts)
+
+
 def draw(
     screen: pygame.Surface,
     world: PongWorld,
     coach: DualPaddleCoach,
+    s: Symbioid,
     font: pygame.font.Font,
     font_sm: pygame.font.Font,
 ) -> None:
@@ -96,7 +113,6 @@ def draw(
     for y in range(20, H - 20, 16):
         pygame.draw.rect(screen, (40, 50, 80), (W // 2 - 2, y, 4, 8))
     ph = int(world.paddle_half * H)
-    # intercept guides (learned targets)
     if coach.left.coming_toward(world):
         pygame.draw.line(
             screen,
@@ -131,17 +147,21 @@ def draw(
         (nx(world.ball_x), ny(world.ball_y)),
         max(6, int(world.ball_r * H * 0.5)),
     )
+    n_th = thought_count(s)
     hud = font.render(
-        f"{world.score_left}  —  {world.score_right}   {world.last_event}",
+        f"{world.score_left}  —  {world.score_right}   Thoughts {n_th}",
         True,
         (200, 210, 230),
     )
     screen.blit(hud, (20, 8))
+    # Live Thought counter — large, always visible
+    tc = font.render(f"Thoughts: {n_th}", True, (255, 220, 120))
+    screen.blit(tc, (W - tc.get_width() - 20, 8))
     screen.blit(font_sm.render(coach.left.summary(), True, (120, 200, 140)), (20, 32))
     screen.blit(font_sm.render(coach.right.summary(), True, (120, 170, 220)), (20, 52))
     screen.blit(
         font_sm.render(
-            "Both paddles LEARN intercepts (hits/misses update policy). Esc quit.",
+            "LEARN paddles. Esc quit.  --verbose for console dumps.",
             True,
             (120, 130, 160),
         ),
@@ -149,7 +169,11 @@ def draw(
     )
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    set_console_emit(args.verbose)
+    log = print if args.verbose else (lambda *a, **k: None)
+
     world = PongWorld()
     world.reset_ball(toward=1)
     s = build_symbioid(world)
@@ -157,9 +181,9 @@ def main() -> None:
 
     twin = s.twin_seed_thoughts()
     if twin:
-        print(format_six_set_line("twin", twin, index=0), flush=True)
-    print("Pong + Symbioid: both paddles learn intercept play.", flush=True)
-    print("Green=left learner, blue=right. Lines = intercept targets.", flush=True)
+        log(format_six_set_line("twin", twin, index=0), flush=True)
+    log("Pong + Symbioid: both paddles learn intercept play.", flush=True)
+    log("Green=left learner, blue=right. Lines = intercept targets.", flush=True)
 
     s.start_processes()
     pygame.init()
@@ -170,7 +194,7 @@ def main() -> None:
     font_sm = pygame.font.SysFont("DejaVu Sans", 15)
     frame = 0
     sample_every = 4
-    log_every = 120  # frames
+    log_every = 120
 
     try:
         running = True
@@ -184,7 +208,6 @@ def main() -> None:
             if frame % sample_every == 0:
                 sample_into_symbioid(s, world, tick=frame)
 
-            # Learn + act (writes actuator outputs)
             lo, ro = coach.control(
                 world, s.actuators[0].output, s.actuators[1].output
             )
@@ -202,30 +225,32 @@ def main() -> None:
                     "score_left",
                     "score_right",
                 ):
-                    print(
+                    log(
                         f"[{world.last_event}] {coach.left.summary()} | {coach.right.summary()}",
                         flush=True,
                     )
 
             if frame > 0 and frame % log_every == 0:
-                print(
+                log(
                     f"t={frame} score={world.score_left}-{world.score_right} "
+                    f"Thoughts={thought_count(s)} "
                     f"| {coach.left.summary()} | {coach.right.summary()}",
                     flush=True,
                 )
 
-            draw(screen, world, coach, font, font_sm)
+            draw(screen, world, coach, s, font, font_sm)
             pygame.display.flip()
             clock.tick(FPS)
             frame += 1
     finally:
         s.stop_processes()
         pygame.quit()
-        print(
+        log(
             f"\nstopped: score={world.score_left}-{world.score_right}\n"
             f"  {coach.left.summary()}\n"
             f"  {coach.right.summary()}\n"
-            f"  formations={len(s.innerface.completed_formations)} "
+            f"  Thoughts={thought_count(s)} "
+            f"formations={len(s.innerface.completed_formations)} "
             f"beliefs={len(s.outerface.active_belief_ids)} "
             f"confirm={s.outerface.belief_confirms} challenge={s.outerface.belief_challenges}",
             flush=True,
