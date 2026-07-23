@@ -1,0 +1,3 @@
+# Runtime + packaging (single-file demos)
+-r requirements.txt
+pyinstaller>=6.3
