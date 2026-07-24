@@ -6,7 +6,7 @@ import math
 import random
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 from symbioid.world.tetris import VALID_ACTIONS, TetrisWorld, piece_cells
 
@@ -222,6 +222,8 @@ class TetrisCoach:
     3. **Target choice** — 1-ply search: ``legal_placements`` +
        ``simulate_placement`` scored by the *learned* evaluator (physics is the
        world model for planning; good/bad boards are learned from play).
+       Phase C: optional ``graph_placement_bonus(world, rot, col)`` from
+       Symbioid cell-map / Thought heat.
        Execute with discovered secret bytes only.
 
     The coach never reads ``world.cipher`` / ``last_byte_action``.
@@ -241,6 +243,11 @@ class TetrisCoach:
     noise: float = 0.35
     # How much to trust feature-scored board vs slot average (0..1)
     board_value_blend: float = 0.55
+    # Phase C: weight for Symbioid cell-map / Thought placement bonus
+    graph_placement_weight: float = 0.40
+    graph_placement_bonus: Optional[
+        Callable[[TetrisWorld, int, int], float]
+    ] = field(default=None, repr=False)
     placements: int = 0
     lines_total: int = 0
     games: int = 0
@@ -249,6 +256,7 @@ class TetrisCoach:
     highscores: list[tuple[int, int]] = field(default_factory=list)
     last_choice: tuple[int, int] = (0, 3)
     last_score: float = 0.0
+    last_graph_bonus: float = 0.0
     last_features: dict[str, float] = field(default_factory=dict)
     last_byte: int = 0
     last_effect: str = "noop"
@@ -262,8 +270,9 @@ class TetrisCoach:
     explore_rate: float = 0.55
     # One clean observation is enough; rescans confirm dominance
     map_threshold: int = 1
-    # Placement exploration among near-best simulated poses (keep low for packing)
-    place_explore: float = 0.12
+    # Placement exploration among near-best simulated poses
+    place_explore: float = 0.18
+    place_explore_floor: float = 0.12
     # (kind, rot, col) → (reward_sum, count) from real locks only
     slot_reward_sum: dict[tuple[str, int, int], float] = field(default_factory=dict)
     slot_reward_n: dict[tuple[str, int, int], int] = field(default_factory=dict)
@@ -282,8 +291,15 @@ class TetrisCoach:
     _pre_board: Optional[dict[str, float]] = None
     _score_at_piece_start: float = 0.0
     _piece_kind: str = ""
-    # Consecutive left/right commands that did not change col → then hard-drop
+    # Consecutive left/right commands that did not change col → then replan/hard
     _stuck_lateral: int = 0
+    # Phase A: mid-piece replan / force-hard
+    _piece_cmds: int = 0
+    _replans_this_piece: int = 0
+    replan_every_cmds: int = 10
+    force_hard_after_cmds: int = 36
+    # Last lock's true action effect (for Mind outcomes; not "explore")
+    last_lock_effect: str = "noop"
     rng: random.Random = field(default_factory=random.Random)
 
     # ------------------------------------------------------------------ map
@@ -331,6 +347,45 @@ class TetrisCoach:
     def map_complete(self) -> bool:
         return all(self.byte_for_effect(e) is not None for e in VALID_ACTIONS)
 
+    def play_ready(self) -> bool:
+        """
+        Phase A: enough map to aim — hard + left + right.
+
+        Rotate may still be missing (then rotate intent falls back to explore).
+        Does not require full map_complete().
+        """
+        return (
+            self.byte_for_effect("hard") is not None
+            and self.byte_for_effect("left") is not None
+            and self.byte_for_effect("right") is not None
+        )
+
+    def wants_hard_now(self, world: TetrisWorld) -> bool:
+        """
+        Phase B: coach situation where hard-drop is the right micro-intent
+        (aligned on target, stuck laterally, or force-hard timeout).
+        """
+        if not self.play_ready() and not self.map_complete():
+            return False
+        if self.byte_for_effect("hard") is None:
+            return False
+        if world.active is None or world.game_over:
+            return False
+        if self._piece_cmds >= int(self.force_hard_after_cmds):
+            return True
+        if self._stuck_lateral >= 3:
+            return True
+        # Aligned with target pose → hard
+        if self._target is not None:
+            tr, tc = self._target
+            tr, tc = self._clamp_pose(world.active.kind, tr, tc, world.cols)
+            if (
+                world.active.rotation % 4 == tr % 4
+                and world.active.col == tc
+            ):
+                return True
+        return False
+
     def map_progress(self) -> str:
         m = self.discovered_map()
         parts = [f"{e}=0x{m[e]:02X}" if e in m else f"{e}=?" for e in VALID_ACTIONS]
@@ -358,15 +413,32 @@ class TetrisCoach:
         Discovery policy (map incomplete):
 
         1. Prefer untried bytes.
-        2. Else systematic scan 0→255→0… so every code is re-probed (not stuck
-           re-rolling the same noops after the first full pass).
-        3. Occasionally re-test bytes that showed a *hint* of a missing action.
+        2. **Hard-hunt bias**: if hard unknown, prefer unbound / noop-only bytes.
+        3. Else systematic scan 0→255→0… so every code is re-probed.
+        4. Occasionally re-test bytes that showed a *hint* of a missing action.
         """
         untried = [i for i in range(256) if i not in self.bytes_tried]
         if untried:
             return self.rng.choice(untried)
 
         missing = set(self.missing_effects())
+        # Phase A: hard-hunt — walk scan among unbound bytes (covers all, prefers
+        # codes with no action binding yet). Falls through to full scan if none.
+        if "hard" in missing and self.rng.random() < 0.7:
+            unbound = {
+                b
+                for b in range(256)
+                if self.observed_effect_for_byte(b) is None
+            }
+            if unbound:
+                for _ in range(256):
+                    b = self._scan_byte & 0xFF
+                    self._scan_byte = (self._scan_byte + 1) & 0xFF
+                    if b == 0:
+                        self._scan_passes += 1
+                    if b in unbound:
+                        return b
+
         # Re-probe candidates that ever produced a still-missing action
         hints: list[int] = []
         if missing:
@@ -375,7 +447,7 @@ class TetrisCoach:
                     if counts.get(e, 0) > 0:
                         hints.append(b)
                         break
-        if hints and self.rng.random() < 0.35:
+        if hints and self.rng.random() < 0.25:
             return self.rng.choice(hints)
 
         # Systematic full rescan — guarantees progress after 256-tried stall
@@ -546,7 +618,8 @@ class TetrisCoach:
         Pick (rotation, column) by 1-ply search:
 
         For each legal landing, simulate the lock on a copy of the board and
-        score the resulting skyline with the learned height-aware evaluator.
+        score the resulting skyline with the learned height-aware evaluator
+        plus optional Phase C graph/cell-map bonus.
 
         Pure (kind,rot,col) averages cannot learn packing — the same pose is
         good or bad depending on the board. Simulation is the world model for
@@ -562,7 +635,7 @@ class TetrisCoach:
         if not options:
             return self._clamp_pose(kind, world.active.rotation, cur_col, cols)
 
-        scored: list[tuple[float, int, int]] = []
+        scored: list[tuple[float, int, int, float]] = []
         for rot, col in options:
             sim = world.simulate_placement(rot, col)
             if sim is None:
@@ -575,32 +648,42 @@ class TetrisCoach:
                 v += 0.12 * (self.slot_reward_sum[key] / n)
             # Slight preference for nearer columns (less control error)
             v -= 0.05 * abs(col - cur_col)
-            scored.append((v, rot, col))
+            g_bonus = 0.0
+            if self.graph_placement_bonus is not None:
+                try:
+                    g_bonus = float(self.graph_placement_bonus(world, rot, col))
+                except Exception:
+                    g_bonus = 0.0
+                v += float(self.graph_placement_weight) * g_bonus
+            scored.append((v, rot, col, g_bonus))
 
         if not scored:
             return self._clamp_pose(kind, world.active.rotation, cur_col, cols)
 
         scored.sort(key=lambda t: t[0], reverse=True)
-        best_v, best_rot, best_col = scored[0]
+        best_v, best_rot, best_col, best_g = scored[0]
 
-        # Explore among near-best poses only (keeps packing quality)
+        # Explore among near-best (or broader set) to escape local pose minima
         if self.rng.random() < self.place_explore and len(scored) > 1:
-            top_k = scored[: min(4, len(scored))]
-            # Softmax over top-k
+            # Phase A: sometimes sample top-8 / half of options, not only top-4
+            k = min(len(scored), 8 if self.rng.random() < 0.35 else 4)
+            top_k = scored[:k]
             m = top_k[0][0]
-            exps = [math.exp((v - m) / max(0.5, self.noise * 8)) for v, _, _ in top_k]
+            exps = [math.exp((v - m) / max(0.5, self.noise * 8)) for v, _, _, _ in top_k]
             z = sum(exps)
             r = self.rng.random() * z
             acc = 0.0
-            for e, (v, rot, col) in zip(exps, top_k):
+            for e, (v, rot, col, gb) in zip(exps, top_k):
                 acc += e
                 if acc >= r:
                     self.last_choice = (rot, col)
                     self.last_score = v
+                    self.last_graph_bonus = gb
                     return rot, col
 
         self.last_choice = (best_rot, best_col)
         self.last_score = best_v
+        self.last_graph_bonus = best_g
         return best_rot, best_col
 
     def _begin_piece(self, world: TetrisWorld) -> None:
@@ -610,11 +693,23 @@ class TetrisCoach:
         self._pre_board = observe_board(world)
         self._score_at_piece_start = float(world.score)
         self._piece_kind = world.active.kind
-        if self.map_complete() or self.byte_for_effect("hard") is not None:
+        self._piece_cmds = 0
+        self._replans_this_piece = 0
+        self._stuck_lateral = 0
+        # Phase A: structured target once hard+left+right known (not full map only)
+        if self.play_ready() or self.map_complete():
             self._target = self.choose_target(world)
         else:
             # Until we can hard-drop intentionally, no structured target
             self._target = None
+
+    def _replan_target(self, world: TetrisWorld) -> None:
+        """Pick a new landing pose mid-piece (escape stuck / local minimum)."""
+        if world.active is None or not (self.play_ready() or self.map_complete()):
+            return
+        self._target = self.choose_target(world)
+        self._replans_this_piece += 1
+        self._stuck_lateral = 0
 
     def _learn_from_real_drop(
         self,
@@ -710,15 +805,16 @@ class TetrisCoach:
             0.0,
         )
 
+        floor = float(self.place_explore_floor)
         if topped:
             self.top_outs += 1
             self.place_explore = min(0.8, self.place_explore * 1.05 + 0.02)
         else:
-            self.place_explore = max(0.08, self.place_explore * 0.995)
+            self.place_explore = max(floor, self.place_explore * 0.995)
             self.noise = max(0.08, self.noise * 0.998)
 
         if lines_cleared > 0:
-            self.place_explore = max(0.08, self.place_explore * 0.97)
+            self.place_explore = max(floor, self.place_explore * 0.97)
 
     # ----------------------------------------------------------- control
 
@@ -726,28 +822,58 @@ class TetrisCoach:
         if world.active is None or world.game_over:
             return "explore"
 
-        # Until the full map is known, ONLY explore bytes.
-        # (Partial maps used to spam the one known key and stall discovery.)
-        if not self.map_complete():
+        # Phase A: explore until hard+left+right known (not full map).
+        # Partial one-key maps must not spam that key (see play_ready).
+        if not self.play_ready() and not self.map_complete():
             return "explore"
 
-        if self._target is None:
+        if self._pre_board is None:
             self._begin_piece(world)
         if self._target is None:
-            return "explore"
+            if self.play_ready() or self.map_complete():
+                self._replan_target(world)
+            if self._target is None:
+                return "explore"
 
         cur = world.active
+        # Force hard if piece is stalling forever (gravity-only death spiral)
+        if (
+            self.byte_for_effect("hard") is not None
+            and self._piece_cmds >= int(self.force_hard_after_cmds)
+        ):
+            self._target = (cur.rotation % 4, cur.col)
+            return "hard"
+
+        # Periodic replan to escape bad targets / local minima
+        if (
+            self._piece_cmds > 0
+            and self.replan_every_cmds > 0
+            and self._piece_cmds % int(self.replan_every_cmds) == 0
+            and self._replans_this_piece < 4
+        ):
+            self._replan_target(world)
+
         tgt_rot, tgt_col = self._target
         # Keep target geometrically on-board for this piece shape
         tgt_rot, tgt_col = self._clamp_pose(cur.kind, tgt_rot, tgt_col, world.cols)
         self._target = (tgt_rot, tgt_col)
 
-        # Stuck on a wall / stack: stop marching, hard-drop here
+        # Stuck on a wall / stack: replan once, then hard-drop here
         if self._stuck_lateral >= 2:
-            self._target = (cur.rotation % 4, cur.col)
-            return "hard"
+            if self._replans_this_piece < 3:
+                self._replan_target(world)
+                tgt_rot, tgt_col = self._target or (cur.rotation % 4, cur.col)
+                tgt_rot, tgt_col = self._clamp_pose(cur.kind, tgt_rot, tgt_col, world.cols)
+                self._target = (tgt_rot, tgt_col)
+            if self._stuck_lateral >= 2:
+                # Still stuck after replan attempt on next cmds — hard now
+                if self._replans_this_piece >= 1 and self._stuck_lateral >= 3:
+                    self._target = (cur.rotation % 4, cur.col)
+                    return "hard"
 
         if cur.rotation % 4 != tgt_rot:
+            if self.byte_for_effect("rotate") is None:
+                return "explore"  # hunt rotate while otherwise play-ready
             return "rotate"
         if cur.col < tgt_col:
             return "right"
@@ -759,7 +885,9 @@ class TetrisCoach:
         intent = self.desired_intent(world)
         if intent == "explore" or self.byte_for_effect(intent) is None:
             return self._pick_explore_byte(), "explore"
-        if self.rng.random() < max(0.03, self.explore_rate * 0.1):
+        # Less random explore once play-ready (still some discovery)
+        explore_p = max(0.02, self.explore_rate * (0.06 if self.play_ready() else 0.1))
+        if self.rng.random() < explore_p:
             return self._pick_explore_byte(), "explore"
         b = self.byte_for_effect(intent)
         assert b is not None
@@ -781,7 +909,7 @@ class TetrisCoach:
         are not mixed with a free-fall delta (which previously broke mapping).
 
         ``preferred_intent``: optional graph recommendation (e.g. left/hard).
-        When the byte map is complete and a live byte is known for that intent,
+        When play_ready/map complete and a live byte is known for that intent,
         take it with probability ``graph_bias`` (else normal select_byte).
         """
         if world.game_over:
@@ -795,11 +923,11 @@ class TetrisCoach:
 
         before = WorldSnapshot.take(world)
         code, intent = self.select_byte(world)
-        # Minted-Thought bias: use graph intent when map is ready
+        # Minted-Thought bias: use graph intent when we can act (play_ready)
         if (
             preferred_intent
             and preferred_intent in VALID_ACTIONS
-            and self.map_complete()
+            and (self.play_ready() or self.map_complete())
             and self.byte_for_effect(preferred_intent) is not None
             and self.rng.random() < max(0.0, min(1.0, graph_bias))
         ):
@@ -808,6 +936,7 @@ class TetrisCoach:
                 code, intent = b, preferred_intent
         self.last_byte = code
         self.last_intent = intent
+        self._piece_cmds += 1
 
         prev_placed = world.pieces_placed
         col_before = before.col
@@ -831,13 +960,19 @@ class TetrisCoach:
         elif intent in ("left", "right", "rotate", "hard"):
             self._stuck_lateral = 0
 
-        if self.map_complete():
+        if self.map_complete() or self.play_ready():
             self.explore_rate = max(0.04, self.explore_rate * 0.999)
 
         locked_by_cmd = world.pieces_placed > prev_placed or (
             world.game_over and before.has_active
         )
         if locked_by_cmd:
+            # True effect for Mind outcomes (prefer hard over explore)
+            self.last_lock_effect = (
+                effect if effect in VALID_ACTIONS else intent
+                if intent in VALID_ACTIONS
+                else "noop"
+            )
             self._finish_piece_lock(world, before)
             return code
 
@@ -850,6 +985,7 @@ class TetrisCoach:
                 world.game_over and g_before.has_active
             ):
                 # Gravity lock — learn drop outcome, do NOT map last byte as hard
+                self.last_lock_effect = "soft"
                 self._finish_piece_lock(world, g_before)
         return code
 
@@ -872,6 +1008,8 @@ class TetrisCoach:
         self._pre_board = None
         self._piece_kind = ""
         self._stuck_lateral = 0
+        self._piece_cmds = 0
+        self._replans_this_piece = 0
 
     def act(self, world: TetrisWorld) -> bool:
         """

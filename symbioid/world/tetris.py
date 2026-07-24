@@ -613,6 +613,30 @@ class TetrisWorld:
                 found.append((rot, col))
         return found
 
+    def landing_cells(self, rotation: int, col: int) -> list[tuple[int, int]]:
+        """
+        Cells filled if current piece hard-drops at (rotation, col).
+        Empty list if illegal. Does not mutate self.
+        """
+        if self.active is None or self.game_over:
+            return []
+        kind = self.active.kind
+        trial = ActivePiece(kind=kind, row=0, col=col, rotation=rotation % 4)
+        if not self._fits(trial):
+            return []
+        while True:
+            nxt = ActivePiece(
+                kind=kind, row=trial.row + 1, col=col, rotation=trial.rotation
+            )
+            if self._fits(nxt):
+                trial = nxt
+            else:
+                break
+        cells = trial.cells()
+        if any(r < 0 for r, _ in cells):
+            return []
+        return cells
+
     def simulate_placement(self, rotation: int, col: int) -> Optional[dict[str, float]]:
         """
         Soft-clone board, apply placement, return board features after lock
