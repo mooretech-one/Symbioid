@@ -30,6 +30,30 @@ source .venv/bin/activate      # or always prefix with .venv/bin/
 python -V                      # should be the venv 3.12.x
 ```
 
+### Agent memory (demos)
+
+On exit, Tetris/Pong save **agent cognition only** — a **lean** snapshot by default:
+
+| Stored | Not stored |
+|--------|------------|
+| Mind Observations, Actions (**command keys**), valence, Follows/Integrates maps | Board / ball / scores / coach / cipher |
+| Registry poles + **Links that touch them** (weights) | Unregistered formation scaffolding, bulk inactive ghosts |
+| | Seeds / laws (rebuilt on `Symbioid()`; **merged** on load) |
+
+| Demo | Default file |
+|------|----------------|
+| Tetris | `~/.local/share/symbioid/tetris_memory.json` |
+| Pong | `~/.local/share/symbioid/pong_memory.json` |
+
+```bash
+.venv/bin/python tetris_demo.py              # load if present, save lean on quit
+.venv/bin/python tetris_demo.py --no-memory
+.venv/bin/python tetris_demo.py --reset-memory
+.venv/bin/python tetris_demo.py --memory /tmp/my_mind.json
+```
+
+API (`symbioid.persist`): `export_memory(host, mode="lean"|"full")`, `save_memory`, `try_load_into`.
+
 **Do not** use bare `python3 -m pip install …` against system Python (externally-managed-environment).  
 **Do not** use bare `pytest` from `~/.local/bin` (may pull pytest-qt / PySide errors from other projects). Use `.venv/bin/pytest` if you install pytest here.
 

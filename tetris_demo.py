@@ -14,6 +14,10 @@ On-screen: live Thought count always shown.
 
 Quit: Esc.  R restarts after top-out (also auto-restarts).
 
+Agent memory (Thoughts + Mind + Action command keys only — not board/score/cipher)
+is loaded from / saved to ~/.local/share/symbioid/tetris_memory.json by default.
+  --no-memory  --reset-memory  --memory PATH
+
   PYTHONPATH=. .venv/bin/python tetris_demo.py
   PYTHONPATH=. .venv/bin/python tetris_demo.py --verbose
 """
@@ -22,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 try:
     import pygame
@@ -29,7 +34,15 @@ except ImportError:
     print("pygame required:  .venv/bin/pip install pygame", file=sys.stderr)
     sys.exit(1)
 
-from symbioid import Symbioid, format_six_set_line, set_console_emit
+from symbioid import (
+    Sensor,
+    Symbioid,
+    default_memory_path,
+    format_six_set_line,
+    save_memory,
+    set_console_emit,
+    try_load_into,
+)
 from symbioid.world.tetris import (
     VALID_ACTIONS,
     ActionCipher,
@@ -39,6 +52,10 @@ from symbioid.world.tetris import (
     piece_cells,
 )
 from symbioid.world.tetris_learn import TetrisCoach
+
+# Stable host id so Thought/Action content keys match across runs
+HOST_ID = "sym-tetris-byte-learner"
+DEFAULT_MEMORY = default_memory_path("tetris_memory.json")
 
 
 CELL = 28
@@ -80,6 +97,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=False,
         help="Enable console dumps (six-sets, map events, coach logs). Default: off.",
     )
+    p.add_argument(
+        "--memory",
+        type=Path,
+        default=DEFAULT_MEMORY,
+        help=f"Agent memory JSON path (Thoughts+Mind only). Default: {DEFAULT_MEMORY}",
+    )
+    p.add_argument(
+        "--no-memory",
+        action="store_true",
+        help="Do not load or save agent memory.",
+    )
+    p.add_argument(
+        "--reset-memory",
+        action="store_true",
+        help="Delete memory file before start (fresh Mind; still saves on exit unless --no-memory).",
+    )
     return p.parse_args(argv)
 
 
@@ -112,7 +145,7 @@ def thought_counts_active_inactive(s: Symbioid) -> tuple[int, int]:
 
 
 def build_symbioid(world: TetrisWorld) -> Symbioid:
-    s = Symbioid(label="tetris-byte-learner")
+    s = Symbioid(id=HOST_ID, label="tetris-byte-learner")
     s.interface.continuous_inputs = False
     s.outerface.wait_for_feedback = False
 
@@ -142,11 +175,14 @@ def build_symbioid(world: TetrisWorld) -> Symbioid:
         ("piece_id", piece_id_n),
         ("last_byte", lambda w, wo=world: wo.last_byte / 255.0),
     ):
-        sen = s.add_sensor(label=label)
+        # Stable sensor ids → Observation content keys survive reloads
+        sen = s.add_sensor(Sensor(id=f"{HOST_ID}:sen:{label}", label=label))
         sen.transfer = transfer
 
     # Single actuator: raw control byte as 0..1 (×255 inside coach path)
-    out = s.add_actuator(label="byte")
+    from symbioid import Actuator
+
+    out = s.add_actuator(Actuator(id=f"{HOST_ID}:act:byte", label="byte"))
     out.output = 0.0
     out.output_step = 1.0 / 255.0
     return s
@@ -538,6 +574,21 @@ def main(argv: list[str] | None = None) -> None:
     coach = TetrisCoach()
     s = build_symbioid(world)
 
+    mem_path = Path(args.memory)
+    use_memory = not args.no_memory
+    if use_memory and args.reset_memory and mem_path.is_file():
+        mem_path.unlink()
+        log(f"[memory] reset {mem_path}", flush=True)
+    if use_memory and mem_path.is_file():
+        if try_load_into(s, mem_path):
+            log(
+                f"[memory] loaded {mem_path} "
+                f"Thoughts={thought_count(s)} actions={len(s.mind._actions)}",
+                flush=True,
+            )
+        else:
+            log(f"[memory] failed to load {mem_path}; starting fresh", flush=True)
+
     twin = s.twin_seed_thoughts()
     if twin:
         log(format_six_set_line("twin", twin, index=0), flush=True)
@@ -547,6 +598,8 @@ def main(argv: list[str] | None = None) -> None:
         flush=True,
     )
     log("(Cipher hidden from learner; not printed here.)", flush=True)
+    if use_memory:
+        log(f"(Agent memory: {mem_path})", flush=True)
 
     s.start_processes()
     pygame.init()
@@ -721,6 +774,16 @@ def main(argv: list[str] | None = None) -> None:
             frame += 1
     finally:
         s.stop_processes()
+        if use_memory:
+            try:
+                save_memory(s, mem_path)
+                log(
+                    f"[memory] saved {mem_path} "
+                    f"Thoughts={thought_count(s)} actions={len(s.mind._actions)}",
+                    flush=True,
+                )
+            except OSError as exc:
+                log(f"[memory] save failed: {exc}", flush=True)
         pygame.quit()
         if not world.game_over and world.pieces_placed > 0:
             coach.record_game_score(world)

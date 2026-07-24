@@ -43,6 +43,14 @@ from symbioid.Core import (
     set_console_emit,
     six_set_labels,
 )
+from symbioid.persist import (
+    apply_memory,
+    default_memory_path,
+    export_memory,
+    load_memory,
+    save_memory,
+    try_load_into,
+)
 
 __all__ = [
     "System",
@@ -86,6 +94,12 @@ __all__ = [
     "emit_six_set",
     "set_console_emit",
     "console_emit_enabled",
+    "export_memory",
+    "apply_memory",
+    "save_memory",
+    "load_memory",
+    "try_load_into",
+    "default_memory_path",
 ]
 
-__version__ = "0.0.20"
+__version__ = "0.0.22"
