@@ -355,138 +355,54 @@ def draw(
                     border_radius=3,
                 )
 
+    # Right panel: game / score / lines / pieces / next / highscores only
     sx = ox + BOARD_W + 24
-    n_act, n_inact = thought_counts_active_inactive(s)
-    n_th = n_act + n_inact
-    screen.blit(font.render("Symbioid Tetris", True, (200, 210, 230)), (sx, oy))
-    # Live Thought counters — primary status when console is quiet
-    #tc = font.render(f"Thoughts: {n_th}", True, (255, 220, 120))
-    #screen.blit(tc, (sx, oy + 26))
-    #screen.blit(
-    #    font_sm.render(
-    #        f"active {n_act}   inactive {n_inact}",
-    #        True,
-    #        (160, 200, 180),
-    #    ),
-    #    (sx, oy + 48),
-    #)
-    screen.blit(
-        font_sm.render(
-            f"game #{coach.game_number}   score {world.score}",
-            True,
-            (180, 190, 210),
-        ),
-        (sx, oy + 68),
-    )
-    screen.blit(
-        font_sm.render(
-            f"lines {world.lines}  pieces {world.pieces_placed}",
-            True,
-            (180, 190, 210),
-        ),
-        (sx, oy + 86),
-    )
+    y = oy
+    screen.blit(font.render("Symbioid Tetris", True, (200, 210, 230)), (sx, y))
+    y += 32
+    for line, color in (
+        (f"game  #{coach.game_number}", (180, 190, 210)),
+        (f"score  {world.score}", (180, 190, 210)),
+        (f"lines  {world.lines}", (180, 190, 210)),
+        (f"pieces {world.pieces_placed}", (180, 190, 210)),
+    ):
+        screen.blit(font_sm.render(line, True, color), (sx, y))
+        y += 20
 
-    # Byte stream (what the agent emits — not the secret cipher)
-    screen.blit(
-        font_sm.render(
-            f"byte 0x{coach.last_byte:02X} ({coach.last_byte:3d})  "
-            f"seen→{coach.last_effect}",
-            True,
-            (160, 220, 180),
-        ),
-        (sx, oy + 106),
-    )
-    intent_line = f"intent {coach.last_intent}"
-    if graph_hint:
-        intent_line = f"{intent_line}  graph→{graph_hint}"
-    screen.blit(
-        font_sm.render(intent_line, True, (140, 180, 160)),
-        (sx, oy + 124),
-    )
-    scan = getattr(coach, "_scan_passes", 0)
-    status = (
-        "MAP OK"
-        if coach.map_complete()
-        else f"scan#{scan} miss:{','.join(coach.missing_effects()) or '?'}"
-    )
-    screen.blit(
-        font_sm.render(
-            f"tried {len(coach.bytes_tried)}/256  {status}",
-            True,
-            (220, 200, 120) if coach.map_complete() else (200, 140, 100),
-        ),
-        (sx, oy + 142),
-    )
-    # Mind recognition + dynamics (firing hot set)
-    screen.blit(
-        font_sm.render(
-            s.mind.summary(),
-            True,
-            (140, 200, 180),
-        ),
-        (sx, oy + 158),
-    )
-    screen.blit(
-        font_sm.render(
-            f"pulse fire={s.last_pulse_fired} hot={s.last_pulse_hot} c={s.pulse_cycle}",
-            True,
-            (180, 160, 200),
-        ),
-        (sx, oy + 172),
-    )
-    # Discovered beliefs only (never ground-truth cipher)
-    screen.blit(font_sm.render("learned map:", True, (140, 150, 170)), (sx, oy + 188))
-    y = oy + 206
-    for line in _wrap(coach.map_progress(), 34):
-        screen.blit(font_sm.render(line, True, (180, 190, 210)), (sx, y))
-        y += 16
-    screen.blit(
-        font_sm.render(
-            f"drop model: {coach.drop_model_summary()}  R={coach.last_reward:.0f}",
-            True,
-            (160, 180, 200),
-        ),
-        (sx, y + 4),
-    )
-    y += 22
-
-    # Next
-    screen.blit(font_sm.render("next", True, (140, 150, 170)), (sx, y + 8))
+    y += 12
+    screen.blit(font_sm.render("next", True, (140, 150, 170)), (sx, y))
+    y += 20
     nc = PIECE_COLORS.get(world.next_kind, (180, 180, 180))
     for dr, dc in piece_cells(world.next_kind, 0):
         pygame.draw.rect(
             screen,
             nc,
-            (sx + dc * 18, y + 28 + dr * 18, 16, 16),
+            (sx + dc * 18, y + dr * 18, 16, 16),
             border_radius=2,
         )
-    y += 100
+    y += 80
 
-    # Highscores
     screen.blit(
         font_sm.render("highscores  best first", True, (200, 190, 120)), (sx, y)
     )
     y += 18
     if not coach.highscores:
         screen.blit(font_sm.render("(finish a game…)", True, (100, 110, 130)), (sx, y))
-        y += 16
     else:
-        # Already sorted best-first; highlight the top row only
         for i, line in enumerate(coach.highscore_lines(limit=10)):
             color = (240, 210, 100) if i == 0 else (160, 170, 190)
             screen.blit(font_sm.render(line, True, color), (sx, y))
             y += 15
-        y += 4
 
-    #if world.game_over:
-    #    msg = "TOP OUT"
-       # if pause_seconds_left is not None and pause_seconds_left > 0:
-       #     msg = f"TOP OUT — pause {pause_seconds_left:.1f}s (Innerface catch-up)"
-       # else:
-       #     msg = "TOP OUT — R restart"
-     #   overlay = font.render(msg, True, (240, 120, 120))
-     #   screen.blit(overlay, (ox + 8, oy + BOARD_H // 2 - 10))
+    if world.game_over and pause_seconds_left is not None and pause_seconds_left > 0:
+        screen.blit(
+            font_sm.render(
+                f"top out — {pause_seconds_left:.0f}s",
+                True,
+                (240, 140, 120),
+            ),
+            (sx, oy + BOARD_H - 24),
+        )
 
     # Plots under the board: Active / Inactive / Minted Thoughts over turns
     plot_oy = oy + BOARD_H + PLOT_MARGIN
