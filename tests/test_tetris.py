@@ -480,3 +480,107 @@ def test_no_endless_right_on_unreachable_target():
             break
     assert w.pieces_placed >= 1
     assert rights < 15, rights
+
+
+def test_cell_field_state_empty_board_is_open():
+    w = TetrisWorld(rng=Random(0), gravity_interval=9999)
+    w.active = None  # pure empty locked board
+    field = w.cell_field_state(with_active=False)
+    assert len(field) == w.rows and len(field[0]) == w.cols
+    assert all(v == 0.0 for row in field for v in row)
+
+
+def test_cell_field_block_and_hole():
+    w = TetrisWorld(rng=Random(0), gravity_interval=9999)
+    w.active = None
+    # Block at row 5, col 3 → air above is open; empty below is hole
+    w.board[5][3] = "I"
+    assert w.cell_reading(5, 3, with_active=False) == 1.0
+    assert w.cell_reading(4, 3, with_active=False) == 0.0  # open above
+    assert w.cell_reading(6, 3, with_active=False) == 0.5  # hole under block
+    assert w.cell_reading(10, 3, with_active=False) == 0.5
+    assert w.cell_reading(5, 4, with_active=False) == 0.0
+
+
+def test_cell_field_includes_active_piece():
+    w = TetrisWorld(rng=Random(0), gravity_interval=9999)
+    assert w.active is not None
+    cells = w.active.cells()
+    r, c = cells[0]
+    assert w.cell_reading(r, c, with_active=True) == 1.0
+    # Falling piece must not invent holes under itself
+    below = r + 1
+    if below < w.rows:
+        assert w.cell_reading(below, c, with_active=True) == 0.0
+    locked = w.cell_reading(r, c, with_active=False)
+    assert locked in (0.0, 0.5, 1.0)
+
+
+def _load_tetris_demo():
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    spec = importlib.util.spec_from_file_location(
+        "tetris_demo", root / "tetris_demo.py"
+    )
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_demo_build_has_full_cell_sensor_map():
+    """200 cell sensors + 4 meta; cells skip full awareness six-sets."""
+    mod = _load_tetris_demo()
+    w = TetrisWorld(rng=Random(0))
+    s = mod.build_symbioid(w)
+    assert len(s.sensors) == w.rows * w.cols + 4
+    cell_labels = [sen.label for sen in s.sensors if (sen.label or "").startswith("cell_")]
+    assert len(cell_labels) == w.rows * w.cols
+    assert any(sen.label == "piece_id" for sen in s.sensors)
+    assert any(sen.label == "next_id" for sen in s.sensors)
+    # Cell sensors are terminators without bloating awareness_sets
+    cell_ids = [sen.id for sen in s.sensors if (sen.label or "").startswith("cell_")]
+    assert all(cid in s.integration_terminators for cid in cell_ids)
+    assert not any(
+        (sid or "").startswith(f"{s.id}:sen:cell_") for sid in s.awareness_sets
+    ) or len(s.awareness_sets) < 20  # only meta (+ actuator)
+    sen0 = next(sen for sen in s.sensors if sen.label == "cell_r00_c00")
+    v = sen0.transfer({})
+    assert v in (0.0, 0.5, 1.0)
+
+
+def test_sample_change_only_skips_static_open_cells():
+    """First sample should not hand off 200 open cells — only active/non-open + meta."""
+    mod = _load_tetris_demo()
+    w = TetrisWorld(rng=Random(0), gravity_interval=9999)
+    s = mod.build_symbioid(w)
+    # Drain any startup; measure handoffs via mind mint delta + last map
+    before_mint = s.mind.admits_mint
+    mod.sample_into_symbioid(s, w, tick=1)
+    # Second sample with no board change → almost no new cell formations
+    mid_mint = s.mind.admits_mint
+    mod.sample_into_symbioid(s, w, tick=2)
+    after_mint = s.mind.admits_mint
+    # First sample may mint a few (active piece cells + meta); not ~200
+    first_wave = mid_mint - before_mint
+    assert first_wave < 40, f"first sample minted too many: {first_wave}"
+    second_wave = after_mint - mid_mint
+    assert second_wave < 10, f"static re-sample minted too many: {second_wave}"
+
+
+def test_twin_seed_thoughts_is_constant_size():
+    """Protect path must not scan the full graph for twin seeds."""
+    from symbioid import Symbioid, Thought
+
+    s = Symbioid(id="sym-twin-perf", install_constitution=False)
+    for i in range(500):
+        s.add_thought(Thought(id=f"{s.id}:form:junk{i}", transient=True))
+    twin = s.twin_seed_thoughts()
+    assert len(twin) == 6
+    assert f"{s.id}:system" in twin
+    assert f"{s.id}:form:junk0" not in twin

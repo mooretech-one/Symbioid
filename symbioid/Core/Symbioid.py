@@ -768,26 +768,26 @@ class Symbioid(System):
         )
 
     def twin_seed_thoughts(self) -> dict[str, Thought]:
-        """Thoughts belonging to the six-seed (by id prefix), excluding constitution/formations."""
-        prefix = f"{self.id}:"
-        skip_prefixes = (
-            f"{self.id}:const:",
-            f"{self.id}:form:",
-            f"{self.id}:obs:",  # content-addressed Observations (Mind)
-            f"{self.id}:sync:",
-            f"{self.id}:sensor:",
-            f"{self.id}:aware:",
-            f"{self.id}:belief:",
-            f"{self.id}:int:",
-            f"{self.id}:actuator:",
+        """
+        Six-seed twin poles only (O(1) id lookup — not a full-graph scan).
+
+        Avoids O(|thoughts| × prefixes) startswith thrash during protect/prune.
+        """
+        p = f"{self.id}:"
+        seed_ids = (
+            f"{p}system",
+            f"{p}environment",
+            f"{p}exists_in",
+            f"{p}exists_around",
+            f"{p}sys_exists_in_env",
+            f"{p}env_exists_around_sys",
         )
-        return {
-            tid: t
-            for tid, t in self.thoughts.items()
-            if tid.startswith(prefix)
-            and not any(tid.startswith(p) for p in skip_prefixes)
-            and tid != f"{self.id}:agent"
-        }
+        out: dict[str, Thought] = {}
+        for tid in seed_ids:
+            t = self.thoughts.get(tid)
+            if t is not None:
+                out[tid] = t
+        return out
 
     def formation_thoughts(self, formation_id: Optional[str] = None) -> dict[str, Thought]:
         """
@@ -841,12 +841,16 @@ class Symbioid(System):
         aspect_label: Optional[str],
         *,
         kind: str = "Sensor",
+        full: bool = True,
     ) -> dict[str, Thought]:
         """
         Install awareness six-set: Agent **Has** aspect (e.g. "Symbioid has Ear").
 
         Registers `aspect_id` as an **integration terminator** so Innerface
         does not merge Observations across different Sensors/Actuators.
+
+        full=False: only register the terminator + lightweight aspect pole
+        (no awareness six-set). Use for high-cardinality maps (e.g. 200 cells).
         """
         if not hasattr(self, "agent") or self.agent is None:
             self.agent = Thought(
@@ -879,6 +883,13 @@ class Symbioid(System):
                 label=(aspect_name[0].upper() + aspect_name[1:]) if aspect_name else aspect_id,
             )
 
+        with self.graph_lock:
+            self.thoughts[aspect_pole.id] = aspect_pole
+            self.integration_terminators.add(aspect_id)
+
+        if not full:
+            return {"aspect": aspect_pole}
+
         awareness_id = f"{self.id}:aware:{kind.lower()}:{aspect_id}"
         store = complete_awareness_set(
             self.agent,
@@ -891,22 +902,41 @@ class Symbioid(System):
             for tid, t in store.items():
                 self.thoughts[tid] = t
             self.awareness_sets[aspect_id] = store
-            self.integration_terminators.add(aspect_id)
         emit_six_set("awareness", store)
         return store
 
-    def add_sensor(self, sensor: Optional[Sensor] = None, *, label: Optional[str] = None) -> Sensor:
+    def add_sensor(
+        self,
+        sensor: Optional[Sensor] = None,
+        *,
+        label: Optional[str] = None,
+        awareness: bool = True,
+    ) -> Sensor:
+        """
+        Register a Sensor. awareness=False skips full six-set (terminator only)
+        — preferred for dense maps (Tetris cells).
+        """
         s = sensor or Sensor(label=label or f"sensor-{len(self.sensors)}")
         with self.graph_lock:
             self.sensors.append(s)
-        self.install_aspect_awareness(s.id, s.label, kind="Sensor")
+        self.install_aspect_awareness(
+            s.id, s.label, kind="Sensor", full=bool(awareness)
+        )
         return s
 
-    def add_actuator(self, actuator: Optional[Actuator] = None, *, label: Optional[str] = None) -> Actuator:
+    def add_actuator(
+        self,
+        actuator: Optional[Actuator] = None,
+        *,
+        label: Optional[str] = None,
+        awareness: bool = True,
+    ) -> Actuator:
         a = actuator or Actuator(label=label or f"actuator-{len(self.actuators)}")
         with self.graph_lock:
             self.actuators.append(a)
-        self.install_aspect_awareness(a.id, a.label, kind="Actuator")
+        self.install_aspect_awareness(
+            a.id, a.label, kind="Actuator", full=bool(awareness)
+        )
         return a
 
     def __iter__(self) -> Iterator[Thought]:

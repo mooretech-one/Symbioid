@@ -501,6 +501,62 @@ class TetrisWorld:
                     out[r][c] = self.active.kind
         return out
 
+    def _column_locked(self, c: int) -> list[bool]:
+        """Per-row locked (settled) occupancy for column ``c``."""
+        return [bool(self.board[r][c]) for r in range(self.rows)]
+
+    def _column_active_rows(self, c: int) -> set[int]:
+        """Rows of the active piece in column ``c``."""
+        rows: set[int] = set()
+        if self.active is None:
+            return rows
+        for r, cc in self.active.cells():
+            if cc == c and 0 <= r < self.rows:
+                rows.add(r)
+        return rows
+
+    def cell_field_state(self, *, with_active: bool = True) -> list[list[float]]:
+        """
+        Full board map for sensors: each cell is one of
+
+          1.0 — block (locked, or active piece if with_active)
+          0.5 — hole  (empty with a **locked** fill above — not under the falling piece)
+          0.0 — open  (empty, no locked fill above)
+
+        Holes use locked board only so a falling piece does not invent
+        column-long hole storms under itself.
+        Row 0 is the top of the playfield.
+        """
+        rows, cols = self.rows, self.cols
+        out: list[list[float]] = [[0.0 for _ in range(cols)] for _ in range(rows)]
+        for c in range(cols):
+            locked = self._column_locked(c)
+            active_rows = self._column_active_rows(c) if with_active else set()
+            seen_locked = False
+            for r in range(rows):
+                if locked[r] or r in active_rows:
+                    out[r][c] = 1.0
+                    if locked[r]:
+                        seen_locked = True
+                elif seen_locked:
+                    out[r][c] = 0.5
+                else:
+                    out[r][c] = 0.0
+        return out
+
+    def cell_reading(self, r: int, c: int, *, with_active: bool = True) -> float:
+        """Single-cell reading (block=1.0, hole=0.5, open=0.0)."""
+        if r < 0 or c < 0 or r >= self.rows or c >= self.cols:
+            return 0.0
+        locked = self._column_locked(c)
+        if locked[r]:
+            return 1.0
+        if with_active and r in self._column_active_rows(c):
+            return 1.0
+        if any(locked[rr] for rr in range(r)):
+            return 0.5
+        return 0.0
+
     def ghost_row(self) -> Optional[int]:
         """Row of active piece if hard-dropped (top-left box row)."""
         if self.active is None:

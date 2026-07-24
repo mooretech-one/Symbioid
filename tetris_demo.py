@@ -145,41 +145,61 @@ def thought_counts_active_inactive(s: Symbioid) -> tuple[int, int]:
 
 
 def build_symbioid(world: TetrisWorld) -> Symbioid:
+    """
+    Sensors: full 10×20 cell map (block / hole / open) + slim meta
+    (piece_id, next_id, lines, last_byte). Aggregates dropped — spatial map
+    supersedes height/hole totals.
+
+    Cell sensors use awareness=False (terminator only) to avoid 200 full
+    awareness six-sets. Sampling is change-only (see sample_into_symbioid).
+    """
     s = Symbioid(id=HOST_ID, label="tetris-byte-learner")
     s.interface.continuous_inputs = False
     s.outerface.wait_for_feedback = False
+    # Last cell readings for change-only formation (sensor_id → float)
+    s._cell_last_reading: dict[str, float] = {}  # type: ignore[attr-defined]
+    s._cell_rc: dict[str, tuple[int, int]] = {}  # type: ignore[attr-defined]
+
+    # Full playfield map: one sensor per cell (stable ids; no full awareness)
+    for r in range(world.rows):
+        for c in range(world.cols):
+            label = f"cell_r{r:02d}_c{c:02d}"
+
+            def _cell_xfer(
+                _w: dict,
+                wo: TetrisWorld = world,
+                row: int = r,
+                col: int = c,
+            ) -> float:
+                return wo.cell_reading(row, col, with_active=True)
+
+            sen = s.add_sensor(
+                Sensor(id=f"{HOST_ID}:sen:{label}", label=label),
+                awareness=False,
+            )
+            sen.transfer = _cell_xfer
+            s._cell_rc[sen.id] = (r, c)  # type: ignore[attr-defined]
 
     def piece_id_n(_w: dict, wo: TetrisWorld = world) -> float:
         if wo.active is None:
             return 0.0
         return PIECE_NAMES.index(wo.active.kind) / 6.0
 
-    def col_heights_mean(_w: dict, wo: TetrisWorld = world) -> float:
-        hs = wo.column_heights()
-        return (sum(hs) / len(hs) / wo.rows) if hs else 0.0
-
-    def height_range_n(_w: dict, wo: TetrisWorld = world) -> float:
-        hs = wo.column_heights()
-        if not hs:
+    def next_id_n(_w: dict, wo: TetrisWorld = world) -> float:
+        kind = getattr(wo, "next_kind", None)
+        if kind is None or kind not in PIECE_NAMES:
             return 0.0
-        return (max(hs) - min(hs)) / wo.rows
+        return PIECE_NAMES.index(kind) / 6.0
 
     for label, transfer in (
-        ("max_height", lambda w, wo=world: wo.max_height() / wo.rows),
-        ("agg_height", lambda w, wo=world: wo.aggregate_height() / (wo.rows * wo.cols)),
-        ("mean_height", col_heights_mean),
-        ("height_range", height_range_n),
-        ("holes", lambda w, wo=world: min(1.0, wo.hole_count() / 20.0)),
-        ("bumpiness", lambda w, wo=world: min(1.0, wo.bumpiness() / 30.0)),
-        ("lines", lambda w, wo=world: min(1.0, wo.lines / 50.0)),
         ("piece_id", piece_id_n),
+        ("next_id", next_id_n),
+        ("lines", lambda w, wo=world: min(1.0, wo.lines / 50.0)),
         ("last_byte", lambda w, wo=world: wo.last_byte / 255.0),
     ):
-        # Stable sensor ids → Observation content keys survive reloads
         sen = s.add_sensor(Sensor(id=f"{HOST_ID}:sen:{label}", label=label))
         sen.transfer = transfer
 
-    # Single actuator: raw control byte as 0..1 (×255 inside coach path)
     from symbioid import Actuator
 
     out = s.add_actuator(Actuator(id=f"{HOST_ID}:act:byte", label="byte"))
@@ -189,16 +209,58 @@ def build_symbioid(world: TetrisWorld) -> Symbioid:
 
 
 def sample_into_symbioid(s: Symbioid, world: TetrisWorld, tick: int) -> None:
+    """
+    Sample meta sensors every call; cell map is **change-only**:
+
+    - Build the field once per sample (not per cell).
+    - Skip formation when reading unchanged.
+    - Skip initial open (0.0) cells until they first become block/hole.
+    """
     w = world.sensor_world()
     w["byte"] = float(s.actuators[0].output)
     handoffs = []
+    last: dict[str, float] = getattr(s, "_cell_last_reading", None) or {}
+    cell_rc: dict[str, tuple[int, int]] = getattr(s, "_cell_rc", None) or {}
+    # One map for all cell sensors
+    field = world.cell_field_state(with_active=True) if cell_rc else None
+
     for sen in s.sensors:
+        rc = cell_rc.get(sen.id)
+        if rc is not None and field is not None:
+            r, c = rc
+            reading = float(field[r][c])
+            prev = last.get(sen.id)
+            # First sight of open sky: remember only, no Rodin storm
+            if prev is None and reading == 0.0:
+                last[sen.id] = reading
+                continue
+            if prev is not None and abs(prev - reading) < 1e-9:
+                continue
+            last[sen.id] = reading
+            sense = {
+                "sensor_id": sen.id,
+                "label": sen.label,
+                "reading": reading,
+                "tick": tick,
+                "kind": "input",
+            }
+            h = s.interface.start_formation_for_sensor(
+                sen, force=True, sense=sense
+            )
+            if h is not None:
+                handoffs.append(h)
+            continue
+
+        # Meta sensors (piece, next, lines, byte)
         sense = sen.sample(tick=tick, world=w)
         if sense is None:
             continue
         h = s.interface.start_formation_for_sensor(sen, force=True, sense=sense)
         if h is not None:
             handoffs.append(h)
+
+    s._cell_last_reading = last  # type: ignore[attr-defined]
+
     if not handoffs:
         return
     if len(handoffs) > 1:

@@ -344,19 +344,19 @@ Sample world map includes actuator values (`w["left"]`, `w["right"]`) so transfe
 
 Host label: `tetris-byte-learner`. Policy: `TetrisCoach` discovers a secret byte→command map, then places pieces (1-ply sim + learned board value). Control is a **single normalized byte**; the world cipher maps only a few of 0–255 to left/right/rotate/hard.
 
-**Sensors (9)**
+**Sensors (204)** — full spatial map + slim meta
 
 | Label | Transfer (from `TetrisWorld`) | Scaling |
 |-------|------------------------------|---------|
-| `max_height` | tallest column | `/ rows` → ~[0, 1] |
-| `agg_height` | sum of column heights | `/ (rows × cols)` → ~[0, 1] |
-| `mean_height` | mean column height | `/ rows` → ~[0, 1] |
-| `height_range` | max − min column height | `/ rows` → ~[0, 1] |
-| `holes` | enclosed empty cells | `min(1, holes/20)` |
-| `bumpiness` | Σ \|Δheight\| between neighbors | `min(1, bump/30)` |
-| `lines` | lines cleared this game | `min(1, lines/50)` |
+| `cell_r{RR}_c{CC}` × **200** (10×20) | `cell_reading(r,c)` with active piece painted | **1.0** block · **0.5** hole · **0.0** open |
 | `piece_id` | active piece kind | index in I…L `/ 6` → [0, 1] |
+| `next_id` | next piece kind | index `/ 6` → [0, 1] |
+| `lines` | lines cleared this game | `min(1, lines/50)` |
 | `last_byte` | last control byte applied | `last_byte / 255` → [0, 1] |
+
+Hole = empty cell with a filled cell above in the same column (classic Tetris). Aggregate height/hole totals are no longer separate sensors; the map supersedes them.
+
+**Perf:** cell sensors use `awareness=False` (terminator only). Sampling is **change-only** (one `cell_field_state` per tick; skip unchanged / initial open cells) so the Rodin path is not hit 200× every frame.
 
 **Actuators (1)**
 
