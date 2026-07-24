@@ -9,6 +9,7 @@ Hierarchy:
     ├── Body, Mind, Sensor, Actuator
 
   Process
+    ├── SpikingEngine   (phased: faces become engines)
     ├── Innerface
     ├── Interface
     └── Outerface
@@ -24,7 +25,8 @@ from symbioid.Core.Mind import Mind
 from symbioid.Core.Outerface import Outerface
 from symbioid.Core.Process import Process
 from symbioid.Core.Sensor import Sensor
-from symbioid.Core.Symbioid import Symbioid
+from symbioid.Core.SpikingEngine import PortPacket, SpikingEngine
+from symbioid.Core.Symbioid import ENGINES_MODES, PORT_I_N, PORT_N_O, Symbioid
 from symbioid.Core.System import System
 from symbioid.Core.Thought import Thought
 from symbioid.Core.formation import (
@@ -47,6 +49,7 @@ from symbioid.Core.formation import (
     ensure_sensor_thought,
     extract_observation,
     format_six_set_line,
+    is_scaffold_thought,
     rodin_double,
     rodin_halve,
     rodin_halve_sequence,
@@ -66,11 +69,16 @@ __all__ = [
     "Sensor",
     "Actuator",
     "Process",
+    "SpikingEngine",
+    "PortPacket",
     "Innerface",
     "Interface",
     "Outerface",
     "Law",
     "Symbioid",
+    "ENGINES_MODES",
+    "PORT_I_N",
+    "PORT_N_O",
     "minimal_seed",
     "constitutional_seed",
     "is_minimal_symbioid_shape",
@@ -96,6 +104,7 @@ __all__ = [
     "extract_observation",
     "six_set_labels",
     "six_set_poles",
+    "is_scaffold_thought",
     "format_six_set_line",
     "emit_six_set",
     "set_console_emit",

@@ -17,16 +17,19 @@ def minimal_seed(
     p = id_prefix
     lab = (lambda s: s) if with_labels else (lambda s: None)
 
-    system = Thought(id=f"{p}system", label=lab("System"))
-    environment = Thought(id=f"{p}environment", label=lab("Environment"))
-    exists_in = Thought(id=f"{p}exists_in", label=lab("ExistsIn"))
-    exists_around = Thought(id=f"{p}exists_around", label=lab("ExistsAround"))
+    # High threshold: structural seed poles do not spam-fire
+    _struct = dict(threshold=10.0, dynamics_enabled=True)
+    system = Thought(id=f"{p}system", label=lab("System"), **_struct)
+    environment = Thought(id=f"{p}environment", label=lab("Environment"), **_struct)
+    exists_in = Thought(id=f"{p}exists_in", label=lab("ExistsIn"), **_struct)
+    exists_around = Thought(id=f"{p}exists_around", label=lab("ExistsAround"), **_struct)
     link_in = Link(
         id=f"{p}sys_exists_in_env",
         label=lab("SystemExistsInEnvironment"),
         source=system,
         link_type=exists_in,
         target=environment,
+        threshold=10.0,
     )
     link_around = Link(
         id=f"{p}env_exists_around_sys",
@@ -34,6 +37,7 @@ def minimal_seed(
         source=environment,
         link_type=exists_around,
         target=system,
+        threshold=10.0,
     )
     return {
         t.id: t

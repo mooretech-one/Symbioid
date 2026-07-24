@@ -51,14 +51,21 @@ def constitutional_seed(
     p = id_prefix
     lab = (lambda s: s) if with_labels else (lambda s: None)
 
-    protected = Thought(id=f"{p}protected_environment", label=lab("ProtectedEnvironment"))
-    authority = Thought(id=f"{p}authority", label=lab("Authority"))
-    self_node = Thought(id=f"{p}self", label=lab("Self"))
+    _hi = dict(threshold=10.0)
+    protected = Thought(
+        id=f"{p}protected_environment", label=lab("ProtectedEnvironment"), **_hi
+    )
+    authority = Thought(id=f"{p}authority", label=lab("Authority"), **_hi)
+    self_node = Thought(id=f"{p}self", label=lab("Self"), **_hi)
 
-    lt_l0 = Thought(id=f"{p}lt_preserve_twin", label=lab("MustPreserveTwinIntegrity"))
-    lt_l1 = Thought(id=f"{p}lt_must_not_harm", label=lab("MustNotHarm"))
-    lt_l2 = Thought(id=f"{p}lt_must_obey", label=lab("MustObeyUnlessHigher"))
-    lt_l3 = Thought(id=f"{p}lt_preserve_self", label=lab("MayPreserveSelfUnlessHigher"))
+    lt_l0 = Thought(
+        id=f"{p}lt_preserve_twin", label=lab("MustPreserveTwinIntegrity"), **_hi
+    )
+    lt_l1 = Thought(id=f"{p}lt_must_not_harm", label=lab("MustNotHarm"), **_hi)
+    lt_l2 = Thought(id=f"{p}lt_must_obey", label=lab("MustObeyUnlessHigher"), **_hi)
+    lt_l3 = Thought(
+        id=f"{p}lt_preserve_self", label=lab("MayPreserveSelfUnlessHigher"), **_hi
+    )
 
     link_l0 = Link(
         id=f"{p}law_l0",
@@ -66,6 +73,7 @@ def constitutional_seed(
         source=agent,
         link_type=lt_l0,
         target=environment,
+        threshold=10.0,
     )
     link_l1 = Link(
         id=f"{p}law_l1",
@@ -73,6 +81,7 @@ def constitutional_seed(
         source=agent,
         link_type=lt_l1,
         target=protected,
+        threshold=10.0,
     )
     link_l2 = Link(
         id=f"{p}law_l2",
@@ -80,6 +89,7 @@ def constitutional_seed(
         source=agent,
         link_type=lt_l2,
         target=authority,
+        threshold=10.0,
     )
     link_l3 = Link(
         id=f"{p}law_l3",
@@ -87,6 +97,7 @@ def constitutional_seed(
         source=agent,
         link_type=lt_l3,
         target=self_node,
+        threshold=10.0,
     )
 
     laws = [

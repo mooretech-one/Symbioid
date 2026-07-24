@@ -58,11 +58,125 @@ Process
 | `sensors` | `list[Sensor]` |
 | `actuators` | `list[Actuator]` |
 | `thoughts` / `thought_list` | structural Thought store (default six-seed) |
+| `mind` | `Mind` — recognition / habituation / valence (see below) |
 | `innerface` | `Innerface` |
 | `interface` | `Interface` |
 | `outerface` | `Outerface` |
 
 Pole roles "System"/"Environment" inside the six-seed are **Thoughts**, not the Symbioid instance.
+
+### Mind recognition (growth under constant I/O)
+
+`Mind` is the policy owner that turns “every sample → new Observation” into **same input → same Thought** (or skip):
+
+| Decision | When | Graph effect |
+|----------|------|----------------|
+| **mint** | Novel content key for that sensor | New content-addressed Observation + sense six-set |
+| **reuse** | Known key, not yet habituated | Same Observation poles; no new scaffolding |
+| **skip** | Same key ≥ `habituate_after` times in a row | No handoff |
+
+**Follows / FollowedBy** co-occurrence uses the same mint/reuse/skip policy via `Mind.admit_follows`: undirected pair of Observation content keys → stable `sync_id`. Repeated multi-sensor batches with the same values do **not** re-mint Follows scaffolding.
+
+**Integrates / IntegratedBy** (Rodin halving) uses `Mind.admit_integrates`: undirected pole pair **+ awareness channel** (+ depth parent ids for depth-fold) → stable `integrate_id`. Same pair/channel does not remint integrate scaffolding.
+
+### Spiking engines (migration)
+
+`engines_mode` on `Symbioid`: **`legacy`** (default) | `hybrid` | `spike`.
+
+- **Phase 0:** `SpikingEngine` base + `pulse_partition(membership=…)`; `pulse_tick()` = full-graph partition.
+- **Phase 1:** `Interface` **is** a `SpikingEngine`.
+  - `legacy`: sample → handoff every formation → full `pulse_tick`.
+  - `hybrid`/`spike`: sample → stimulate → **membership pulse** → handoff **mint only**.
+- **Phase 2:** `Innerface` **is** a `SpikingEngine`.
+  - `legacy`: inbox formation/sync/integrate automata as before.
+  - `hybrid`/`spike`: **port-in** from Interface → membership pulse → **co-fire consolidator** → sparse depth-fold/prune.
+- **Phase 3:** `Outerface` **is** a `SpikingEngine`.
+  - `legacy`: Beliefs + graph recommend + law-gated fire.
+  - `hybrid`/`spike`: **port-in** from Innerface → membership pulse → **hottest Action** under law gate.
+- **Phase 4:** `engines_mode="spike"` demotes inbox automata.
+  - Interface: **no** Innerface inbox handoffs; mints go to `structure_pending`.
+  - Innerface: pulls `structure_pending` consolidator only (drops inbox); co-fire + sparse prune.
+  - Outerface: spike heat first; beliefs last resort.
+  - `Symbioid.run_engines()` runs serial **I → N → O**.
+- **Phase 5 (now):** port queues + energy budgets + Port-only cross-engine Hebb.
+  - `PortPacket` FIFO on `Symbioid.port_queues` (`interface>innerface`, `innerface>outerface`).
+  - Engines **export** firers via `export_port_packets`; **import** via `drain_port` + `apply_port_packets`.
+  - `Link.is_port=True` channels modulate transfer gain and take Hebb on successful import; they **never** participate in pulse spread.
+  - Under membership, non-Port Hebb only when the target is also in membership (`Mind.port_hebb_cross_only`).
+  - Per-engine **energy budget** caps fire/spread cost (`Mind.energy_budget_*`, `energy_fire_cost`, `energy_spread_cost`; `0` = unlimited).
+
+```python
+s = Symbioid()
+s.engines_mode = "spike"
+s.mind.energy_budget_interface = 8.0   # optional cap
+s.run_engines()   # I → N → O via port queues
+```
+
+### Thought firing + decay (Thoughts double as neurons)
+
+There is no separate `Neuron` class. Each **Thought** (including **Link**) carries:
+
+| Field | Role |
+|-------|------|
+| `activation` | Short-term energy (Signal) |
+| `threshold` / `try_fire` | Fire when activation ≥ threshold |
+| `decay_rate` / `decay_step` | Leak toward `resting` each pulse tick |
+| `refractory_ticks` | Blocks immediate re-fire |
+
+`Symbioid.pulse_tick()`: decay hot set → collect fires → **one-hop** spread along outgoing Links (`weight × propagate_gain`) → **Hebbian** weight update.  
+Interface **stimulates** Sensor + Observation poles on sample (mint/reuse/skip).  
+Structural seeds / laws use high `threshold` so they do not thrash.
+
+**Activation-based forgetting:** decay alone only quiets energy; structure stays. With **`Mind.forget_cold_enabled=True`** (default), `Innerface.forget_cold_thoughts()` removes **unprotected** Thoughts that have been near resting for ≥ `forget_cold_cycles` host pulse cycles since `last_hot_cycle` (must have been hot at least once). Default **`forget_transient_only=False`** (any unprotected Thought; set `True` to limit to transients). Mind registry Observations/Actions, active six-sets, seeds, laws, last obs, and beliefs stay protected (same set as structure prune).
+
+```python
+s.mind.forget_cold_enabled = True   # default
+s.mind.forget_cold_cycles = 64
+# runs with structure prune via Innerface.maybe_gc()
+# s.mind.forget_cold_enabled = False  # opt out
+```
+
+**Plasticity (`Link.weight`):**
+
+| Event | Effect |
+|-------|--------|
+| Both poles fire same tick | `weight += hebb_lr × hebb_co_fire_scale` (clamped) |
+| Pre fires, post active | smaller `hebb_pre_post_scale` bump |
+| `record_outcome` reward | `reinforce_edge` / `ensure_reciprocal_links` both ways |
+
+Defaults: `weight` starts at 1.0, range **`weight_min`…`weight_max`** (0.05…4). When `weight × propagate_gain ≳ threshold`, one pole can **recruit** its mate (dynamically stronger six-set).
+
+```python
+s.mind.dynamics_enabled = True   # master switch
+s.mind.hebb_enabled = True
+s.stimulate(obs, 1.2)
+s.pulse_tick()                   # fire + spread + Hebb + decay clock
+```
+
+### Behavior from minted Thoughts
+
+Minted structure is **read for action choice**, not only stored:
+
+| API | Role |
+|-----|------|
+| `ensure_action_thought(domain, token)` | Stable Action poles (`act:tetris:hard`) |
+| `record_outcome(state_poles, token, reward=…)` | Link state ↔ action (Follows + policy Integrates) + valence |
+| `recommend_action(state_poles, domain=…)` | Highest-valence Action linked to current state (fail open → `None`) |
+
+**Outerface** prefers `propose_actions_from_graph()` before the legacy “fire first actuator” path.  
+**Tetris** records outcomes on piece lock and, when the byte map is complete, biases `tick(preferred_intent=…)` from `recommend_action`.
+
+Content keys quantize float `reading` (`quantize_decimals=3` default). Registry Observations + Actions are protected from prune. Coach lock reward also fans into valence via `mind.note_valence(channel="board", delta=…)`.
+
+```python
+s = Symbioid()
+s.mind.recognition_enabled = True   # default
+s.mind.habituate_after = 2
+# After sensors sample + outcomes:
+# rec = s.mind.recommend_action(poles, domain="tetris")
+# Legacy always-mint growth (Observations + Follows):
+# s.mind.recognition_enabled = False
+```
 
 ### Constitution (Asimov-shaped, installed STABLE patterns)
 
@@ -237,7 +351,7 @@ TetrisCoach.tick ──writes──► actuator "byte".output = code/255
 
 The coach does **not** use `Actuator.request_fire` for moves; it writes the byte channel and steps the world directly. Symbioid still forms Thoughts/Beliefs from board sensors. Placement search uses world physics (`simulate_placement`) scored by a height-shaped + learned evaluator; the secret control map is learned from observation only (never from reading `cipher`).
 
-**UI extras (Tetris):** 5 s pause after top-out for Innerface catch-up; dual plots of **Active** vs **Inactive** Thought counts over a 1024-turn window; highscores sorted best-first (`#ddd ssssss`).
+**UI extras (Tetris):** pause after top-out for Innerface catch-up; plots of **Active**, **Inactive**, and **Minted** Thought counts over a 1024-turn window; highscores sorted best-first (`#ddd ssssss`). Superseded Rodin sense/sync scaffolding (Links + relation types) is GC'd from the live graph after integrate/depth-fold.
 
 ## Single-file executables (Pong + Tetris)
 

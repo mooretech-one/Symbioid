@@ -1,8 +1,11 @@
 """Minimal Antelligence ontology: System → Thought/Link + Symbioid aspects & faces."""
 
 from symbioid.Core import (
+    ENGINES_MODES,
     INNERFACE_RODIN_STAGES,
     INTERFACE_RODIN_STAGES,
+    PORT_I_N,
+    PORT_N_O,
     RODIN_CYCLE,
     RODIN_HALVE_CYCLE,
     Actuator,
@@ -13,8 +16,10 @@ from symbioid.Core import (
     Link,
     Mind,
     Outerface,
+    PortPacket,
     Process,
     Sensor,
+    SpikingEngine,
     Symbioid,
     System,
     Thought,
@@ -48,11 +53,16 @@ __all__ = [
     "Sensor",
     "Actuator",
     "Process",
+    "SpikingEngine",
+    "PortPacket",
     "Innerface",
     "Interface",
     "Outerface",
     "Law",
     "Symbioid",
+    "ENGINES_MODES",
+    "PORT_I_N",
+    "PORT_N_O",
     "minimal_seed",
     "constitutional_seed",
     "is_minimal_symbioid_shape",
@@ -78,4 +88,4 @@ __all__ = [
     "console_emit_enabled",
 ]
 
-__version__ = "0.0.7"
+__version__ = "0.0.20"

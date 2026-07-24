@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
 from symbioid.Core.Link import Link
-from symbioid.Core.Process import Process
+from symbioid.Core.SpikingEngine import SpikingEngine
 from symbioid.Core.Thought import Thought
 from symbioid.Core.formation import (
     complete_belief_set,
@@ -67,18 +67,29 @@ def _expected_observation_from_store(store: dict[str, Thought]) -> Optional[Thou
 
 
 @dataclass
-class Outerface(Process):
+class Outerface(SpikingEngine):
     """
     Outer process (~9): Belief → Action → World → Feedback.
 
     One active Belief six-set per Sensor channel (Feedback[eye] anticipates …).
     Updating Feedback revises the expected Observation; it does not nest labels.
+
+    **legacy:** inbox Beliefs + propose_actions_from_beliefs (graph recommend).
+
+    **hybrid/spike (Phase 3):** SpikingEngine — port-in from Innerface, membership
+    pulse, act on **hottest Action** Thought under constitutional gate.
     """
 
     id: str = field(default_factory=lambda: _new_id("outer-"))
     label: Optional[str] = "Outerface"
+    engine_name: str = "outerface"
+    port_gain: float = 0.55
     agency_ticks: int = field(default=0, init=False, repr=False)
     last_gate: Optional[str] = field(default=None, init=False, repr=False)
+    # Phase 3 metrics
+    spike_actions: int = field(default=0, init=False, repr=False)
+    port_imports: int = field(default=0, init=False, repr=False)
+    engine_ticks: int = field(default=0, init=False, repr=False)
 
     # belief_id → six-Thought store (stable id per sensor channel)
     completed_beliefs: dict[str, dict[str, Thought]] = field(
@@ -111,6 +122,21 @@ class Outerface(Process):
 
     def process(self) -> Optional[threading.Thread]:
         return super().process()
+
+    def _engine_mode(self) -> str:
+        host = self.host
+        if host is None:
+            return "legacy"
+        mode = getattr(host, "engines_mode", "legacy") or "legacy"
+        return mode if mode in ("legacy", "hybrid", "spike") else "legacy"
+
+    def _register_members(self, *thoughts: Optional[Thought]) -> None:
+        for t in thoughts:
+            if t is None:
+                continue
+            self.add_member(t.id)
+            if t.engine_owner is None:
+                t.engine_owner = self.engine_name
 
     @property
     def beliefs(self) -> dict[str, dict[str, Thought]]:
@@ -556,16 +582,63 @@ class Outerface(Process):
                 if sid in exhausted:
                     self._pending_feedback.pop(sid, None)
 
+    def _current_state_poles(self) -> list[Thought]:
+        """Last Observation poles per sensor (for graph recommend)."""
+        host = self.host
+        if host is None or host.innerface is None:
+            return []
+        with host.innerface._local_lock:
+            return list(host.innerface._last_obs_by_sensor.values())
+
+    def propose_actions_from_graph(self) -> list[tuple[bool, str]]:
+        """
+        Behavior from minted Thoughts: recommend Action via Mind graph+valence.
+
+        Fail open (empty list) when cold so beliefs / explore can take over.
+        """
+        host = self.host
+        if host is None or host.mind is None or not host.mind.enabled:
+            return []
+        self._drop_pending_for_exhausted_sensors()
+        with self._local_lock:
+            if self.wait_for_feedback and self._pending_feedback:
+                return []
+        poles = self._current_state_poles()
+        if not poles:
+            return []
+        domain = (host.label or "default").replace(" ", "_")
+        rec = host.mind.recommend_action(poles, domain=domain)
+        if rec is None:
+            # Also try generic domain used by demos
+            rec = host.mind.recommend_action(poles, domain="default")
+        if rec is None:
+            return []
+        with host.graph_lock:
+            actuators = list(host.actuators)
+        if not actuators:
+            return []
+        act = actuators[0]
+        ok, reason = act.request_fire(host, rec.token)
+        with self._local_lock:
+            self.last_gate = f"graph:{rec.token}:{reason}"
+            if not ok:
+                self.actuator_denies += 1
+        return [(ok, reason)]
+
     def propose_actions_from_beliefs(self) -> list[tuple[bool, str]]:
         """
         Closed-loop agency: fire at most once while no Feedback is pending.
 
-        Prevents hand racing ahead of Interface samples (which caused inverted
-        challenge: expected next value, got previous sample).
+        Prefer graph recommend (minted associations) when available; else fire
+        first actuator with its label (legacy).
         """
         host = self.host
         if host is None:
             return []
+        graph = self.propose_actions_from_graph()
+        if graph:
+            return graph
+
         self._drop_pending_for_exhausted_sensors()
         with self._local_lock:
             if self.wait_for_feedback and self._pending_feedback:
@@ -592,13 +665,67 @@ class Outerface(Process):
                 self.actuator_denies += 1
         return results
 
-    def _process_body(self) -> None:
-        """Agency tick: Feedback→Belief six-sets; Action proposals gated by laws."""
+    def propose_actions_from_spikes(self) -> list[tuple[bool, str]]:
+        """
+        Phase 3: act on the hottest Action Thought in membership (activation),
+        falling back to graph recommend / beliefs. Laws still gate request_fire.
+        """
+        host = self.host
+        if host is None or host.mind is None:
+            return []
+        self._drop_pending_for_exhausted_sensors()
+        with self._local_lock:
+            if self.wait_for_feedback and self._pending_feedback:
+                return []
+
+        mind = host.mind
+        best_token: Optional[str] = None
+        best_act = -1.0
+        with mind._lock:
+            actions = list(mind._actions.items())
+        for ck, th in actions:
+            score = float(th.activation)
+            if th.just_fired or int(getattr(th, "last_fired_cycle", -1)) == int(
+                host.pulse_cycle
+            ):
+                score += 0.5
+            if score > best_act:
+                best_act = score
+                best_token = mind._action_tokens.get(ck) or (
+                    ck.split(":", 2)[-1] if ck.startswith("act:") else None
+                )
+
+        # spike mode: lower floor — prefer Action heat over automata
+        mode = self._engine_mode()
+        heat_floor = 0.12 if mode == "spike" else 0.25
+        if best_token is not None and best_act >= heat_floor:
+            with host.graph_lock:
+                actuators = list(host.actuators)
+            if not actuators:
+                return []
+            act = actuators[0]
+            ok, reason = act.request_fire(host, best_token)
+            with self._local_lock:
+                self.last_gate = f"spike:{best_token}:{reason}"
+                if ok:
+                    self.spike_actions += 1
+                else:
+                    self.actuator_denies += 1
+            return [(ok, reason)]
+
+        # Cold spike field → graph recommend (valence + activation)
+        graph = self.propose_actions_from_graph()
+        if graph or mode == "spike":
+            # spike: do not fall back further here (post_ports may still use beliefs)
+            return graph
+        return graph
+
+    def _handle_inbox_messages(self) -> list[dict[str, Any]]:
+        """Beliefs + action proposals (thin consolidator / control plane)."""
         messages = self._drain_inbox()
         host = self.host
         if host is None:
-            return
-
+            return []
         proposals: list[dict[str, Any]] = []
         for msg in messages:
             if not isinstance(msg, dict):
@@ -611,7 +738,12 @@ class Outerface(Process):
                     self.last_error = f"belief: {exc}"
             elif kind == "action_proposal":
                 proposals.append(msg)
+        return proposals
 
+    def _apply_action_proposals(self, proposals: list[dict[str, Any]]) -> None:
+        host = self.host
+        if host is None:
+            return
         for msg in proposals:
             allowed, reason = self.check_action(
                 host,
@@ -651,11 +783,128 @@ class Outerface(Process):
                 with self._local_lock:
                     self.actuator_denies += 1
 
-        if self.active_belief_ids and host.actuators:
-            self.propose_actions_from_beliefs()
+    def pre_ports(self) -> None:
+        """Belief inbox + port-in from Innerface + Action membership."""
+        host = self.host
+        if host is None:
+            return
+        proposals = self._handle_inbox_messages()
+        self._pending_proposals = proposals  # type: ignore[attr-defined]
+
+        # Port-in: Phase 5 queue first, then last_export_ids fallback
+        gain = float(self.port_gain)
+        if host.mind is not None:
+            gain = float(getattr(host.mind, "port_gain", gain))
+        packets = host.drain_port("innerface", "outerface")
+        if packets:
+            n = host.apply_port_packets(packets, gain=gain, hebb=True)
+            for pkt in packets:
+                t = host.thoughts.get(pkt.thought_id)
+                if t is not None:
+                    self._register_members(t)
+            with self._local_lock:
+                self.port_imports += n
+        else:
+            inner = getattr(host, "innerface", None)
+            if inner is not None:
+                for tid in list(getattr(inner, "last_export_ids", None) or []):
+                    t = host.thoughts.get(tid)
+                    if t is None:
+                        continue
+                    amt = float(getattr(t, "export_activation", 0.0) or 0.0) * gain
+                    if amt == 0:
+                        continue
+                    host.stimulate(t, amt)
+                    self._register_members(t)
+                    with self._local_lock:
+                        self.port_imports += 1
+
+        # Belief poles
+        with self._local_lock:
+            for bid in list(self.active_belief_ids):
+                store = self.completed_beliefs.get(bid)
+                if store:
+                    self._register_members(*six_set_poles(store))
+
+        # Action poles from Mind registry
+        mind = host.mind
+        if mind is not None:
+            with mind._lock:
+                for th in mind._actions.values():
+                    host.add_thought(th)
+                    self._register_members(th)
+
+        # State observations (for recommend fallback)
+        for t in self._current_state_poles():
+            self._register_members(t)
+
+    def pulse(self) -> dict[str, int]:
+        host = self.host
+        if host is None:
+            return {"cycle": 0, "hot": 0, "fired": 0, "spread": 0, "hebb": 0}
+        if not getattr(host.mind, "dynamics_enabled", True):
+            return {
+                "cycle": host.pulse_cycle,
+                "hot": 0,
+                "fired": 0,
+                "spread": 0,
+                "hebb": 0,
+            }
+        self.use_membership = True
+        if not self.membership:
+            self.last_pulse_stats = {
+                "cycle": host.pulse_cycle,
+                "hot": 0,
+                "fired": 0,
+                "spread": 0,
+                "hebb": 0,
+                "engine": self.engine_name,
+            }
+            self.last_export_ids = []
+            return self.last_pulse_stats
+        return super().pulse()
+
+    def post_ports(self) -> None:
+        """Apply explicit proposals then spike-driven / graph / belief actions."""
+        host = self.host
+        if host is None:
+            return
+        proposals = getattr(self, "_pending_proposals", None) or []
+        self._apply_action_proposals(list(proposals))
+        self._pending_proposals = []  # type: ignore[attr-defined]
+
+        # Prefer spike heat; graph inside propose_actions_from_spikes; beliefs last
+        if host.actuators:
+            spiked = self.propose_actions_from_spikes()
+            if not spiked and self.active_belief_ids:
+                self.propose_actions_from_beliefs()
 
         with self._local_lock:
+            self.engine_ticks += 1
             self.agency_ticks += 1
+
+    def _process_body_legacy(self) -> None:
+        """Original agency automata path."""
+        proposals = self._handle_inbox_messages()
+        self._apply_action_proposals(proposals)
+        host = self.host
+        if host is not None and self.active_belief_ids and host.actuators:
+            self.propose_actions_from_beliefs()
+        with self._local_lock:
+            self.agency_ticks += 1
+
+    def _process_body(self) -> None:
+        """legacy automata vs hybrid/spike agency engine."""
+        host = self.host
+        if host is None:
+            return
+        if self._engine_mode() == "legacy":
+            self._process_body_legacy()
+            return
+        self.use_membership = True
+        self.pre_ports()
+        self.pulse()
+        self.post_ports()
 
     def check_action(
         self,

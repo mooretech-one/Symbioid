@@ -128,6 +128,11 @@ def begin_sensor_formation(
     with_labels: bool = True,
     sense: Optional[dict[str, Any]] = None,
     sensor_thought: Optional[Thought] = None,
+    observation: Optional[Thought] = None,
+    formation_id: Optional[str] = None,
+    content_key: Optional[str] = None,
+    reused: bool = False,
+    mind_action: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     Interface stages (Rodin 1→2) for one Sensor Input.
@@ -135,10 +140,13 @@ def begin_sensor_formation(
     Source = Sensor (grounding Thought)
     Target = Observation (Input value Thought)
 
+    When ``observation`` / ``formation_id`` are provided (Mind recognition),
+    poles are content-addressed and stable across identical Inputs.
+
     Returns a handoff for complete_formation.
     """
     lab = (lambda s: s) if with_labels else (lambda s: None)
-    fid = formation_id_for_sensor(host_id, sensor.id, generation)
+    fid = formation_id or formation_id_for_sensor(host_id, sensor.id, generation)
     p = f"{fid}:"
     sensor_lab = sensor.label or sensor.id
 
@@ -153,11 +161,14 @@ def begin_sensor_formation(
             sense_value = f"{sensor_lab}:{sense['sample']}"
         elif sense_value is None:
             sense_value = sensor_lab
-    observation = Thought(
-        id=f"{p}observation",
-        label=lab(str(sense_value)),
-        transient=True,
-    )
+    if observation is None:
+        observation = Thought(
+            id=f"{p}observation",
+            label=lab(str(sense_value)),
+            transient=True,
+        )
+    elif observation.label is None and with_labels:
+        observation.label = str(sense_value)
     return {
         "kind": "formation_handoff",
         "formation_id": fid,
@@ -170,6 +181,9 @@ def begin_sensor_formation(
         "with_labels": with_labels,
         "sense": sense,
         "tick": (sense or {}).get("tick"),
+        "content_key": content_key,
+        "reused": bool(reused),
+        "mind_action": mind_action or ("reuse" if reused else "mint"),
         "partial": {
             "sensor": source,
             "observation": observation,
@@ -312,6 +326,35 @@ def six_set_poles(store: dict[str, Thought]) -> list[Thought]:
         for t in store.values()
         if not isinstance(t, Link) and (t.label not in _SIX_SET_TYPE_LABELS)
     ]
+
+
+# Relation-type + Link scaffolding created on Rodin double (sense/sync) or
+# halve (integrate). Safe to GC once the six-set is superseded / inactive.
+_SCAFFOLD_LABELS: frozenset[str] = frozenset(
+    {
+        "Perceives",
+        "PerceivedBy",
+        "Follows",
+        "FollowedBy",
+        "Integrates",
+        "IntegratedBy",
+        "Expects",
+        "ExpectedBy",
+    }
+)
+
+
+def is_scaffold_thought(thought: Thought) -> bool:
+    """
+    True for ghost scaffolding from a six-set (Links + relation-type Thoughts).
+
+    Poles (Sensor, Observation, Feedback, …) return False and may be retained
+    via Mind registry / active sets.
+    """
+    if isinstance(thought, Link):
+        return True
+    lab = thought.label
+    return lab is not None and lab in _SCAFFOLD_LABELS
 
 
 def extract_observation(store: dict[str, Thought]) -> Optional[Thought]:

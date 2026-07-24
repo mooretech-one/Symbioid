@@ -455,30 +455,50 @@ def test_temporal_integrate_last_two_same_sensor():
 
 def test_prune_removes_superseded_sense_scaffolding():
     """After Integrate, inactive formation scaffolding is GC'd; poles remain."""
+    from symbioid.Core.Link import Link
+    from symbioid.Core.formation import is_scaffold_thought
+
     s = Symbioid(label="prune")
     s.innerface.auto_prune = True
     eye = s.add_sensor(label="eye")
     h1 = s.interface.start_formation_for_sensor(eye, force=True, sense=eye.sample(tick=1))
+    assert h1 is not None
+    fid1 = h1["formation_id"]
     s.innerface.accept_formation(h1)
+    # Scaffold from first sense set is on the graph before integrate
+    scaffold_before = [
+        tid
+        for tid, t in s.thoughts.items()
+        if tid.startswith(f"{fid1}:") and is_scaffold_thought(t)
+    ]
+    assert len(scaffold_before) >= 4  # Perceives, PerceivedBy, 2 Links
     n_after_first = len(s.thoughts)
     h2 = s.interface.start_formation_for_sensor(eye, force=True, sense=eye.sample(tick=2))
     s.innerface.accept_formation(h2)
-    # Integrate should have pruned superseded sense scaffolding
+    # Integrate should have pruned superseded sense scaffolding (Rodin ghosts)
     assert s.innerface.thoughts_pruned > 0
     n_after_int = len(s.thoughts)
     # Graph should not keep growing unboundedly for two samples
     assert n_after_int < n_after_first + 20
+    # Ghost scaffold from first (superseded) formation must leave host.thoughts
+    for tid in scaffold_before:
+        assert tid not in s.thoughts, f"ghost scaffold still live: {tid}"
     # Active integrate store still present
     assert s.innerface.active_set_summary().get("integrate", 0) == 1
     # Sensor grounding pole still registered
     assert any(tid.endswith(f"sensor:{eye.id}") or f":sensor:{eye.id}" in tid for tid in s.thoughts)
+    # No orphan Links labeled Perceives from fid1
+    assert not any(
+        isinstance(t, Link) and t.id.startswith(f"{fid1}:") for t in s.thoughts.values()
+    )
 
 
 def test_h2_depth_fold_only_above_soft_cap():
-    """H2: depth fold only when active integrates exceed max (many may coexist)."""
+    """H2: depth fold respects global soft cap (eager off, high per-channel)."""
     s = Symbioid(label="depth")
-    # Soft cap still high enough to hold several concurrent patterns
+    s.innerface.eager_depth_fold = False
     s.innerface.max_active_integrates = 3
+    s.innerface.max_active_integrates_per_channel = 99
     eye = s.add_sensor(label="eye")
     ear = s.add_sensor(label="ear")
     for t in range(1, 6):
@@ -493,8 +513,27 @@ def test_h2_depth_fold_only_above_soft_cap():
         )
     n_int = s.innerface.active_set_summary().get("integrate", 0)
     assert n_int <= s.innerface.max_active_integrates
-    # Must not force collapse to a single belief-like integrate by default
     assert s.innerface.max_active_integrates >= 3
+
+
+def test_eager_depth_fold_cascades_per_channel():
+    """Eager multi-step halving keeps each sensor channel ≤ per-channel cap."""
+    s = Symbioid(label="eager-depth")
+    s.innerface.eager_depth_fold = True
+    s.innerface.max_active_integrates_per_channel = 2
+    s.innerface.max_active_integrates = 24
+    eye = s.add_sensor(label="eye")
+    for t in range(1, 10):
+        h = s.interface.start_formation_for_sensor(
+            eye, force=True, sense=eye.sample(tick=t)
+        )
+        s.innerface.accept_formation(h)
+    by_ch = s.innerface._active_integrates_by_channel()
+    assert by_ch, "expected at least one channel with integrates"
+    for ch, ids in by_ch.items():
+        assert len(ids) <= s.innerface.max_active_integrates_per_channel, (ch, len(ids))
+    assert s.innerface.depth_fold_count >= 1
+    assert s.innerface.integrate_count >= 8
 
 
 def test_belief_six_set_feedback_expects_observation():

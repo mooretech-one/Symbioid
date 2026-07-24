@@ -765,13 +765,24 @@ class TetrisCoach:
         assert b is not None
         return b, intent
 
-    def tick(self, world: TetrisWorld, *, run_gravity: bool = True) -> int:
+    def tick(
+        self,
+        world: TetrisWorld,
+        *,
+        run_gravity: bool = True,
+        preferred_intent: Optional[str] = None,
+        graph_bias: float = 0.92,
+    ) -> int:
         """
         Emit one secret byte. Learn byte map + drop effects from observation.
         Never scores candidates with simulate_placement.
 
         Gravity runs in a **separate** step after the command so left/right
         are not mixed with a free-fall delta (which previously broke mapping).
+
+        ``preferred_intent``: optional graph recommendation (e.g. left/hard).
+        When the byte map is complete and a live byte is known for that intent,
+        take it with probability ``graph_bias`` (else normal select_byte).
         """
         if world.game_over:
             self.last_effect = "game_over"
@@ -784,6 +795,17 @@ class TetrisCoach:
 
         before = WorldSnapshot.take(world)
         code, intent = self.select_byte(world)
+        # Minted-Thought bias: use graph intent when map is ready
+        if (
+            preferred_intent
+            and preferred_intent in VALID_ACTIONS
+            and self.map_complete()
+            and self.byte_for_effect(preferred_intent) is not None
+            and self.rng.random() < max(0.0, min(1.0, graph_bias))
+        ):
+            b = self.byte_for_effect(preferred_intent)
+            if b is not None:
+                code, intent = b, preferred_intent
         self.last_byte = code
         self.last_intent = intent
 

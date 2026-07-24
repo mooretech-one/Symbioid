@@ -31,6 +31,7 @@ except ImportError:
 
 from symbioid import Symbioid, format_six_set_line, set_console_emit
 from symbioid.world.tetris import (
+    VALID_ACTIONS,
     ActionCipher,
     PIECE_COLORS,
     PIECE_NAMES,
@@ -44,11 +45,12 @@ CELL = 28
 COLS, ROWS = 10, 20
 BOARD_W, BOARD_H = COLS * CELL, ROWS * CELL
 SIDE = 280
-# Plots under the board: Active / Inactive Thoughts vs game turns
-PLOT_H = 100  # height per plot panel
-PLOT_GAP = 8
-PLOT_MARGIN = 12
+# Plots under the board: Active / Inactive / Minted Thoughts vs game turns
+PLOT_H = 88  # height per plot panel
+PLOT_GAP = 6
+PLOT_MARGIN = 10
 PLOT_HISTORY = 1024  # game turns (piece locks) on the x-axis window
+N_PLOTS = 3
 MARGIN_X = 20
 MARGIN_Y = 20
 FOOTER_H = 28
@@ -57,9 +59,8 @@ H = (
     MARGIN_Y
     + BOARD_H
     + PLOT_MARGIN
-    + PLOT_H
-    + PLOT_GAP
-    + PLOT_H
+    + N_PLOTS * PLOT_H
+    + (N_PLOTS - 1) * PLOT_GAP
     + FOOTER_H
     + MARGIN_Y
 )
@@ -257,10 +258,12 @@ def draw(
     s: Symbioid,
     active_history: list[int],
     inactive_history: list[int],
+    mint_history: list[int],
     font: pygame.font.Font,
     font_sm: pygame.font.Font,
     *,
     pause_seconds_left: float | None = None,
+    graph_hint: str | None = None,
 ) -> None:
     screen.fill((12, 14, 28))
     ox, oy = MARGIN_X, MARGIN_Y
@@ -358,8 +361,11 @@ def draw(
         ),
         (sx, oy + 106),
     )
+    intent_line = f"intent {coach.last_intent}"
+    if graph_hint:
+        intent_line = f"{intent_line}  graph→{graph_hint}"
     screen.blit(
-        font_sm.render(f"intent {coach.last_intent}", True, (140, 180, 160)),
+        font_sm.render(intent_line, True, (140, 180, 160)),
         (sx, oy + 124),
     )
     scan = getattr(coach, "_scan_passes", 0)
@@ -376,9 +382,26 @@ def draw(
         ),
         (sx, oy + 142),
     )
+    # Mind recognition + dynamics (firing hot set)
+    screen.blit(
+        font_sm.render(
+            s.mind.summary(),
+            True,
+            (140, 200, 180),
+        ),
+        (sx, oy + 158),
+    )
+    screen.blit(
+        font_sm.render(
+            f"pulse fire={s.last_pulse_fired} hot={s.last_pulse_hot} c={s.pulse_cycle}",
+            True,
+            (180, 160, 200),
+        ),
+        (sx, oy + 172),
+    )
     # Discovered beliefs only (never ground-truth cipher)
-    screen.blit(font_sm.render("learned map:", True, (140, 150, 170)), (sx, oy + 164))
-    y = oy + 182
+    screen.blit(font_sm.render("learned map:", True, (140, 150, 170)), (sx, oy + 188))
+    y = oy + 206
     for line in _wrap(coach.map_progress(), 34):
         screen.blit(font_sm.render(line, True, (180, 190, 210)), (sx, y))
         y += 16
@@ -429,7 +452,7 @@ def draw(
      #   overlay = font.render(msg, True, (240, 120, 120))
      #   screen.blit(overlay, (ox + 8, oy + BOARD_H // 2 - 10))
 
-    # Two plots under the board: Active / Inactive Thoughts over turns
+    # Plots under the board: Active / Inactive / Minted Thoughts over turns
     plot_oy = oy + BOARD_H + PLOT_MARGIN
     draw_thought_plot(
         screen,
@@ -455,6 +478,19 @@ def draw(
         title="Inactive Thoughts",
         line_color=(120, 170, 255),
         marker_color=(180, 210, 255),
+        show_x_labels=False,
+    )
+    draw_thought_plot(
+        screen,
+        mint_history,
+        font_sm,
+        ox=ox,
+        oy=plot_oy + 2 * (PLOT_H + PLOT_GAP),
+        width=BOARD_W,
+        height=PLOT_H,
+        title="Minted Thoughts",
+        line_color=(240, 180, 80),
+        marker_color=(255, 210, 120),
         show_x_labels=True,
     )
 
@@ -527,16 +563,28 @@ def main(argv: list[str] | None = None) -> None:
     # Thought counts once per game turn (piece lock)
     active_history: list[int] = []
     inactive_history: list[int] = []
+    mint_history: list[int] = []
     last_pieces_for_plot = world.pieces_placed
+    last_graph_hint: str | None = None
+    # State poles at last command (for outcome write on lock)
+    last_cmd_poles: list = []
+    last_cmd_intent: str = "explore"
+
+    def _state_poles():
+        with s.innerface._local_lock:
+            return list(s.innerface._last_obs_by_sensor.values())
 
     def _record_thought_sample() -> None:
         a, i = thought_counts_active_inactive(s)
         active_history.append(a)
         inactive_history.append(i)
+        mint_history.append(int(s.mind.admits_mint))
         if len(active_history) > PLOT_HISTORY:
             del active_history[: len(active_history) - PLOT_HISTORY]
         if len(inactive_history) > PLOT_HISTORY:
             del inactive_history[: len(inactive_history) - PLOT_HISTORY]
+        if len(mint_history) > PLOT_HISTORY:
+            del mint_history[: len(mint_history) - PLOT_HISTORY]
 
     try:
         running = True
@@ -558,14 +606,45 @@ def main(argv: list[str] | None = None) -> None:
 
             if frame % sample_every == 0:
                 sample_into_symbioid(s, world, tick=frame)
+            # Continuous decay / fire / spread (Thought-as-neuron)
+            if s.mind.dynamics_enabled:
+                s.pulse_tick()
 
             if not world.game_over and frame % CMD_EVERY == 0:
                 prev_event = world.last_event
                 prev_pieces = world.pieces_placed
-                code = coach.tick(world)
+                # Graph recommend from minted state→action associations
+                poles = _state_poles()
+                rec = s.mind.recommend_action(poles, domain="tetris")
+                preferred = None
+                last_graph_hint = None
+                if rec is not None and rec.token in VALID_ACTIONS:
+                    preferred = rec.token
+                    last_graph_hint = f"{rec.token}@{rec.score:.2f}"
+                last_cmd_poles = poles
+                code = coach.tick(world, preferred_intent=preferred)
+                last_cmd_intent = coach.last_intent
+                if preferred and coach.last_intent == preferred:
+                    last_graph_hint = f"USE {preferred}"
                 s.actuators[0].output = code / 255.0
                 # One sample per game turn (piece lock)
                 if world.pieces_placed > prev_pieces:
+                    # Write outcome into minted graph (state poles ↔ action intent)
+                    intent = last_cmd_intent
+                    if intent in VALID_ACTIONS:
+                        s.mind.record_outcome(
+                            last_cmd_poles,
+                            intent,
+                            domain="tetris",
+                            host_id=s.id,
+                            reward=float(coach.last_reward),
+                            host=s,
+                        )
+                    # Feeling bridge: coach board reward → Mind valence on recent obs
+                    s.mind.note_valence(
+                        channel="board",
+                        delta=max(-2.0, min(2.0, float(coach.last_reward) / 50.0)),
+                    )
                     _record_thought_sample()
                     last_pieces_for_plot = world.pieces_placed
                 if coach.map_complete() and not was_mapped:
@@ -631,9 +710,11 @@ def main(argv: list[str] | None = None) -> None:
                 s,
                 active_history,
                 inactive_history,
+                mint_history,
                 font,
                 font_sm,
                 pause_seconds_left=pause_left,
+                graph_hint=last_graph_hint,
             )
             pygame.display.flip()
             clock.tick(FPS)
