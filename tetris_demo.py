@@ -157,11 +157,18 @@ def build_symbioid(world: TetrisWorld) -> Symbioid:
     s = Symbioid(id=HOST_ID, label="tetris-byte-learner")
     s.interface.continuous_inputs = False
     s.outerface.wait_for_feedback = False
-    # Learning structure (P0): avoid cell co-fire storms / zombie syncs
+    # Learning structure (P0): avoid cell co-fire storms / zombie syncs.
+    # Band B (research active-thoughts theory): serious network-primary WM +
+    # larger policy registries with act:-preferring hard eviction.
     s.innerface.cofire_meta_only = True
     s.innerface.allow_cross_channel_follows = False
-    s.innerface.max_active_syncs = 64
-    s.innerface.max_active_senses = 96
+    s.innerface.max_active_syncs = 112
+    s.innerface.max_active_senses = 224
+    s.innerface.max_active_integrates = 112
+    s.innerface.max_active_integrates_per_channel = 8
+    s.mind.max_follows_registry = 4096
+    s.mind.max_integrates_registry = 4096
+    s.mind.policy_registry_priority = True
 
     # Last cell readings for change-only formation (sensor_id → float)
     s._cell_last_reading: dict[str, float] = {}  # type: ignore[attr-defined]
@@ -777,6 +784,50 @@ def draw(
     ):
         screen.blit(font_sm.render(line, True, color), (sx, y))
         y += 20
+
+    # Active six-set breakdown (Band A caps; sense/sync/integrate)
+    n_act, n_inact = thought_counts_active_inactive(s)
+    summary = s.innerface.active_set_summary()
+    n_sense = int(summary.get("sense", 0))
+    n_sync = int(summary.get("sync", 0))
+    n_int = int(summary.get("integrate", 0))
+    cap_s = int(s.innerface.max_active_senses)
+    cap_y = int(s.innerface.max_active_syncs)
+    cap_i = int(s.innerface.max_active_integrates)
+    y += 8
+    screen.blit(
+        font_sm.render(f"Thoughts  A={n_act}  I={n_inact}", True, (140, 200, 160)),
+        (sx, y),
+    )
+    y += 16
+    screen.blit(
+        font_sm.render(
+            f"sets  se {n_sense}/{cap_s}  sy {n_sync}/{cap_y}  in {n_int}/{cap_i}",
+            True,
+            (130, 170, 200),
+        ),
+        (sx, y),
+    )
+    y += 16
+    n_fl = len(s.mind._follows)
+    n_ig = len(s.mind._integrates)
+    cap_fl = int(s.mind.max_follows_registry)
+    cap_ig = int(s.mind.max_integrates_registry)
+    screen.blit(
+        font_sm.render(
+            f"reg   fl {n_fl}/{cap_fl}  ig {n_ig}/{cap_ig}",
+            True,
+            (120, 150, 180),
+        ),
+        (sx, y),
+    )
+    y += 16
+    if graph_hint:
+        screen.blit(
+            font_sm.render(str(graph_hint)[:36], True, (200, 180, 120)),
+            (sx, y),
+        )
+        y += 16
 
     y += 12
     screen.blit(font_sm.render("next", True, (140, 150, 170)), (sx, y))

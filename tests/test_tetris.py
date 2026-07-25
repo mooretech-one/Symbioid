@@ -322,6 +322,30 @@ def test_phase_b_policy_poles_prefer_meta():
     assert 0.0 <= bias <= 1.0
 
 
+def test_build_symbioid_band_b_active_caps():
+    """Band B: wider WM + larger policy registries for network-primary learning."""
+    import tetris_demo as mod
+
+    w = TetrisWorld(rng=Random(0), gravity_interval=9999)
+    s = mod.build_symbioid(w)
+    assert s.innerface.max_active_senses == 224
+    assert s.innerface.max_active_syncs == 112
+    assert s.innerface.max_active_integrates == 112
+    assert s.innerface.max_active_integrates_per_channel == 8
+    assert s.mind.max_follows_registry == 4096
+    assert s.mind.max_integrates_registry == 4096
+    assert s.mind.policy_registry_priority is True
+    assert s.innerface.cofire_meta_only is True
+    assert s.innerface.allow_cross_channel_follows is False
+    summary = s.innerface.active_set_summary()
+    assert isinstance(summary, dict)
+    # Caps still bound force-activated sets (no runaway to uncapped 8k+)
+    for i in range(300):
+        s.innerface._activate(f"{s.id}:sense:cap{i}", "sense")
+    n_sense = sum(1 for v in s.innerface.active_ids.values() if v == "sense")
+    assert n_sense <= 224
+
+
 def test_network_primary_tick_prefers_symbioid_intent():
     """When network_primary and play_ready, preferred_intent wins over coach explore."""
     cipher = ActionCipher.fixed({10: "left", 20: "right", 30: "rotate", 40: "hard"})

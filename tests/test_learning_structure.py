@@ -106,6 +106,36 @@ def test_follows_registry_hard_cap():
     assert len(mind._follows) <= 5
 
 
+def test_policy_registry_priority_keeps_act_keys():
+    """Band B: non-policy Follows evicted before state↔action associations."""
+    from symbioid import Mind, Thought
+
+    mind = Mind(max_follows_registry=3, policy_registry_priority=True)
+    st = Thought(id="h:obs:s", label="state", transient=True)
+    mind._observations["eye:r:0.5"] = st
+    mind._thought_to_key[st.id] = "eye:r:0.5"
+    # One policy association (state → hard)
+    mind.record_outcome([st], "hard", domain="tetris", host_id="h", reward=100.0)
+    policy_keys = [k for k in mind._follows if mind.is_policy_registry_key(k)]
+    assert policy_keys, "expected act: follows key after record_outcome"
+    # Flood with non-policy follows that would otherwise wipe the registry
+    junk = []
+    for i in range(10):
+        a = Thought(id=f"h:j{i}a", label=f"j{i}a", transient=True)
+        b = Thought(id=f"h:j{i}b", label=f"j{i}b", transient=True)
+        mind._thought_to_key[a.id] = f"junk:{i}a"
+        mind._thought_to_key[b.id] = f"junk:{i}b"
+        mind._observations[f"junk:{i}a"] = a
+        mind._observations[f"junk:{i}b"] = b
+        junk.append((a, b))
+        mind.admit_follows(a, b, host_id="h")
+    assert len(mind._follows) <= 3
+    remaining_policy = [k for k in mind._follows if mind.is_policy_registry_key(k)]
+    assert remaining_policy, (
+        f"policy follows should survive non-policy flood, keys={list(mind._follows)}"
+    )
+
+
 def test_cross_channel_no_mint_when_disallowed():
     """allow_cross_channel_follows=False skips Follows across terminators."""
     s = Symbioid(install_constitution=False)

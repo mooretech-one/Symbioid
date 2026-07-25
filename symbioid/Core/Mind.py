@@ -89,6 +89,9 @@ class Mind(System):
     max_registry_per_channel: int = 512
     max_follows_registry: int = 1024
     max_integrates_registry: int = 1024
+    # When True (default): hard-evict non-policy keys first so Follows/Integrates
+    # that touch Action poles (content keys containing "act:") survive longer.
+    policy_registry_priority: bool = True
     # Small valence bump on mint / decay on pure reuse
     surprise_valence: float = 0.15
     reuse_valence_decay: float = 0.02
@@ -722,6 +725,12 @@ class Mind(System):
                 kind="observation",
             )
 
+    @staticmethod
+    def is_policy_registry_key(key: str) -> bool:
+        """True if a Follows/Integrates content key associates with an Action pole."""
+        # Action poles use content keys like act:{domain}:{token}; pair keys embed them.
+        return "act:" in str(key)
+
     def _evict_registry_hard(
         self,
         store: dict[str, Any],
@@ -736,6 +745,10 @@ class Mind(System):
 
         Unlike soft eviction, high-valence keys are still dropped when over cap
         so the map cannot grow unbounded.
+
+        With ``policy_registry_priority`` (default True), keys that touch Action
+        poles (``act:`` in content key) are only evicted after all non-policy
+        candidates are gone — preserves state↔action learning under load.
         """
         max_n = max(1, int(max_n))
         while len(store) > max_n:
@@ -743,6 +756,13 @@ class Mind(System):
             if not candidates:
                 break
             order_index = {k: i for i, k in enumerate(order)}
+            pool = candidates
+            if self.policy_registry_priority:
+                non_policy = [
+                    k for k in candidates if not self.is_policy_registry_key(k)
+                ]
+                if non_policy:
+                    pool = non_policy
 
             def _rank(k: str) -> tuple[float, int]:
                 return (
@@ -750,7 +770,7 @@ class Mind(System):
                     order_index.get(k, 0),
                 )
 
-            old = min(candidates, key=_rank)
+            old = min(pool, key=_rank)
             store.pop(old, None)
             streak.pop(old, None)
             # Keep valence on Action poles / observations elsewhere; drop pair valence

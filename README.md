@@ -252,12 +252,30 @@ Rodin cycle **1 → 2 → 4 → 8 → 7 → 5** for each Sensor Input:
 | 7 | PerceivedBy | **Innerface** |
 | 5 | ObservationPerceivedBySensor (Link) | **Innerface** |
 
-Sensor Thoughts are **stable** (`{sym_id}:sensor:{sensor_id}`); each Input creates a new Observation. Multi-sensor batches also get a lateral six-set:
+Sensor Thoughts are **stable** (`{sym_id}:sensor:{sensor_id}`); each Input creates a new Observation. Multi-sensor batches also get a lateral six-set (Follows, then optional Integrates).
 
-| | |
-|--|--|
-| **Follows / FollowedBy** | ObservationA ⇄ ObservationB (same Interface tick) |
-| **Integrates / IntegratedBy** | Rodin **halving**: reduce a pair of Observations (Follows pairs and/or last-two per sensor) |
+### Relationship types
+
+Every edge is a `Link`: **Source → [LinkType] → Target** (all Thoughts). Six-sets mint **reciprocal** LinkType pairs. Full catalog: vault `Work-Log/2026-07-25-research-loop-symbioid-relationship-types.md`.
+
+| Forward | Reverse | Role |
+|---------|---------|------|
+| **Perceives** | **PerceivedBy** | Sensor ⇄ Observation (sense / Input formation) |
+| **Follows** | **FollowedBy** | Observation ⇄ Observation (lateral co-occurrence) |
+| **Integrates[reason:channel]** | **IntegratedBy[…]** | Observation ⊕ Observation (Rodin halving; v0.0.31+) |
+| **Expects** | **ExpectedBy** | Feedback ⇄ expected Observation (Beliefs) |
+| **Has** | **IsPartOf** | Host ⇄ Sensor/Actuator (awareness; integrate terminators) |
+| **ExistsIn** | **ExistsAround** | System ⇄ Environment (twin seed) |
+
+**Integrates reasons** (live Innerface/Mind): `follows`, `temporal`, `depth`, `cofire`, default `pair`, plus `policy` on outcome registry / tests (e.g. `Integrates[follows:eye]`).
+
+**Also on the graph (not six-set operators):**
+
+| LinkType | Role |
+|----------|------|
+| **Port** (`Port[channel]` links, `is_port`) | Cross-engine transfer / Hebb (I→N, N→O) |
+| **Associates** | Policy plasticity edges (state ↔ Action) |
+| **MustPreserveTwinIntegrity**, **MustNotHarm**, **MustObeyUnlessHigher**, **MayPreserveSelfUnlessHigher** | Constitution L0–L3 |
 
 Halving cycle: **1 → 5 → 7 → 8 → 4 → 2 → 1** (`rodin_halve`). Integrated sets supersede source sense formations in the **active set** (`innerface.active_set_count`).
 
@@ -360,7 +378,7 @@ Host label: `tetris-byte-learner`. Policy: `TetrisCoach` discovers a secret byte
 
 Hole = empty cell with a filled cell above in the same column (classic Tetris). Aggregate height/hole totals are no longer separate sensors; the map supersedes them.
 
-**Perf:** cell sensors use `awareness=False` (terminator only). Sampling is **change-only** + **ROI** (v0.0.28): empty top rows (`sky_row`), solid full-width floor (`solid_floor_start_row`), active dirty-rect, sticky locked=1.0, line-clear invalidation; candidates via `(r,c)` index. **Dynamics** (v0.0.29): Link adjacency index + hot-set-only `pulse_tick`; demo pulses every **2** frames; Phase C cell-obs index. **Learning structure** (v0.0.30): cross-channel Integrate block deactivates Follows sync; `max_active_syncs`/`max_active_senses` LRU; Tetris `cofire_meta_only` + no cell–cell Follows; hard Mind follows/integrates registry caps.
+**Perf:** cell sensors use `awareness=False` (terminator only). Sampling is **change-only** + **ROI** (v0.0.28): empty top rows (`sky_row`), solid full-width floor (`solid_floor_start_row`), active dirty-rect, sticky locked=1.0, line-clear invalidation; candidates via `(r,c)` index. **Dynamics** (v0.0.29): Link adjacency index + hot-set-only `pulse_tick`; demo pulses every **2** frames; Phase C cell-obs index. **Learning structure** (v0.0.30): cross-channel Integrate block deactivates Follows sync; `max_active_syncs`/`max_active_senses` LRU; Tetris `cofire_meta_only` + no cell–cell Follows; hard Mind follows/integrates registry caps. **Band B** (Tetris demo): `max_active_senses=224`, `max_active_syncs=112`, `max_active_integrates=112`; Mind registries **4096** with **policy-first** hard eviction (keep `act:` associations); HUD shows `se/sy/in` + `fl/ig` registry.
 
 **Actuators (1)**
 
