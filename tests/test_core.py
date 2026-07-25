@@ -434,8 +434,38 @@ def test_complete_integrate_set_h1():
     store = complete_integrate_set(a, b, integrate_id="int-test")
     assert len(store) == 6
     assert is_minimal_symbioid_shape(store)
-    labels = {t.label for t in store.values()}
-    assert "Integrates" in labels and "IntegratedBy" in labels
+    labels = {t.label for t in store.values() if t.label}
+    # Qualified by default reason "pair"
+    assert any(str(L).startswith("Integrates[") for L in labels)
+    assert any(str(L).startswith("IntegratedBy[") for L in labels)
+    from symbioid.Core.formation import six_set_poles
+
+    poles = six_set_poles(store)
+    assert len(poles) == 2
+    assert {p.id for p in poles} == {"oa", "ob"}
+
+
+def test_complete_integrate_set_reason_and_channel_labels():
+    from symbioid.Core.formation import (
+        is_scaffold_thought,
+        qualify_integrate_type_labels,
+    )
+
+    a = Thought(id="oa2", label="piece_id:0.1", transient=True)
+    b = Thought(id="ob2", label="hard", transient=True)
+    store = complete_integrate_set(
+        a, b, integrate_id="int-pol", reason="policy", channel="policy"
+    )
+    labels = {t.label for t in store.values() if t.label}
+    assert "Integrates[policy:policy]" in labels or any(
+        "Integrates[policy" in str(L) for L in labels
+    )
+    assert any("IntegratedBy[policy" in str(L) for L in labels)
+    # Scaffold recognition for qualified operators
+    types = [t for t in store.values() if t.label and str(t.label).startswith("Integrates")]
+    assert types and is_scaffold_thought(types[0])
+    t_fwd, _, _, _ = qualify_integrate_type_labels("follows", "sym:sen:eye")
+    assert t_fwd == "Integrates[follows:eye]"
 
 
 def test_temporal_integrate_last_two_same_sensor():

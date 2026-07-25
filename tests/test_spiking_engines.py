@@ -50,6 +50,52 @@ def test_pulse_tick_wraps_partition():
     assert st["cycle"] >= 1
 
 
+def test_out_index_tracks_links_on_add_remove():
+    s = Symbioid(install_constitution=False)
+    a = Thought(id=f"{s.id}:oa", threshold=1.0)
+    b = Thought(id=f"{s.id}:ob", threshold=1.0)
+    lt = Thought(id=f"{s.id}:olt", threshold=10.0)
+    link = Link(
+        id=f"{s.id}:ol",
+        source=a,
+        link_type=lt,
+        target=b,
+        weight=1.0,
+        threshold=10.0,
+    )
+    for t in (a, b, lt, link):
+        s.add_thought(t)
+    s.rebuild_out_index()
+    assert link.id in s._out_by_source.get(a.id, set())
+    s.remove_thought(link.id)
+    assert link.id not in s._out_by_source.get(a.id, set())
+    assert link.id not in s.thoughts
+
+
+def test_pulse_spread_uses_index_not_only_scan():
+    """Firer with indexed edge still spreads after hot-set-only optimisations."""
+    s = Symbioid(install_constitution=False)
+    s.mind.dynamics_enabled = True
+    a = Thought(id=f"{s.id}:sa", threshold=1.0)
+    b = Thought(id=f"{s.id}:sb", threshold=10.0, activation=0.0)
+    lt = Thought(id=f"{s.id}:slt", threshold=10.0)
+    link = Link(
+        id=f"{s.id}:sl",
+        source=a,
+        link_type=lt,
+        target=b,
+        weight=1.0,
+        threshold=10.0,
+    )
+    for t in (a, b, lt, link):
+        s.add_thought(t)
+    s.stimulate(a, 2.0)
+    st = s.pulse_tick()
+    assert st["fired"] >= 1
+    assert st["spread"] >= 1
+    assert b.activation > 0
+
+
 def test_membership_mask_only_fires_members():
     s = Symbioid(install_constitution=False)
     s.mind.dynamics_enabled = True

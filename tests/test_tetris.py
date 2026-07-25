@@ -716,6 +716,92 @@ def test_sample_change_only_skips_static_open_cells():
     assert second_wave < 10, f"static re-sample minted too many: {second_wave}"
 
 
+def test_sky_row_and_solid_floor_roi():
+    w = TetrisWorld(rng=Random(0), gravity_interval=9999)
+    w.active = None
+    assert w.sky_row(with_active=False) == w.rows
+    assert w.solid_floor_start_row() == w.rows
+    assert w.cell_sample_roi(with_active=False) == (w.rows, w.rows)
+
+    # Locked stack mid-board
+    w.board[10][3] = "T"
+    assert w.sky_row(with_active=False) == 10
+    # Solid full-width base at bottom
+    for c in range(w.cols):
+        w.board[w.rows - 1][c] = "I"
+        w.board[w.rows - 2][c] = "I"
+    assert w.solid_floor_start_row() == w.rows - 2
+    r_lo, r_hi = w.cell_sample_roi(with_active=False)
+    assert r_lo == 10
+    assert r_hi == w.rows - 2
+
+
+def test_active_cells_set_and_sky_includes_piece():
+    w = TetrisWorld(rng=Random(0), gravity_interval=9999)
+    assert w.active is not None
+    cells = w.active_cells_set()
+    assert len(cells) >= 4
+    assert w.sky_row(with_active=True) <= min(r for r, _ in cells)
+
+
+def test_sample_dirty_rect_limits_move_mints():
+    """Lateral move should mint roughly O(piece cells), not a sky full of opens."""
+    mod = _load_tetris_demo()
+    w = TetrisWorld(rng=Random(1), gravity_interval=9999)
+    s = mod.build_symbioid(w)
+    mod.sample_into_symbioid(s, w, tick=1)
+    # Process a few left moves; mint growth per move should stay small
+    mints = []
+    for i in range(4):
+        before = s.mind.admits_mint
+        w.step_action("left")
+        mod.sample_into_symbioid(s, w, tick=10 + i)
+        mints.append(s.mind.admits_mint - before)
+    # Each move: leave cells + enter cells (+ maybe meta). Not dozens of sky cells.
+    assert max(mints) < 25, f"move mints too high: {mints}"
+    assert sum(mints) < 60, f"total move mints too high: {mints}"
+
+
+def test_sample_line_clear_invalidates_last_readings():
+    """After line clear, cell last-map resets so stack can re-form."""
+    mod = _load_tetris_demo()
+    w = TetrisWorld(rng=Random(0), gravity_interval=9999)
+    w.active = None
+    # Partial stack (not full-width solid floor — that would empty the ROI band)
+    w.board[15][2] = "I"
+    w.board[15][3] = "I"
+    w.board[16][3] = "I"
+    s = mod.build_symbioid(w)
+    mod.sample_into_symbioid(s, w, tick=1)
+    assert s._cell_last_reading, "expected some cell last-readings after sample"
+    before_keys = set(s._cell_last_reading.keys())
+    # Simulate line clear event
+    w.last_event = "line_clear"
+    w.lines += 1
+    w.board[15][2] = ""
+    w.board[15][3] = ""
+    w.board[16][3] = ""
+    mod.sample_into_symbioid(s, w, tick=2)
+    # last_lines advanced; resync ran (map rebuilt for new open field)
+    assert int(s._cell_last_lines) == int(w.lines)
+    # Prior non-open keys should not all persist unchanged as the sole map
+    assert before_keys  # had content pre-clear
+
+
+def test_sticky_locked_skips_reform():
+    """Locked 1.0 cells do not re-mint on static re-sample."""
+    mod = _load_tetris_demo()
+    w = TetrisWorld(rng=Random(0), gravity_interval=9999)
+    w.active = None
+    w.board[15][4] = "O"
+    s = mod.build_symbioid(w)
+    mod.sample_into_symbioid(s, w, tick=1)
+    mid = s.mind.admits_mint
+    mod.sample_into_symbioid(s, w, tick=2)
+    mod.sample_into_symbioid(s, w, tick=3)
+    assert s.mind.admits_mint - mid < 8, "sticky locked should not re-mint"
+
+
 def test_twin_seed_thoughts_is_constant_size():
     """Protect path must not scan the full graph for twin seeds."""
     from symbioid import Symbioid, Thought

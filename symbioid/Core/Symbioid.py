@@ -82,6 +82,9 @@ class Symbioid(System):
     graph_lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
     # Dynamics: ids with non-rest activation / refractory (optimized pulse_tick)
     _hot_ids: set[str] = field(default_factory=set, init=False, repr=False)
+    # source_id → set of non-Port Link ids (spread adjacency; maintained on add/remove)
+    _out_by_source: dict[str, set[str]] = field(default_factory=dict, init=False, repr=False)
+    _out_index_dirty: bool = field(default=True, init=False, repr=False)
     pulse_cycle: int = field(default=0, init=False, repr=False)
     last_pulse_fired: int = field(default=0, init=False, repr=False)
     last_pulse_hot: int = field(default=0, init=False, repr=False)
@@ -123,6 +126,7 @@ class Symbioid(System):
         self.thoughts[self.agent.id] = self.agent
         if self.install_constitution:
             self.install_laws()
+        self.rebuild_out_index()
 
     def start_processes(self) -> list[threading.Thread]:
         """Start Innerface, Interface, Outerface workers (each calls process())."""
@@ -269,7 +273,7 @@ class Symbioid(System):
                     threshold=10.0,
                     dynamics_enabled=False,
                 )
-                self.thoughts[type_id] = port_type
+                self._register_in_store_unlocked(port_type)
             link = Link(
                 id=link_id,
                 label=f"Port[{channel}]" if self.with_labels else None,
@@ -281,7 +285,7 @@ class Symbioid(System):
                 is_port=True,
                 dynamics_enabled=False,
             )
-            self.thoughts[link_id] = link
+            self._register_in_store_unlocked(link)
             return link
 
     def export_port_packets(
@@ -443,13 +447,17 @@ class Symbioid(System):
             self.pulse_cycle += 1
             cycle = self.pulse_cycle
 
+            # Adjacency index (lazy rebuild if external code mutated thoughts{})
+            if self._out_index_dirty:
+                self._rebuild_out_index_unlocked()
+
             # Eligible ids for decay/fire
+            # Full-graph: trust _hot_ids only (O(hot)) — no all-Thoughts is_hot scan.
             if membership is None:
-                eligible = set(self.thoughts.keys())
-                hot_ids = set(self._hot_ids)
-                for tid, t in self.thoughts.items():
-                    if t.is_hot():
-                        hot_ids.add(tid)
+                eligible = None  # type: ignore[assignment]
+                hot_ids = {tid for tid in self._hot_ids if tid in self.thoughts}
+                if len(hot_ids) != len(self._hot_ids):
+                    self._hot_ids = set(hot_ids)
             else:
                 eligible = set(membership) & set(self.thoughts.keys())
                 hot_ids = (set(self._hot_ids) & eligible) | {
@@ -458,11 +466,14 @@ class Symbioid(System):
                     if (t := self.thoughts.get(tid)) is not None and t.is_hot()
                 }
 
-            # 1) Decay only eligible
+            def _in_eligible(tid: str) -> bool:
+                return eligible is None or tid in eligible
+
+            # 1) Decay only hot (∩ eligible when membership set)
             still_hot: set[str] = set()
             for tid in hot_ids:
                 t = self.thoughts.get(tid)
-                if t is None or tid not in eligible:
+                if t is None or not _in_eligible(tid):
                     continue
                 t.decay_step()
                 if t.is_hot():
@@ -472,7 +483,7 @@ class Symbioid(System):
             firers: list[Thought] = []
             candidates = list(still_hot) + [i for i in hot_ids if i not in still_hot]
             for tid in candidates:
-                if tid not in eligible:
+                if not _in_eligible(tid):
                     continue
                 t = self.thoughts.get(tid)
                 if t is None:
@@ -499,24 +510,14 @@ class Symbioid(System):
 
             firer_ids = {f.id for f in firers}
 
-            # Outgoing Links (optionally filtered); Port Links never spread
-            out_links: dict[str, list[Link]] = {}
-            for t in self.thoughts.values():
-                if not isinstance(t, Link):
-                    continue
-                if getattr(t, "is_port", False):
-                    continue
-                if synapse_filter is not None and not synapse_filter(t):
-                    continue
-                # Only spread *from* firers in this partition
-                out_links.setdefault(t.source.id, []).append(t)
-
-            # 3) One-hop spread + Hebb
+            # 3) One-hop spread + Hebb via adjacency index (not full graph scan)
             spread = 0
             hebb_n = 0
             for firer in firers:
                 strength = max(float(firer.threshold), float(firer.activation))
-                for link in out_links.get(firer.id, ()):
+                for link in self._outgoing_links_unlocked(
+                    firer.id, synapse_filter=synapse_filter
+                ):
                     tgt = link.target
                     if tgt is None:
                         continue
@@ -529,7 +530,7 @@ class Symbioid(System):
                             energy_left -= spread_cost
                             tgt.receive(amt)
                             still_hot.add(tgt.id)
-                            self.thoughts[tgt.id] = tgt
+                            self._register_in_store_unlocked(tgt)
                             # Targets that receive become globally hot
                             self._hot_ids.add(tgt.id)
                             spread += 1
@@ -540,7 +541,7 @@ class Symbioid(System):
                     if (
                         membership is not None
                         and cross_only
-                        and tgt.id not in eligible
+                        and tgt.id not in eligible  # type: ignore[operator]
                     ):
                         continue
                     if tgt.id in firer_ids:
@@ -556,7 +557,7 @@ class Symbioid(System):
             if membership is None:
                 self._hot_ids = {i for i in still_hot if i in self.thoughts}
             else:
-                retained = {i for i in self._hot_ids if i not in eligible}
+                retained = {i for i in self._hot_ids if i not in eligible}  # type: ignore[operator]
                 self._hot_ids = retained | {i for i in still_hot if i in self.thoughts}
 
             # Cold-forget age: stamp last_hot_cycle on anything still hot this tick
@@ -612,11 +613,11 @@ class Symbioid(System):
         w_max = float(getattr(mind, "weight_max", 4.0) if mind else 4.0)
         n = 0
         with self.graph_lock:
-            for t in self.thoughts.values():
-                if not isinstance(t, Link):
-                    continue
-                if t.source.id == source.id and t.target.id == target.id:
-                    t.adjust_weight(float(delta), w_min=w_min, w_max=w_max)
+            if self._out_index_dirty:
+                self._rebuild_out_index_unlocked()
+            for link in self._outgoing_links_unlocked(source.id):
+                if link.target is not None and link.target.id == target.id:
+                    link.adjust_weight(float(delta), w_min=w_min, w_max=w_max)
                     n += 1
         if mind is not None and n:
             mind.hebb_updates = int(getattr(mind, "hebb_updates", 0)) + n
@@ -640,18 +641,16 @@ class Symbioid(System):
         w0 = max(w_min, min(w_max, float(initial_weight)))
 
         def _find(src: Thought, tgt: Thought) -> Optional[Link]:
-            for t in self.thoughts.values():
-                if (
-                    isinstance(t, Link)
-                    and t.source.id == src.id
-                    and t.target.id == tgt.id
-                ):
-                    return t
+            for link in self._outgoing_links_unlocked(src.id):
+                if link.target is not None and link.target.id == tgt.id:
+                    return link
             return None
 
         with self.graph_lock:
-            self.thoughts[a.id] = a
-            self.thoughts[b.id] = b
+            if self._out_index_dirty:
+                self._rebuild_out_index_unlocked()
+            self._register_in_store_unlocked(a)
+            self._register_in_store_unlocked(b)
             ab = _find(a, b)
             ba = _find(b, a)
             if ab is None:
@@ -669,8 +668,8 @@ class Symbioid(System):
                     weight=w0,
                     threshold=10.0,
                 )
-                self.thoughts[lt.id] = lt
-                self.thoughts[ab.id] = ab
+                self._register_in_store_unlocked(lt)
+                self._register_in_store_unlocked(ab)
             else:
                 ab.weight = max(ab.weight, w0)
             if ba is None:
@@ -688,18 +687,101 @@ class Symbioid(System):
                     weight=w0,
                     threshold=10.0,
                 )
-                self.thoughts[lt2.id] = lt2
-                self.thoughts[ba.id] = ba
+                self._register_in_store_unlocked(lt2)
+                self._register_in_store_unlocked(ba)
             else:
                 ba.weight = max(ba.weight, w0)
         return ab, ba
 
-    def add_thought(self, thought: Thought) -> None:
-        """Register a Thought/Link under graph_lock."""
+    def _index_link_unlocked(self, thought: Thought) -> None:
+        if not isinstance(thought, Link) or getattr(thought, "is_port", False):
+            return
+        src = thought.source
+        if src is None:
+            return
+        self._out_by_source.setdefault(src.id, set()).add(thought.id)
+
+    def _unindex_link_unlocked(self, thought: Thought) -> None:
+        if not isinstance(thought, Link):
+            return
+        src = thought.source
+        if src is None:
+            return
+        bucket = self._out_by_source.get(src.id)
+        if not bucket:
+            return
+        bucket.discard(thought.id)
+        if not bucket:
+            self._out_by_source.pop(src.id, None)
+
+    def _register_in_store_unlocked(self, thought: Thought) -> None:
+        """thoughts[id]= + adjacency index (caller holds graph_lock)."""
+        old = self.thoughts.get(thought.id)
+        if old is not None and old is not thought:
+            self._unindex_link_unlocked(old)
+        self.thoughts[thought.id] = thought
+        self._index_link_unlocked(thought)
+        if thought.is_hot():
+            self._hot_ids.add(thought.id)
+
+    def _remove_thought_unlocked(self, thought_id: str) -> Optional[Thought]:
+        t = self.thoughts.pop(thought_id, None)
+        if t is None:
+            return None
+        self._unindex_link_unlocked(t)
+        self._hot_ids.discard(thought_id)
+        return t
+
+    def remove_thought(self, thought_id: str) -> Optional[Thought]:
+        """Remove a Thought/Link and keep adjacency / hot sets coherent."""
         with self.graph_lock:
-            self.thoughts[thought.id] = thought
-            if thought.is_hot():
-                self._hot_ids.add(thought.id)
+            return self._remove_thought_unlocked(thought_id)
+
+    def _rebuild_out_index_unlocked(self) -> None:
+        self._out_by_source.clear()
+        for t in self.thoughts.values():
+            self._index_link_unlocked(t)
+        self._out_index_dirty = False
+
+    def rebuild_out_index(self) -> None:
+        """Full adjacency rebuild (after bulk store replace / seed)."""
+        with self.graph_lock:
+            self._rebuild_out_index_unlocked()
+
+    def mark_out_index_dirty(self) -> None:
+        """Call after external bulk mutations of ``thoughts`` without add/remove."""
+        self._out_index_dirty = True
+
+    def _outgoing_links_unlocked(
+        self,
+        source_id: str,
+        *,
+        synapse_filter: Optional[Callable[[Link], bool]] = None,
+    ) -> list[Link]:
+        """Non-port Links from source via adjacency index (caller holds lock)."""
+        out: list[Link] = []
+        bucket = self._out_by_source.get(source_id)
+        if not bucket:
+            return out
+        stale: list[str] = []
+        for lid in bucket:
+            t = self.thoughts.get(lid)
+            if not isinstance(t, Link) or getattr(t, "is_port", False):
+                stale.append(lid)
+                continue
+            if synapse_filter is not None and not synapse_filter(t):
+                continue
+            out.append(t)
+        for lid in stale:
+            bucket.discard(lid)
+        if not bucket and source_id in self._out_by_source:
+            del self._out_by_source[source_id]
+        return out
+
+    def add_thought(self, thought: Thought) -> None:
+        """Register a Thought/Link under graph_lock; maintain Link adjacency."""
+        with self.graph_lock:
+            self._register_in_store_unlocked(thought)
 
     @property
     def thought_list(self) -> list[Thought]:
@@ -724,6 +806,7 @@ class Symbioid(System):
             )
         else:
             self.env_thoughts = {}
+        self._out_index_dirty = True
         return seed
 
     def install_laws(self) -> list[Law]:
@@ -747,6 +830,7 @@ class Symbioid(System):
         )
         for tid, t in nodes.items():
             self.thoughts[tid] = t
+        self._out_index_dirty = True
         self.laws = sorted(laws, key=lambda law: law.priority)
         return self.laws
 

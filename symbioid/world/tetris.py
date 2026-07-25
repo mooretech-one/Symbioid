@@ -544,6 +544,68 @@ class TetrisWorld:
                     out[r][c] = 0.0
         return out
 
+    def sky_row(self, *, with_active: bool = True) -> int:
+        """
+        First row from the top that is not pure open sky (locked or active).
+
+        Rows ``0 .. sky_row-1`` are completely empty and can be skipped for
+        cell sampling. Returns ``rows`` when the whole board is empty.
+        """
+        active_rows_by_c: list[set[int]] = [set() for _ in range(self.cols)]
+        if with_active and self.active is not None:
+            for r, c in self.active.cells():
+                if 0 <= r < self.rows and 0 <= c < self.cols:
+                    active_rows_by_c[c].add(r)
+        for r in range(self.rows):
+            for c in range(self.cols):
+                if self.board[r][c] or r in active_rows_by_c[c]:
+                    return r
+        return self.rows
+
+    def solid_floor_start_row(self) -> int:
+        """
+        First row of a contiguous full-width **locked** solid slab from the bottom.
+
+        Rows ``solid_floor_start_row .. rows-1`` are entirely locked (no empties).
+        Those cells cannot change until a line clear. Returns ``rows`` when the
+        bottom row is not fully solid (common mid-game).
+
+        Note: fully filled rows normally clear immediately on lock; this still
+        covers the brief post-lock window and any deferred-clear setups.
+        """
+        r = self.rows - 1
+        while r >= 0 and all(bool(self.board[r][c]) for c in range(self.cols)):
+            r -= 1
+        return r + 1
+
+    def active_cells_set(self) -> set[tuple[int, int]]:
+        """Board cells occupied by the active piece (in-bounds only)."""
+        out: set[tuple[int, int]] = set()
+        if self.active is None:
+            return out
+        for r, c in self.active.cells():
+            if 0 <= r < self.rows and 0 <= c < self.cols:
+                out.add((r, c))
+        return out
+
+    def cell_sample_roi(
+        self, *, with_active: bool = True
+    ) -> tuple[int, int]:
+        """
+        Inclusive-exclusive row band ``[r_lo, r_hi)`` for cell sampling.
+
+        - ``r_lo`` = :meth:`sky_row` (skip empty top)
+        - ``r_hi`` = :meth:`solid_floor_start_row` (skip solid full base)
+
+        Empty board → ``(rows, rows)`` (empty band). Active piece always expands
+        sky via ``with_active``.
+        """
+        r_lo = self.sky_row(with_active=with_active)
+        r_hi = self.solid_floor_start_row()
+        if r_lo > r_hi:
+            r_lo = r_hi
+        return r_lo, r_hi
+
     def cell_reading(self, r: int, c: int, *, with_active: bool = True) -> float:
         """Single-cell reading (block=1.0, hole=0.5, open=0.0)."""
         if r < 0 or c < 0 or r >= self.rows or c >= self.cols:

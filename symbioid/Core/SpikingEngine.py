@@ -101,19 +101,17 @@ class SpikingEngine(Process):
             energy_budget=self._resolve_energy_budget(),
         )
         self.last_pulse_stats = dict(stats)
-        # Export ids that just fired (for port transfer)
+        # Export ids that just fired (for port transfer) — scan hot set / membership only
         fired_ids: list[str] = []
-        if mem is None:
-            with host.graph_lock:
-                for tid, t in host.thoughts.items():
-                    if getattr(t, "just_fired", False):
-                        fired_ids.append(tid)
-        else:
-            with host.graph_lock:
-                for tid in mem:
-                    t = host.thoughts.get(tid)
-                    if t is not None and getattr(t, "just_fired", False):
-                        fired_ids.append(tid)
+        with host.graph_lock:
+            if mem is None:
+                scan = list(getattr(host, "_hot_ids", ()) or ())
+            else:
+                scan = list(mem)
+            for tid in scan:
+                t = host.thoughts.get(tid)
+                if t is not None and getattr(t, "just_fired", False):
+                    fired_ids.append(tid)
         self.last_export_ids = fired_ids
         return stats
 

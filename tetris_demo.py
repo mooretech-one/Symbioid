@@ -83,6 +83,7 @@ H = (
 )
 FPS = 30
 CMD_EVERY = 2
+PULSE_EVERY = 2  # dynamics tick every N frames (T0.1 — cut full-graph pulse load)
 GRAVITY_INTERVAL = 18
 # Pause after top-out so Innerface formations can catch up before next game
 RESTART_DELAY_FRAMES = FPS * 1
@@ -156,9 +157,19 @@ def build_symbioid(world: TetrisWorld) -> Symbioid:
     s = Symbioid(id=HOST_ID, label="tetris-byte-learner")
     s.interface.continuous_inputs = False
     s.outerface.wait_for_feedback = False
+    # Learning structure (P0): avoid cell co-fire storms / zombie syncs
+    s.innerface.cofire_meta_only = True
+    s.innerface.allow_cross_channel_follows = False
+    s.innerface.max_active_syncs = 64
+    s.innerface.max_active_senses = 96
+
     # Last cell readings for change-only formation (sensor_id → float)
     s._cell_last_reading: dict[str, float] = {}  # type: ignore[attr-defined]
     s._cell_rc: dict[str, tuple[int, int]] = {}  # type: ignore[attr-defined]
+    # Reverse index for ROI / dirty-rect sampling (avoid walking all 200 sensors)
+    s._cell_by_rc: dict[tuple[int, int], object] = {}  # type: ignore[attr-defined]
+    s._cell_prev_active: set[tuple[int, int]] = set()  # type: ignore[attr-defined]
+    s._cell_last_lines: int = 0  # type: ignore[attr-defined]
 
     # Full playfield map: one sensor per cell (stable ids; no full awareness)
     for r in range(world.rows):
@@ -179,6 +190,7 @@ def build_symbioid(world: TetrisWorld) -> Symbioid:
             )
             sen.transfer = _cell_xfer
             s._cell_rc[sen.id] = (r, c)  # type: ignore[attr-defined]
+            s._cell_by_rc[(r, c)] = sen  # type: ignore[attr-defined]
 
     def piece_id_n(_w: dict, wo: TetrisWorld = world) -> float:
         if wo.active is None:
@@ -278,6 +290,33 @@ def policy_state_poles(s: Symbioid, world: TetrisWorld) -> list:
     return poles
 
 
+def _cell_obs_index(s: Symbioid) -> dict[str, list[tuple[str, object]]]:
+    """
+    Map ``cell_rXX_cYY`` label → [(content_key, observation Thought), ...].
+
+    Rebuilt when Mind observation count changes (O(|obs|) once per generation).
+    """
+    import re
+
+    n = 0
+    with s.mind._lock:
+        n = len(s.mind._observations)
+        if (
+            getattr(s, "_cell_obs_gen", None) == n
+            and getattr(s, "_cell_obs_index", None) is not None
+        ):
+            return s._cell_obs_index  # type: ignore[return-value]
+        idx: dict[str, list[tuple[str, object]]] = {}
+        pat = re.compile(r"cell_r\d{2}_c\d{2}")
+        for ck, oth in s.mind._observations.items():
+            m = pat.search(str(ck))
+            if m:
+                idx.setdefault(m.group(0), []).append((str(ck), oth))
+    s._cell_obs_index = idx  # type: ignore[attr-defined]
+    s._cell_obs_gen = n  # type: ignore[attr-defined]
+    return idx
+
+
 def cell_thought_placement_score(
     s: Symbioid,
     world: TetrisWorld,
@@ -302,7 +341,7 @@ def cell_thought_placement_score(
     with s.mind._lock:
         valence = dict(s.mind._valence)
         t2k = dict(s.mind._thought_to_key)
-        observations = dict(s.mind._observations)
+    lab_index = _cell_obs_index(s)
 
     for r, c in cells:
         if not (0 <= r < world.rows and 0 <= c < world.cols):
@@ -326,11 +365,10 @@ def cell_thought_placement_score(
             if ck is not None:
                 score += 0.18 * float(valence.get(ck, 0.0))
         lab = f"cell_r{r:02d}_c{c:02d}"
-        for ck, oth in observations.items():
-            if lab in ck:
-                score += 0.12 * float(getattr(oth, "activation", 0.0) or 0.0)
-                score += 0.12 * float(valence.get(ck, 0.0))
-                break
+        for ck, oth in lab_index.get(lab, ()):
+            score += 0.12 * float(getattr(oth, "activation", 0.0) or 0.0)
+            score += 0.12 * float(valence.get(ck, 0.0))
+            break
     return score
 
 
@@ -395,48 +433,102 @@ def graph_preferred_intent(
 
 def sample_into_symbioid(s: Symbioid, world: TetrisWorld, tick: int) -> None:
     """
-    Sample meta sensors every call; cell map is **change-only**:
+    Sample meta sensors every call; cell map is **change-only** + **ROI**:
 
     - Build the field once per sample (not per cell).
     - Skip formation when reading unchanged.
     - Skip initial open (0.0) cells until they first become block/hole.
+    - **S0.2** empty top rows above :meth:`TetrisWorld.sky_row`.
+    - **S0.1** solid full-width floor at bottom (:meth:`TetrisWorld.solid_floor_start_row`).
+    - **S1.1** dirty-rect = previous ∪ current active cells (always considered).
+    - **S1.4** sticky locked=1.0 (skip re-form until line clear / resync).
+    - **S1.9** invalidate cell last-readings on line clear (or rising ``lines``).
+    - Iterate only candidate cells (not all 200 sensors).
     """
     w = world.sensor_world()
     w["byte"] = float(s.actuators[0].output)
     handoffs = []
     last: dict[str, float] = getattr(s, "_cell_last_reading", None) or {}
-    cell_rc: dict[str, tuple[int, int]] = getattr(s, "_cell_rc", None) or {}
-    # One map for all cell sensors
-    field = world.cell_field_state(with_active=True) if cell_rc else None
+    cell_by_rc: dict[tuple[int, int], object] = getattr(s, "_cell_by_rc", None) or {}
+    prev_active: set[tuple[int, int]] = set(getattr(s, "_cell_prev_active", None) or set())
+    last_lines = int(getattr(s, "_cell_last_lines", 0) or 0)
 
-    for sen in s.sensors:
-        rc = cell_rc.get(sen.id)
-        if rc is not None and field is not None:
-            r, c = rc
-            reading = float(field[r][c])
-            prev = last.get(sen.id)
-            # First sight of open sky: remember only, no Rodin storm
-            if prev is None and reading == 0.0:
-                last[sen.id] = reading
-                continue
-            if prev is not None and abs(prev - reading) < 1e-9:
-                continue
-            last[sen.id] = reading
-            sense = {
-                "sensor_id": sen.id,
-                "label": sen.label,
-                "reading": reading,
-                "tick": tick,
-                "kind": "input",
-            }
-            h = s.interface.start_formation_for_sensor(
-                sen, force=True, sense=sense
-            )
-            if h is not None:
-                handoffs.append(h)
+    # Line-clear invalidation: forget cell last-readings so ROI resyncs
+    force_resync = False
+    if world.last_event == "line_clear" or int(world.lines) > last_lines:
+        force_resync = True
+        last = {}
+    s._cell_last_lines = int(world.lines)  # type: ignore[attr-defined]
+
+    cur_active = world.active_cells_set()
+    dirty = prev_active | cur_active
+    r_lo, r_hi = world.cell_sample_roi(with_active=True)
+
+    # Candidate (r,c): ROI band + dirty (active may sit in former sky)
+    candidates: set[tuple[int, int]] = set(dirty)
+    if cell_by_rc and r_lo < r_hi:
+        for r in range(r_lo, r_hi):
+            for c in range(world.cols):
+                candidates.add((r, c))
+    elif cell_by_rc and force_resync:
+        # Empty ROI but resync requested — touch all cells once
+        for r in range(world.rows):
+            for c in range(world.cols):
+                candidates.add((r, c))
+
+    field = (
+        world.cell_field_state(with_active=True)
+        if candidates and cell_by_rc
+        else None
+    )
+
+    for r, c in candidates:
+        sen = cell_by_rc.get((r, c))
+        if sen is None or field is None:
+            continue
+        # Outside ROI and not dirty → skip (solid floor / pure sky)
+        in_roi = r_lo <= r < r_hi
+        is_dirty = (r, c) in dirty
+        if not in_roi and not is_dirty and not force_resync:
             continue
 
-        # Meta sensors (piece, next, lines, byte)
+        reading = float(field[r][c])
+        sid = sen.id
+        prev = last.get(sid)
+
+        # Sticky locked block: no re-form until resync / dirty paint edge
+        if (
+            not force_resync
+            and not is_dirty
+            and prev is not None
+            and abs(prev - 1.0) < 1e-9
+            and abs(reading - 1.0) < 1e-9
+            and bool(world.board[r][c])
+        ):
+            continue
+
+        # First sight of open sky: remember only, no Rodin storm
+        if prev is None and reading == 0.0:
+            last[sid] = reading
+            continue
+        if prev is not None and abs(prev - reading) < 1e-9:
+            continue
+        last[sid] = reading
+        sense = {
+            "sensor_id": sid,
+            "label": sen.label,
+            "reading": reading,
+            "tick": tick,
+            "kind": "input",
+        }
+        h = s.interface.start_formation_for_sensor(sen, force=True, sense=sense)
+        if h is not None:
+            handoffs.append(h)
+
+    # Meta sensors (piece, next, lines, byte) — not cell map
+    for sen in s.sensors:
+        if getattr(s, "_cell_rc", None) and sen.id in s._cell_rc:  # type: ignore[attr-defined]
+            continue
         sense = sen.sample(tick=tick, world=w)
         if sense is None:
             continue
@@ -445,6 +537,7 @@ def sample_into_symbioid(s: Symbioid, world: TetrisWorld, tick: int) -> None:
             handoffs.append(h)
 
     s._cell_last_reading = last  # type: ignore[attr-defined]
+    s._cell_prev_active = cur_active  # type: ignore[attr-defined]
 
     if not handoffs:
         return
@@ -823,8 +916,8 @@ def main(argv: list[str] | None = None) -> None:
 
             if frame % sample_every == 0:
                 sample_into_symbioid(s, world, tick=frame)
-            # Continuous decay / fire / spread (Thought-as-neuron)
-            if s.mind.dynamics_enabled:
+            # Decay / fire / spread — every PULSE_EVERY frames (not every paint)
+            if s.mind.dynamics_enabled and frame % PULSE_EVERY == 0:
                 s.pulse_tick()
 
             if not world.game_over and frame % CMD_EVERY == 0:

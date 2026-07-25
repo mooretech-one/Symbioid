@@ -245,13 +245,11 @@ class Mind(System):
         with self._lock:
             ck = self._thought_to_key.get(thought_id)
             if ck is None:
-                # still protect any registered observation even at low valence
-                if thought_id in {t.id for t in self._observations.values()}:
-                    return True
                 return False
-            return self._valence.get(ck, 0.0) >= min_valence or thought_id in {
-                t.id for t in self._observations.values()
-            }
+            # Registered Observation / Action poles are always protected (O(1)).
+            if ck in self._observations or ck in self._actions:
+                return True
+            return self._valence.get(ck, 0.0) >= min_valence
 
     def registered_observation_ids(self) -> set[str]:
         """Poles that must survive GC: Observations + Action policy poles."""
@@ -724,25 +722,55 @@ class Mind(System):
                 kind="observation",
             )
 
+    def _evict_registry_hard(
+        self,
+        store: dict[str, Any],
+        order: list[str],
+        streak: dict[str, int],
+        max_n: int,
+        *,
+        keep_key: Optional[str] = None,
+    ) -> None:
+        """
+        Hard-cap a content registry by lowest valence (then oldest).
+
+        Unlike soft eviction, high-valence keys are still dropped when over cap
+        so the map cannot grow unbounded.
+        """
+        max_n = max(1, int(max_n))
+        while len(store) > max_n:
+            candidates = [k for k in store.keys() if k != keep_key]
+            if not candidates:
+                break
+            order_index = {k: i for i, k in enumerate(order)}
+
+            def _rank(k: str) -> tuple[float, int]:
+                return (
+                    float(self._valence.get(k, 0.0)),
+                    order_index.get(k, 0),
+                )
+
+            old = min(candidates, key=_rank)
+            store.pop(old, None)
+            streak.pop(old, None)
+            # Keep valence on Action poles / observations elsewhere; drop pair valence
+            if old.startswith("follows:") or old.startswith("int:"):
+                self._valence.pop(old, None)
+            if old in order:
+                order.remove(old)
+
     def _touch_follows(self, follows_key: str, sync_id: str) -> None:
         self._follows[follows_key] = sync_id
         if follows_key in self._follows_order:
             self._follows_order.remove(follows_key)
         self._follows_order.append(follows_key)
-        while len(self._follows_order) > int(self.max_follows_registry):
-            old = self._follows_order.pop(0)
-            if old == follows_key:
-                continue
-            v = self._valence.get(old, 0.0)
-            if v >= 0.5:
-                # keep high-valence associations
-                self._follows_order.append(old)
-                if len(self._follows_order) > int(self.max_follows_registry):
-                    break
-                continue
-            self._follows.pop(old, None)
-            self._follows_streak.pop(old, None)
-            self._valence.pop(old, None)
+        self._evict_registry_hard(
+            self._follows,
+            self._follows_order,
+            self._follows_streak,
+            int(self.max_follows_registry),
+            keep_key=follows_key,
+        )
 
     def admit_follows(
         self,
@@ -829,19 +857,13 @@ class Mind(System):
         if integrates_key in self._integrates_order:
             self._integrates_order.remove(integrates_key)
         self._integrates_order.append(integrates_key)
-        while len(self._integrates_order) > int(self.max_integrates_registry):
-            old = self._integrates_order.pop(0)
-            if old == integrates_key:
-                continue
-            v = self._valence.get(old, 0.0)
-            if v >= 0.5:
-                self._integrates_order.append(old)
-                if len(self._integrates_order) > int(self.max_integrates_registry):
-                    break
-                continue
-            self._integrates.pop(old, None)
-            self._integrates_streak.pop(old, None)
-            self._valence.pop(old, None)
+        self._evict_registry_hard(
+            self._integrates,
+            self._integrates_order,
+            self._integrates_streak,
+            int(self.max_integrates_registry),
+            keep_key=integrates_key,
+        )
 
     def admit_integrates(
         self,

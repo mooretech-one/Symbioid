@@ -41,13 +41,33 @@ class Innerface(SpikingEngine):
     consolidate_every: int = 5
     # H2: soft caps for depth-fold (integrate-of-integrates).
     # Global: never keep more than this many active integrates total.
-    max_active_integrates: int = 24
+    max_active_integrates: int = 48
     # Per awareness channel (sensor/actuator terminator): cascade folds until
     # each channel has ≤ this many active integrates (multi-step halving).
-    max_active_integrates_per_channel: int = 3
+    max_active_integrates_per_channel: int = 6
+    # Bound live sense/sync six-sets (LRU) so they cannot accumulate as zombies.
+    max_active_syncs: int = 64
+    max_active_senses: int = 128
     # If True, every batch runs depth fold until per-channel + global caps hold
     # (not only when already over the global soft cap).
     eager_depth_fold: bool = True
+    # Co-fire: when True, only meta-sensor + Action poles participate (not cell map).
+    cofire_meta_only: bool = False
+    # Labels treated as policy meta for co-fire (sensor.label match).
+    cofire_meta_labels: tuple[str, ...] = (
+        "piece_id",
+        "next_id",
+        "lines",
+        "last_byte",
+        "byte",
+        "score",
+        "ball_x",
+        "ball_y",
+        "paddle_y",
+        "opp_y",
+    )
+    # When False, skip minting Follows across different terminator channels.
+    allow_cross_channel_follows: bool = True
     formation_ticks: int = field(default=0, init=False, repr=False)
     completed_formations: dict[str, dict[str, Thought]] = field(
         default_factory=dict, init=False, repr=False
@@ -61,6 +81,8 @@ class Innerface(SpikingEngine):
     sets_emitted: int = field(default=0, init=False, repr=False)
     # set_id → kind ("sense" | "sync" | "integrate") — not yet superseded
     active_ids: dict[str, str] = field(default_factory=dict, init=False, repr=False)
+    # LRU order of active set ids (oldest first) for sense/sync caps
+    _active_order: list[str] = field(default_factory=list, init=False, repr=False)
     # observation Thought id → sense formation_id
     _obs_to_formation: dict[str, str] = field(default_factory=dict, init=False, repr=False)
     # observation Thought id → sensor_id (integration channel / terminator)
@@ -134,12 +156,72 @@ class Innerface(SpikingEngine):
         emit_six_set(kind, store, index=n)
 
     def _activate(self, set_id: str, kind: str) -> None:
+        """Mark six-set active; enforce LRU caps for sense/sync kinds."""
         with self._local_lock:
             self.active_ids[set_id] = kind
+            if set_id in self._active_order:
+                self._active_order.remove(set_id)
+            self._active_order.append(set_id)
+            self._enforce_active_kind_cap_unlocked("sync", int(self.max_active_syncs))
+            self._enforce_active_kind_cap_unlocked("sense", int(self.max_active_senses))
 
     def _deactivate(self, set_id: str) -> None:
         with self._local_lock:
             self.active_ids.pop(set_id, None)
+            if set_id in self._active_order:
+                self._active_order.remove(set_id)
+
+    def _enforce_active_kind_cap_unlocked(self, kind: str, max_n: int) -> None:
+        """Drop oldest active sets of ``kind`` until count ≤ max_n (caller holds lock)."""
+        if max_n <= 0:
+            return
+        while True:
+            of_kind = [sid for sid in self._active_order if self.active_ids.get(sid) == kind]
+            if len(of_kind) <= max_n:
+                break
+            victim = of_kind[0]
+            self.active_ids.pop(victim, None)
+            if victim in self._active_order:
+                self._active_order.remove(victim)
+
+    def _sensor_label_for_channel(self, channel: Optional[str]) -> str:
+        if not channel:
+            return ""
+        host = self.host
+        if host is None:
+            return ""
+        for sen in host.sensors:
+            if sen.id == channel or channel.endswith(sen.id) or sen.id in channel:
+                return str(sen.label or "")
+        for act in host.actuators:
+            if act.id == channel or channel.endswith(act.id):
+                return str(act.label or "")
+        return ""
+
+    def _is_cofire_eligible(self, thought: Thought) -> bool:
+        """
+        Whether an Observation participates in co-fire consolidations.
+
+        When ``cofire_meta_only`` is True: Action poles + meta-labeled sensors only
+        (excludes cell_r* map Observations).
+        """
+        if not self.cofire_meta_only:
+            return True
+        tid = thought.id or ""
+        if ":act:" in tid:
+            return True
+        lab = str(thought.label or "")
+        meta = set(self.cofire_meta_labels)
+        if lab in meta or any(m in lab for m in meta):
+            return True
+        ch = self._channel_for_obs(thought)
+        sen_lab = self._sensor_label_for_channel(ch)
+        if sen_lab in meta:
+            return True
+        if sen_lab.startswith("cell_") or "cell_r" in lab or (ch and "cell_" in ch):
+            return False
+        # Unknown non-cell channels: keep (pong / future sensors)
+        return True
 
     def accept_formation(
         self,
@@ -279,6 +361,18 @@ class Innerface(SpikingEngine):
         for i in range(len(ordered) - 1):
             a, b = ordered[i], ordered[i + 1]
 
+            # Optional: block cross-terminator Follows (cell map storms), but still
+            # allow meta↔meta / meta↔action when cofire_meta_only (policy co-occurrence).
+            if not self.allow_cross_channel_follows and not self._same_integration_channel(
+                a, b
+            ):
+                if not (
+                    self.cofire_meta_only
+                    and self._is_cofire_eligible(a)
+                    and self._is_cofire_eligible(b)
+                ):
+                    continue
+
             admit = None
             if mind is not None:
                 admit = mind.admit_follows(a, b, host_id=host_id)
@@ -374,13 +468,13 @@ class Innerface(SpikingEngine):
         for obs in (observation_a, observation_b):
             fid = self._obs_to_formation.get(obs.id)
             if fid:
-                self.active_ids.pop(fid, None)
+                self._deactivate(fid)
         if deactivate_sync_id:
-            self.active_ids.pop(deactivate_sync_id, None)
+            self._deactivate(deactivate_sync_id)
         if deactivate_integrate_ids:
             for iid in deactivate_integrate_ids:
-                self.active_ids.pop(iid, None)
-        self.active_ids[integrate_id] = "integrate"
+                self._deactivate(iid)
+        self._activate(integrate_id, "integrate")
 
     def integrate_pair(
         self,
@@ -406,12 +500,15 @@ class Innerface(SpikingEngine):
         """
         if observation_a.id == observation_b.id and not deactivate_integrate_ids:
             return None
-        # Terminator: do not Integrate across different sensor/actuator channels
+        # Terminator: do not Integrate across different sensor/actuator channels.
+        # Still deactivate the Follows sync so it cannot remain a zombie active set.
         if not depth_fold and not self._same_integration_channel(
             observation_a, observation_b, channel=channel
         ):
             with self._local_lock:
                 self.integrate_blocked_cross_channel += 1
+            if deactivate_sync_id:
+                self._deactivate(deactivate_sync_id)
             return None
 
         host = self.host
@@ -505,6 +602,8 @@ class Innerface(SpikingEngine):
                 observation_b,
                 integrate_id=integrate_id,
                 with_labels=with_labels,
+                reason=reason,
+                channel=ch_key if ch_key != "_" else None,
             )
         except (ValueError, RuntimeError) as exc:
             self.last_error = f"integrate: {exc}"
@@ -696,8 +795,7 @@ class Innerface(SpikingEngine):
         removed = 0
         with host.graph_lock:
             for tid in removable:
-                if tid in host.thoughts:
-                    del host.thoughts[tid]
+                if host._remove_thought_unlocked(tid) is not None:
                     removed += 1
 
         if removed:
@@ -794,10 +892,8 @@ class Innerface(SpikingEngine):
 
             removed = 0
             for tid in remove:
-                if tid in host.thoughts:
-                    del host.thoughts[tid]
+                if host._remove_thought_unlocked(tid) is not None:
                     removed += 1
-                host._hot_ids.discard(tid)
 
             # Drop from engine memberships
             for eng in (host.interface, host.innerface, host.outerface):
@@ -1177,6 +1273,9 @@ class Innerface(SpikingEngine):
         """
         Replace bulk synchronize automata: Observations that fired this pulse
         get Follows (+ channel Integrates via existing helpers).
+
+        When ``cofire_meta_only`` is True, cell-map Observations are excluded so
+        policy co-occurrence stays on meta sensors / Action poles.
         """
         host = self.host
         if host is None:
@@ -1193,8 +1292,21 @@ class Innerface(SpikingEngine):
                 # Prefer true Observations (channel map or transient)
                 with self._local_lock:
                     is_obs = tid in self._obs_channel or t.transient
-                if is_obs or (t.label and ":" in str(t.label)):
+                if is_obs or (t.label and ":" in str(t.label)) or ":act:" in tid:
                     fired_obs.append(t)
+
+        # Also include Action poles that fired (policy)
+        with host.graph_lock:
+            mind = getattr(host, "mind", None)
+            if mind is not None:
+                with mind._lock:
+                    acts = list(mind._actions.values())
+                for t in acts:
+                    if int(getattr(t, "last_fired_cycle", -1)) == int(cycle):
+                        fired_obs.append(t)
+
+        # Filter for policy-focused co-fire
+        fired_obs = [t for t in fired_obs if self._is_cofire_eligible(t)]
 
         if len(fired_obs) < 2:
             # Single-channel temporal: if two last_obs different and both hot
@@ -1240,7 +1352,6 @@ class Innerface(SpikingEngine):
             with self._local_lock:
                 self.co_fire_consolidations += 1
         return n
-
     def post_ports(self) -> None:
         """Co-fire consolidators + sparse depth-fold/prune."""
         host = self.host

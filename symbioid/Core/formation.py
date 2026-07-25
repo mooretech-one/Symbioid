@@ -319,12 +319,28 @@ def six_set_labels(store: dict[str, Thought]) -> list[str]:
     return [t.label if t.label else t.id for t in store.values()]
 
 
+def is_relation_type_label(label: Optional[str]) -> bool:
+    """True for six-set relation-type labels, including qualified Integrates[…]."""
+    if not label:
+        return False
+    if label in _SIX_SET_TYPE_LABELS:
+        return True
+    # Middle-ground operators: Integrates[follows], IntegratedBy[policy:eye], …
+    if label.startswith("Integrates") or label.startswith("IntegratedBy"):
+        return True
+    if label.startswith("ObservationIntegrates") or label.startswith(
+        "ObservationIntegratedBy"
+    ):
+        return True
+    return False
+
+
 def six_set_poles(store: dict[str, Thought]) -> list[Thought]:
     """The two pole Thoughts of a reciprocal six-set (excludes Links and type roles)."""
     return [
         t
         for t in store.values()
-        if not isinstance(t, Link) and (t.label not in _SIX_SET_TYPE_LABELS)
+        if not isinstance(t, Link) and not is_relation_type_label(t.label)
     ]
 
 
@@ -354,7 +370,17 @@ def is_scaffold_thought(thought: Thought) -> bool:
     if isinstance(thought, Link):
         return True
     lab = thought.label
-    return lab is not None and lab in _SCAFFOLD_LABELS
+    if lab is None:
+        return False
+    if lab in _SCAFFOLD_LABELS:
+        return True
+    # Qualified integrate operators count as scaffold (Integrates[follows], …)
+    return is_relation_type_label(lab) and (
+        lab.startswith("Integrates")
+        or lab.startswith("IntegratedBy")
+        or lab.startswith("ObservationIntegrates")
+        or lab.startswith("ObservationIntegratedBy")
+    )
 
 
 def extract_observation(store: dict[str, Thought]) -> Optional[Thought]:
@@ -476,35 +502,70 @@ def complete_belief_set(
     return store
 
 
+def qualify_integrate_type_labels(
+    reason: str = "pair",
+    channel: Optional[str] = None,
+) -> tuple[str, str, str, str]:
+    """
+    Middle-ground operator labels for integrate six-sets.
+
+    Keeps reciprocal Integrates/IntegratedBy shape but qualifies by *reason*
+    (follows, cofire, depth, policy, …) and optional short channel tag.
+
+    Returns (type_fwd, type_rev, link_fwd, link_rev).
+    """
+    r = (reason or "pair").strip().replace(" ", "_") or "pair"
+    r = r[:32]
+    if channel:
+        # Prefer last path segment (sensor id / "policy") for readability
+        ch = str(channel).strip().split(":")[-1][:24] or "ch"
+        tag = f"{r}:{ch}"
+    else:
+        tag = r
+    return (
+        f"Integrates[{tag}]",
+        f"IntegratedBy[{tag}]",
+        f"ObservationIntegratesObservation[{tag}]",
+        f"ObservationIntegratedByObservation[{tag}]",
+    )
+
+
 def complete_integrate_set(
     observation_a: Thought,
     observation_b: Thought,
     *,
     integrate_id: str,
     with_labels: bool = True,
+    reason: str = "pair",
+    channel: Optional[str] = None,
 ) -> dict[str, Thought]:
     """
     H1: Rodin-halving integration six-set — two Observations → Integrates/IntegratedBy.
 
     Reduces a pair of Input-level Observations into one reciprocal six-Thought pattern
     (symmetric to complete_follows_set, different link semantics).
+
+    Link *types* are qualified by ``reason`` (and optional ``channel``), e.g.
+    ``Integrates[follows]``, ``Integrates[policy:eye]``, not a free product of
+    Perceives×Follows poles — but not a bare generic "Integrates" either.
     """
     if observation_a.id == observation_b.id:
         raise ValueError("cannot integrate an Observation with itself")
     lab = (lambda s: s) if with_labels else (lambda s: None)
+    t_fwd, t_rev, l_fwd, l_rev = qualify_integrate_type_labels(reason, channel)
     p = f"{integrate_id}:"
-    integrates = Thought(id=f"{p}integrates", label=lab("Integrates"))
-    integrated_by = Thought(id=f"{p}integrated_by", label=lab("IntegratedBy"))
+    integrates = Thought(id=f"{p}integrates", label=lab(t_fwd))
+    integrated_by = Thought(id=f"{p}integrated_by", label=lab(t_rev))
     link_integrates = Link(
         id=f"{p}a_integrates_b",
-        label=lab("ObservationIntegratesObservation"),
+        label=lab(l_fwd),
         source=observation_a,
         link_type=integrates,
         target=observation_b,
     )
     link_integrated_by = Link(
         id=f"{p}b_integrated_by_a",
-        label=lab("ObservationIntegratedByObservation"),
+        label=lab(l_rev),
         source=observation_b,
         link_type=integrated_by,
         target=observation_a,
@@ -535,9 +596,22 @@ def format_six_set_line(kind: str, store: dict[str, Thought], *, index: Optional
     elif kind == "sync" and len(poles) >= 2:
         title = f"sync {poles[0].label}⇄{poles[1].label}"
     elif kind == "integrate" and len(poles) >= 2:
-        title = f"integrate {poles[0].label}⊕{poles[1].label}"
+        # Prefer qualified type tag from store if present (Integrates[follows:…])
+        tag = ""
+        for t in store.values():
+            lab = t.label or ""
+            if lab.startswith("Integrates[") and lab.endswith("]"):
+                tag = lab[len("Integrates") :]
+                break
+        title = f"integrate{tag} {poles[0].label}⊕{poles[1].label}"
     elif kind == "depth" and len(poles) >= 2:
-        title = f"depth {poles[0].label}⊕{poles[1].label}"
+        tag = ""
+        for t in store.values():
+            lab = t.label or ""
+            if lab.startswith("Integrates[") and lab.endswith("]"):
+                tag = lab[len("Integrates") :]
+                break
+        title = f"depth{tag} {poles[0].label}⊕{poles[1].label}"
     elif kind == "belief" and len(poles) >= 2:
         # poles: Feedback, ExpectedObservation — compact (no full six-set dump)
         title = f"belief {poles[0].label} anticipates {poles[1].label}"

@@ -356,7 +356,7 @@ Host label: `tetris-byte-learner`. Policy: `TetrisCoach` discovers a secret byte
 
 Hole = empty cell with a filled cell above in the same column (classic Tetris). Aggregate height/hole totals are no longer separate sensors; the map supersedes them.
 
-**Perf:** cell sensors use `awareness=False` (terminator only). Sampling is **change-only** (one `cell_field_state` per tick; skip unchanged / initial open cells) so the Rodin path is not hit 200× every frame.
+**Perf:** cell sensors use `awareness=False` (terminator only). Sampling is **change-only** + **ROI** (v0.0.28): empty top rows (`sky_row`), solid full-width floor (`solid_floor_start_row`), active dirty-rect, sticky locked=1.0, line-clear invalidation; candidates via `(r,c)` index. **Dynamics** (v0.0.29): Link adjacency index + hot-set-only `pulse_tick`; demo pulses every **2** frames; Phase C cell-obs index. **Learning structure** (v0.0.30): cross-channel Integrate block deactivates Follows sync; `max_active_syncs`/`max_active_senses` LRU; Tetris `cofire_meta_only` + no cell–cell Follows; hard Mind follows/integrates registry caps.
 
 **Actuators (1)**
 
