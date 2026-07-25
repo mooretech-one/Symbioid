@@ -188,7 +188,11 @@ Minted structure is **read for action choice**, not only stored:
 | `recommend_action(state_poles, domain=…)` | Highest-valence Action linked to current state (fail open → `None`) |
 
 **Outerface** prefers `propose_actions_from_graph()` before the legacy “fire first actuator” path.  
-**Tetris** records outcomes on piece lock and, when the byte map is complete, biases `tick(preferred_intent=…)` from `recommend_action`.
+**Tetris (v0.0.32+)** is **Symbioid-primary** (`TetrisCoach.network_primary=True`):
+
+1. **Placement / strategy** — `choose_target` blends cell-map Thought heat at high weight (`graph_placement_weight≈0.88`); coach board value is residual.
+2. **Commands** — `graph_preferred_intent` derives micro-intents from the network-scored target (geo), with Mind `recommend_action` as strong-score override; `tick` takes that intent at high `graph_bias` (~0.93).
+3. **Coach retains** — secret-byte discovery, gravity separation, stuck/force-hard survival, cold explore fallback (`last_network_cmd` marks who drove the last byte).
 
 Content keys quantize float `reading` (`quantize_decimals=3` default). Registry Observations + Actions are protected from prune. Coach lock reward also fans into valence via `mind.note_valence(channel="board", delta=…)`.
 

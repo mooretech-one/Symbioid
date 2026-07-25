@@ -378,55 +378,124 @@ def graph_preferred_intent(
     coach: TetrisCoach,
 ) -> tuple[str | None, float, list, str | None]:
     """
-    Phase B hand-off: recommend_action + hard bias when coach wants hard.
-    Phase C: heat Outerface Action membership for agency alignment.
+    Symbioid → coach control hand-off.
+
+    **Network-primary (default):**
+    - **Strategy / placement:** ``choose_target`` with cell-map Thought heat
+      yields a geometric micro-intent (rotate/left/right/hard toward target).
+    - **Policy:** Mind ``recommend_action`` soft-biases; only overrides geo when
+      score is strong or when no target exists yet.
+    - **Bias:** high ``graph_bias`` so ``tick`` usually emits the network intent.
+
+    Coach remains: cipher map, residual board value, gravity separation,
+    stuck/force-hard survival, cold explore fallback.
 
     Returns (preferred_intent, graph_bias, poles, hint).
     """
     poles = policy_state_poles(s, world)
-    # Mild heat on Action poles so activation weight can contribute
+    net = bool(getattr(coach, "network_primary", True))
+    # Heat Action poles so activation weight can contribute to recommend
     for tok in VALID_ACTIONS:
         th = s.mind.ensure_action_thought("tetris", tok, host_id=s.id)
         s.add_thought(th)
 
     rec = s.mind.recommend_action(poles, domain="tetris", min_score=0.05)
+    mind_tok: str | None = None
+    mind_score = 0.0
+    if rec is not None and rec.token in VALID_ACTIONS:
+        mind_tok = rec.token
+        mind_score = float(getattr(rec, "score", 0.0) or 0.0)
+
+    play = coach.play_ready() or coach.map_complete()
+
+    # --- Geometric intent from network-scored placement target ---
+    geo_intent: str | None = None
+    if world.active is not None and (play or (net and coach.graph_placement_bonus is not None)):
+        if coach._target is None:
+            try:
+                # Only structured aim once we can hard-drop (or full map)
+                if play:
+                    coach._target = coach.choose_target(world)
+            except Exception:
+                pass
+        if coach._target is not None:
+            tgt_rot, tgt_col = coach._target
+            cur = world.active
+            if cur.rotation % 4 != tgt_rot % 4:
+                geo_intent = "rotate"
+            elif cur.col < tgt_col:
+                geo_intent = "right"
+            elif cur.col > tgt_col:
+                geo_intent = "left"
+            else:
+                geo_intent = "hard"
+
+    # Network-primary strategy: geo from placement owns the path;
+    # Mind overrides only when strong or when geo is missing.
     preferred: str | None = None
     hint: str | None = None
-    if rec is not None and rec.token in VALID_ACTIONS:
-        preferred = rec.token
-        hint = f"{rec.token}@{rec.score:.2f}"
-
-    graph_bias = 0.50  # default: light bias so coach placement still leads
-    play = coach.play_ready() or coach.map_complete()
-    if not play:
-        return preferred, 0.0, poles, hint  # no override while discovering
+    if net:
+        if geo_intent is not None:
+            preferred = geo_intent
+            hint = f"geo:{geo_intent}"
+            # Strong Mind signal may override (learned policy over pure geometry)
+            if mind_tok is not None and mind_tok != geo_intent and mind_score >= 0.55:
+                preferred = mind_tok
+                hint = f"{mind_tok}@{mind_score:.2f}>geo"
+            elif mind_tok is not None and mind_tok == geo_intent:
+                hint = f"geo+mind:{geo_intent}"
+        elif mind_tok is not None:
+            preferred = mind_tok
+            hint = f"{mind_tok}@{mind_score:.2f}"
+    else:
+        # Legacy coach-primary: Mind first, geo as soft fill
+        if mind_tok is not None:
+            preferred = mind_tok
+            hint = f"{mind_tok}@{mind_score:.2f}"
+        elif geo_intent is not None:
+            preferred = geo_intent
+            hint = f"geo:{geo_intent}"
 
     want_hard = coach.wants_hard_now(world)
     if want_hard:
         hard_th = s.mind.ensure_action_thought("tetris", "hard", host_id=s.id)
         s.add_thought(hard_th)
         s.stimulate(hard_th, 1.8)
-        # Phase C: Outerface membership for agency path alignment
         if hasattr(s.outerface, "add_member"):
             s.outerface.add_member(hard_th.id)
         preferred = "hard"
-        graph_bias = 0.97 if coach._stuck_lateral >= 2 else 0.90
         hint = "hard@stuck" if coach._stuck_lateral >= 2 else "hard@align"
-    elif preferred == "hard":
-        # Graph wants hard early — allow moderately (coach may still lateral)
-        graph_bias = 0.72
-        hard_th = s.mind.ensure_action_thought("tetris", "hard", host_id=s.id)
-        s.add_thought(hard_th)
-        if hasattr(s.outerface, "add_member"):
-            s.outerface.add_member(hard_th.id)
     elif preferred is not None:
-        # Light bias for graph lateral/rotate; coach placement still primary
-        graph_bias = 0.55
         th = s.mind.ensure_action_thought("tetris", preferred, host_id=s.id)
         s.add_thought(th)
-        s.stimulate(th, 0.9)
+        s.stimulate(th, 1.35 if net else 0.9)
         if hasattr(s.outerface, "add_member"):
             s.outerface.add_member(th.id)
+
+    # Bias: network-primary runs the command path; coach-primary is soft
+    if not play:
+        # While mapping: still let network try known intents (discover via outcomes)
+        if preferred and coach.byte_for_effect(preferred) is not None:
+            graph_bias = 0.50 if net else 0.0
+        else:
+            graph_bias = 0.0
+        return preferred, graph_bias, poles, hint
+
+    if net:
+        if preferred == "hard":
+            graph_bias = 0.98 if coach._stuck_lateral >= 2 else 0.95
+        elif preferred is not None:
+            graph_bias = 0.93
+        else:
+            graph_bias = 0.90  # coach fallback rare
+    else:
+        # Legacy coach-primary soft bias
+        if preferred == "hard":
+            graph_bias = 0.72
+        elif preferred is not None:
+            graph_bias = 0.55
+        else:
+            graph_bias = 0.50
 
     return preferred, graph_bias, poles, hint
 
@@ -827,10 +896,10 @@ def main(argv: list[str] | None = None) -> None:
         cipher=cipher,
         rng=rng_world,
     )
-    coach = TetrisCoach()
+    coach = TetrisCoach(network_primary=True)
     s = build_symbioid(world)
-    # Phase C: Symbioid cell-map / Thought heat shapes placement choice
-    coach.graph_placement_weight = 0.40
+    # Symbioid-primary: network scores placement; coach residual + byte map
+    coach.graph_placement_weight = 0.88
     coach.graph_placement_bonus = (
         lambda w, rot, col, _s=s: cell_thought_placement_score(_s, w, rot, col)
     )
@@ -923,7 +992,7 @@ def main(argv: list[str] | None = None) -> None:
             if not world.game_over and frame % CMD_EVERY == 0:
                 prev_event = world.last_event
                 prev_pieces = world.pieces_placed
-                # Phase B: policy state poles + hard bias when coach wants hard
+                # Symbioid-primary control: intent + placement from network
                 preferred, g_bias, poles, g_hint = graph_preferred_intent(
                     s, world, coach
                 )
@@ -935,8 +1004,14 @@ def main(argv: list[str] | None = None) -> None:
                     graph_bias=g_bias,
                 )
                 last_cmd_intent = coach.last_intent
-                if preferred and coach.last_intent == preferred:
-                    last_graph_hint = f"USE {preferred}"
+                if getattr(coach, "last_network_cmd", False) and preferred:
+                    last_graph_hint = f"NET {preferred}@{g_bias:.2f}"
+                elif preferred and coach.last_intent == preferred:
+                    last_graph_hint = f"NET {preferred}@{g_bias:.2f}"
+                elif coach.last_intent:
+                    last_graph_hint = f"fb {coach.last_intent}" + (
+                        f" (want {preferred})" if preferred else ""
+                    )
                 s.actuators[0].output = code / 255.0
                 # One sample per game turn (piece lock)
                 if world.pieces_placed > prev_pieces:

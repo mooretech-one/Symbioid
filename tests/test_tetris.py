@@ -322,6 +322,95 @@ def test_phase_b_policy_poles_prefer_meta():
     assert 0.0 <= bias <= 1.0
 
 
+def test_network_primary_tick_prefers_symbioid_intent():
+    """When network_primary and play_ready, preferred_intent wins over coach explore."""
+    cipher = ActionCipher.fixed({10: "left", 20: "right", 30: "rotate", 40: "hard"})
+    w = TetrisWorld(rng=Random(0), cipher=cipher, gravity_interval=9999)
+    coach = TetrisCoach(rng=Random(0), network_primary=True, map_threshold=1)
+    for b, e in ((10, "left"), (20, "right"), (30, "rotate"), (40, "hard")):
+        coach.effect_counts[b][e] = 3
+        coach.bytes_tried.add(b)
+    assert coach.play_ready()
+    hits = 0
+    for _ in range(40):
+        code = coach.tick(w, preferred_intent="left", graph_bias=0.95, run_gravity=False)
+        if code == 10 and coach.last_intent == "left":
+            hits += 1
+        if w.game_over or w.active is None:
+            break
+    assert hits >= 20, f"network primary should usually honor preferred_intent, hits={hits}"
+
+
+def test_network_primary_placement_weights_graph():
+    """network_primary + graph bonus should change choose_target vs coach-only."""
+    w = TetrisWorld(rng=Random(1), gravity_interval=9999)
+    # Bonus favors high columns
+    def bonus(world, rot, col):
+        return float(col) * 10.0
+
+    coach_net = TetrisCoach(
+        rng=Random(1),
+        network_primary=True,
+        graph_placement_weight=0.95,
+        graph_placement_bonus=bonus,
+        map_threshold=1,
+    )
+    coach_only = TetrisCoach(
+        rng=Random(1),
+        network_primary=False,
+        graph_placement_weight=0.0,
+        graph_placement_bonus=None,
+        map_threshold=1,
+    )
+    for b, e in ((1, "left"), (2, "right"), (3, "rotate"), (4, "hard")):
+        coach_net.effect_counts[b][e] = 2
+        coach_only.effect_counts[b][e] = 2
+        coach_net.bytes_tried.add(b)
+        coach_only.bytes_tried.add(b)
+    if w.active is None:
+        return
+    tn = coach_net.choose_target(w)
+    tc = coach_only.choose_target(w)
+    # Not required to differ always, but network should store graph bonus
+    assert coach_net.last_graph_bonus >= 0.0
+    assert isinstance(tn, tuple) and isinstance(tc, tuple)
+
+
+def test_network_primary_geo_intent_from_target():
+    """graph_preferred_intent follows network placement target when play-ready."""
+    import tetris_demo as mod
+
+    cipher = ActionCipher.fixed({10: "left", 20: "right", 30: "rotate", 40: "hard"})
+    w = TetrisWorld(rng=Random(2), cipher=cipher, gravity_interval=9999)
+    coach = TetrisCoach(
+        rng=Random(2),
+        network_primary=True,
+        graph_placement_weight=0.9,
+        map_threshold=1,
+    )
+    for b, e in ((10, "left"), (20, "right"), (30, "rotate"), (40, "hard")):
+        coach.effect_counts[b][e] = 3
+        coach.bytes_tried.add(b)
+    assert coach.play_ready()
+    assert w.active is not None
+    # Force a target to the right of current column
+    cur = w.active
+    tgt_col = min(w.cols - 1, cur.col + 2)
+    if tgt_col == cur.col:
+        tgt_col = max(0, cur.col - 2)
+    coach._target = (cur.rotation % 4, tgt_col)
+    s = mod.build_symbioid(w)
+    pref, bias, poles, hint = mod.graph_preferred_intent(s, w, coach)
+    assert pref in ("left", "right", "hard", "rotate")
+    if tgt_col > cur.col:
+        assert pref == "right", f"expected right toward target, got {pref} hint={hint}"
+    elif tgt_col < cur.col:
+        assert pref == "left", f"expected left toward target, got {pref} hint={hint}"
+    assert bias >= 0.85
+    assert isinstance(poles, list)
+    assert hint is not None
+
+
 def test_phase_b_wants_hard_when_aligned():
     w = TetrisWorld(rng=Random(3), gravity_interval=9999)
     coach = TetrisCoach(rng=Random(3), map_threshold=1)

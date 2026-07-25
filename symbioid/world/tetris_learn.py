@@ -214,17 +214,18 @@ class DropExperience:
 @dataclass
 class TetrisCoach:
     """
-    Three-layer learning (no privileged physics oracles for control):
+    Control layers (no privileged cipher oracle):
 
-    1. **Byte map** — emit 0..255; observe effects; learn live bytes.
-    2. **Board value** — after each real lock, shape-reward height/holes/lines
-       and update feature weights + pose residuals.
-    3. **Target choice** — 1-ply search: ``legal_placements`` +
-       ``simulate_placement`` scored by the *learned* evaluator (physics is the
-       world model for planning; good/bad boards are learned from play).
-       Phase C: optional ``graph_placement_bonus(world, rot, col)`` from
-       Symbioid cell-map / Thought heat.
-       Execute with discovered secret bytes only.
+    1. **Byte map** — emit 0..255; observe effects; learn live bytes (coach).
+    2. **Placement / strategy** — with ``network_primary`` (default), 1-ply
+       ``choose_target`` is dominated by Symbioid ``graph_placement_bonus``
+       (cell-map / Thought heat); coach board evaluator is residual only.
+    3. **Commands** — ``tick(preferred_intent=…)`` takes Symbioid intents first
+       (Mind ``recommend_action`` + geo-from-network-target); ``select_byte``
+       is cold fallback / mapping explore.
+
+    Coach retains: cipher discovery, gravity separation, stuck/force-hard
+    survival, and residual board shaping when the graph is cold.
 
     The coach never reads ``world.cipher`` / ``last_byte_action``.
     """
@@ -243,8 +244,12 @@ class TetrisCoach:
     noise: float = 0.35
     # How much to trust feature-scored board vs slot average (0..1)
     board_value_blend: float = 0.55
-    # Phase C: weight for Symbioid cell-map / Thought placement bonus
-    graph_placement_weight: float = 0.40
+    # When True (default): Symbioid drives placement scores + preferred intents;
+    # coach supplies byte map, gravity/world model, and cold fallback.
+    network_primary: bool = True
+    # Weight for Symbioid placement bonus in choose_target (higher = more network)
+    # network_primary default ~0.85; coach-primary demos can set 0.40.
+    graph_placement_weight: float = 0.85
     graph_placement_bonus: Optional[
         Callable[[TetrisWorld, int, int], float]
     ] = field(default=None, repr=False)
@@ -261,6 +266,7 @@ class TetrisCoach:
     last_byte: int = 0
     last_effect: str = "noop"
     last_intent: str = "explore"
+    last_network_cmd: bool = False  # True when last tick used preferred_intent
     last_reward: float = 0.0
     # byte → effect → count
     effect_counts: dict[int, dict[str, int]] = field(
@@ -636,25 +642,33 @@ class TetrisCoach:
             return self._clamp_pose(kind, world.active.rotation, cur_col, cols)
 
         scored: list[tuple[float, int, int, float]] = []
+        net_primary = bool(self.network_primary) and self.graph_placement_bonus is not None
+        g_w = float(self.graph_placement_weight)
+        if net_primary:
+            g_w = max(0.55, min(0.98, g_w))  # network owns strategy
         for rot, col in options:
             sim = world.simulate_placement(rot, col)
             if sim is None:
                 continue
-            v = self.evaluate_imagined_drop(pre, sim, rows=float(world.rows))
+            coach_v = self.evaluate_imagined_drop(pre, sim, rows=float(world.rows))
             # Small residual from real-game outcomes for this pose
             key = (kind, rot % 4, int(col))
             n = self.slot_reward_n.get(key, 0)
             if n > 0:
-                v += 0.12 * (self.slot_reward_sum[key] / n)
+                coach_v += 0.12 * (self.slot_reward_sum[key] / n)
             # Slight preference for nearer columns (less control error)
-            v -= 0.05 * abs(col - cur_col)
+            coach_v -= 0.05 * abs(col - cur_col)
             g_bonus = 0.0
             if self.graph_placement_bonus is not None:
                 try:
                     g_bonus = float(self.graph_placement_bonus(world, rot, col))
                 except Exception:
                     g_bonus = 0.0
-                v += float(self.graph_placement_weight) * g_bonus
+            if net_primary:
+                # Symbioid placement heat is primary; coach board value is residual
+                v = g_w * g_bonus + (1.0 - g_w) * coach_v
+            else:
+                v = coach_v + g_w * g_bonus
             scored.append((v, rot, col, g_bonus))
 
         if not scored:
@@ -882,11 +896,22 @@ class TetrisCoach:
         return "hard"
 
     def select_byte(self, world: TetrisWorld) -> tuple[int, str]:
+        """
+        Coach / geometric fallback command.
+
+        When ``network_primary`` and play-ready, explore is minimal — the demo
+        path should usually have already supplied ``preferred_intent`` from
+        Symbioid. ``desired_intent`` still walks a network-scored ``_target``
+        when ``graph_placement_bonus`` is set.
+        """
         intent = self.desired_intent(world)
         if intent == "explore" or self.byte_for_effect(intent) is None:
             return self._pick_explore_byte(), "explore"
-        # Less random explore once play-ready (still some discovery)
-        explore_p = max(0.02, self.explore_rate * (0.06 if self.play_ready() else 0.1))
+        # Network-primary: keep residual discovery tiny once we can act
+        if self.network_primary and (self.play_ready() or self.map_complete()):
+            explore_p = max(0.01, self.explore_rate * 0.02)
+        else:
+            explore_p = max(0.02, self.explore_rate * (0.06 if self.play_ready() else 0.1))
         if self.rng.random() < explore_p:
             return self._pick_explore_byte(), "explore"
         b = self.byte_for_effect(intent)
@@ -908,9 +933,10 @@ class TetrisCoach:
         Gravity runs in a **separate** step after the command so left/right
         are not mixed with a free-fall delta (which previously broke mapping).
 
-        ``preferred_intent``: optional graph recommendation (e.g. left/hard).
-        When play_ready/map complete and a live byte is known for that intent,
-        take it with probability ``graph_bias`` (else normal select_byte).
+        ``preferred_intent``: Symbioid / graph recommendation (e.g. left/hard).
+        With ``network_primary`` (default), preferred intent is the *primary*
+        command source once a live byte is known; coach ``select_byte`` is fallback.
+        ``graph_bias`` is the probability of taking the network intent (0..1).
         """
         if world.game_over:
             self.last_effect = "game_over"
@@ -922,20 +948,47 @@ class TetrisCoach:
             self._begin_piece(world)
 
         before = WorldSnapshot.take(world)
-        code, intent = self.select_byte(world)
-        # Minted-Thought bias: use graph intent when we can act (play_ready)
+        bias = max(0.0, min(1.0, float(graph_bias)))
+        if self.network_primary and bias < 0.5 and (
+            self.play_ready() or self.map_complete()
+        ):
+            # Network-primary demos should not accidentally run coach-only
+            bias = max(bias, 0.90)
+
+        used_network = False
+        code: int
+        intent: str
+        # --- Symbioid-first command selection ---
         if (
             preferred_intent
             and preferred_intent in VALID_ACTIONS
-            and (self.play_ready() or self.map_complete())
             and self.byte_for_effect(preferred_intent) is not None
-            and self.rng.random() < max(0.0, min(1.0, graph_bias))
+            and self.rng.random() < bias
         ):
-            b = self.byte_for_effect(preferred_intent)
-            if b is not None:
-                code, intent = b, preferred_intent
+            # Allow weak network influence even while mapping (bias often small)
+            if self.play_ready() or self.map_complete() or self.network_primary:
+                b = self.byte_for_effect(preferred_intent)
+                if b is not None:
+                    code, intent = b, preferred_intent
+                    used_network = True
+        if not used_network:
+            code, intent = self.select_byte(world)
+            # Coach-primary soft override (legacy)
+            if (
+                not self.network_primary
+                and preferred_intent
+                and preferred_intent in VALID_ACTIONS
+                and (self.play_ready() or self.map_complete())
+                and self.byte_for_effect(preferred_intent) is not None
+                and self.rng.random() < bias
+            ):
+                b = self.byte_for_effect(preferred_intent)
+                if b is not None:
+                    code, intent = b, preferred_intent
+                    used_network = True
         self.last_byte = code
         self.last_intent = intent
+        self.last_network_cmd = used_network
         self._piece_cmds += 1
 
         prev_placed = world.pieces_placed
