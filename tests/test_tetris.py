@@ -261,6 +261,18 @@ def test_landing_cells_matches_legal_drop():
     assert all(0 <= r < w.rows and 0 <= c < w.cols for r, c in cells)
 
 
+def test_demo_timing_sense_not_slower_than_command():
+    """Sense and command clocks: sample_every ≤ CMD_EVERY; pulse at least per frame."""
+    import tetris_demo as mod
+
+    assert mod.SAMPLE_EVERY <= mod.CMD_EVERY
+    assert mod.PULSE_EVERY >= 1
+    assert mod.PULSES_PRE_CMD >= 0
+    assert mod.PULSES_ON_LOCK >= 0
+    # Target ratio: at least one sample per command interval
+    assert mod.CMD_EVERY % mod.SAMPLE_EVERY == 0 or mod.SAMPLE_EVERY == mod.CMD_EVERY
+
+
 def test_edge_well_metrics_report_open_side_trenches():
     """Left/right open single-width wells must contribute to well (edge-aware)."""
     from symbioid.world.tetris import well_metrics

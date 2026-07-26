@@ -82,8 +82,13 @@ H = (
     + MARGIN_Y
 )
 FPS = 30
+# Timing: sense ≥ command; pulse ≥ command (settle between moves).
+# Order on command frames: sample → base pulse → pre-cmd pulses → decide.
 CMD_EVERY = 2
-PULSE_EVERY = 2  # dynamics tick every N frames (T0.1 — cut full-graph pulse load)
+SAMPLE_EVERY = 2  # was 4 — map was 2× staler than commands
+PULSE_EVERY = 1  # was 2 — dynamics every paint frame
+PULSES_PRE_CMD = 1  # extra settle pulses after sample, before intent (total ~2/cmd)
+PULSES_ON_LOCK = 3  # burst after lock reward so outcomes can propagate
 GRAVITY_INTERVAL = 18
 # Pause after top-out so Innerface formations can catch up before next game
 RESTART_DELAY_FRAMES = FPS * 1
@@ -888,6 +893,17 @@ def draw(
         (sx, y),
     )
     y += 16
+    # Clocks: sense / command / pulse periods (frames @ FPS)
+    screen.blit(
+        font_sm.render(
+            f"clk   se/{SAMPLE_EVERY} cmd/{CMD_EVERY} p/{PULSE_EVERY}"
+            f"+{PULSES_PRE_CMD}pre +{PULSES_ON_LOCK}lk",
+            True,
+            (110, 130, 150),
+        ),
+        (sx, y),
+    )
+    y += 16
 
     # Active six-set breakdown (Band A caps; sense/sync/integrate)
     n_act, n_inact = thought_counts_active_inactive(s)
@@ -1095,7 +1111,7 @@ def main(argv: list[str] | None = None) -> None:
     font = pygame.font.SysFont("DejaVu Sans", 20)
     font_sm = pygame.font.SysFont("DejaVu Sans", 14)
     frame = 0
-    sample_every = 4
+    sample_every = SAMPLE_EVERY
     log_every = 90
     game_over_at: int | None = None
     was_mapped = False
@@ -1139,13 +1155,23 @@ def main(argv: list[str] | None = None) -> None:
                             flush=True,
                         )
 
-            if frame % sample_every == 0:
+            # --- Network / game clocks (sense ≥ cmd; pulse settles before decide) ---
+            is_cmd = (not world.game_over) and (frame % CMD_EVERY == 0)
+            is_sample = frame % sample_every == 0
+
+            # 1) Sense: refresh cell map + meta before any command on this frame
+            if is_sample:
                 sample_into_symbioid(s, world, tick=frame)
-            # Decay / fire / spread — every PULSE_EVERY frames (not every paint)
+
+            # 2) Baseline dynamics
             if s.mind.dynamics_enabled and frame % PULSE_EVERY == 0:
                 s.pulse_tick()
 
-            if not world.game_over and frame % CMD_EVERY == 0:
+            # 3) Command: extra settle pulses, then intent + byte
+            if is_cmd:
+                if s.mind.dynamics_enabled and PULSES_PRE_CMD > 0:
+                    for _ in range(int(PULSES_PRE_CMD)):
+                        s.pulse_tick()
                 prev_event = world.last_event
                 prev_pieces = world.pieces_placed
                 # Symbioid-primary control: intent + placement from network
@@ -1201,6 +1227,10 @@ def main(argv: list[str] | None = None) -> None:
                         apply_lock_valence_to_landing_cells(
                             s, lock_cells, float(coach.last_reward)
                         )
+                    # Burst pulse so outcome valence can spread before next cmd
+                    if s.mind.dynamics_enabled and PULSES_ON_LOCK > 0:
+                        for _ in range(int(PULSES_ON_LOCK)):
+                            s.pulse_tick()
                     _record_thought_sample()
                     last_pieces_for_plot = world.pieces_placed
                 if coach.map_complete() and not was_mapped:
