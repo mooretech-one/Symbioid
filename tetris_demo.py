@@ -82,16 +82,19 @@ H = (
     + MARGIN_Y
 )
 FPS = 30
-# Timing: sense ≥ command; pulse ≥ command (settle between moves).
-# Order on command frames: sample → base pulse → pre-cmd pulses → decide.
-CMD_EVERY = 2
-SAMPLE_EVERY = 2  # was 4 — map was 2× staler than commands
-PULSE_EVERY = 1  # was 2 — dynamics every paint frame
-PULSES_PRE_CMD = 1  # extra settle pulses after sample, before intent (total ~2/cmd)
-PULSES_ON_LOCK = 3  # burst after lock reward so outcomes can propagate
-GRAVITY_INTERVAL = 18
-# Pause after top-out so Innerface formations can catch up before next game
-RESTART_DELAY_FRAMES = FPS * 1
+# Optimal coupling (v0.0.38): sense = command = every paint frame; faces ~50 Hz.
+# Order: sample → pulse → pre-cmd settle → decide. Gravity slowed so fall rate
+# stays ~1 row/s when gravity ticks every frame (was every 2 frames).
+CMD_EVERY = 1
+SAMPLE_EVERY = 1
+PULSE_EVERY = 1
+PULSES_PRE_CMD = 1  # settle activation before intent
+PULSES_ON_LOCK = 2  # outcome spread (shorter; more cmd frames overall)
+GRAVITY_INTERVAL = 30  # ~1.0 s/row at 30 FPS with cmd every frame
+# Top-out: half second for Innerface queue (was 1.0 s)
+RESTART_DELAY_FRAMES = max(12, FPS // 2)
+# Face worker sleep (default Process 0.05 → 20 Hz); 0.02 → 50 Hz formation drain
+FACE_TICK_INTERVAL = 0.02
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -163,6 +166,10 @@ def build_symbioid(world: TetrisWorld) -> Symbioid:
     s = Symbioid(id=HOST_ID, label="tetris-byte-learner")
     s.interface.continuous_inputs = False
     s.outerface.wait_for_feedback = False
+    # Faster face workers so sample→formation is not stuck on 50 ms sleeps
+    s.interface.tick_interval = float(FACE_TICK_INTERVAL)
+    s.innerface.tick_interval = float(FACE_TICK_INTERVAL)
+    s.outerface.tick_interval = float(FACE_TICK_INTERVAL)
     # Learning structure (P0): avoid cell co-fire storms / zombie syncs.
     # Band B (research active-thoughts theory): serious network-primary WM +
     # larger policy registries with act:-preferring hard eviction.
