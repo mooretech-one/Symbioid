@@ -152,12 +152,13 @@ def thought_counts_active_inactive(s: Symbioid) -> tuple[int, int]:
 
 def build_symbioid(world: TetrisWorld) -> Symbioid:
     """
-    Sensors: full 10×20 cell map (block / hole / open) + slim meta
-    (piece_id, next_id, lines, last_byte). Aggregates dropped — spatial map
-    supersedes height/hole totals.
+    Sensors: full 10×20 cell map (block / hole / open) + meta
+    (piece_id, next_id, lines, last_byte, holes_n, last_d_holes).
 
     Cell sensors use awareness=False (terminator only) to avoid 200 full
     awareness six-sets. Sampling is change-only (see sample_into_symbioid).
+    Packing meta (holes_n / last_d_holes) gives the Thought graph explicit
+    insight into sealed-hole count and last lock's hole delta.
     """
     s = Symbioid(id=HOST_ID, label="tetris-byte-learner")
     s.interface.continuous_inputs = False
@@ -171,9 +172,21 @@ def build_symbioid(world: TetrisWorld) -> Symbioid:
     s.innerface.max_active_senses = 224
     s.innerface.max_active_integrates = 112
     s.innerface.max_active_integrates_per_channel = 8
+    # Packing meta participates in co-fire / policy poles
+    s.innerface.cofire_meta_labels = tuple(
+        dict.fromkeys(
+            list(s.innerface.cofire_meta_labels)
+            + ["holes_n", "last_d_holes", "well_n", "max_well_n"]
+        )
+    )
     s.mind.max_follows_registry = 4096
     s.mind.max_integrates_registry = 4096
     s.mind.policy_registry_priority = True
+    # Held packing readings for sensor.transfer (updated on sample / lock)
+    s._pack_holes = 0.0  # type: ignore[attr-defined]
+    s._last_d_holes = 0.0  # type: ignore[attr-defined]
+    s._pack_well = 0.0  # type: ignore[attr-defined]
+    s._pack_max_well = 0.0  # type: ignore[attr-defined]
 
     # Last cell readings for change-only formation (sensor_id → float)
     s._cell_last_reading: dict[str, float] = {}  # type: ignore[attr-defined]
@@ -215,11 +228,29 @@ def build_symbioid(world: TetrisWorld) -> Symbioid:
             return 0.0
         return PIECE_NAMES.index(kind) / 6.0
 
+    def holes_n(_w: dict, _s: Symbioid = s) -> float:
+        # Absolute sealed-hole count, scaled (~0..1 for typical boards)
+        return min(1.0, max(0.0, float(getattr(_s, "_pack_holes", 0.0)) / 40.0))
+
+    def last_d_holes_n(_w: dict, _s: Symbioid = s) -> float:
+        # Last lock Δholes, compressed to [-1, 1] (÷8 holes ≈ full-scale)
+        return max(-1.0, min(1.0, float(getattr(_s, "_last_d_holes", 0.0)) / 8.0))
+
+    def well_n(_w: dict, _s: Symbioid = s) -> float:
+        return min(1.0, max(0.0, float(getattr(_s, "_pack_well", 0.0)) / 40.0))
+
+    def max_well_n(_w: dict, _s: Symbioid = s) -> float:
+        return min(1.0, max(0.0, float(getattr(_s, "_pack_max_well", 0.0)) / 20.0))
+
     for label, transfer in (
         ("piece_id", piece_id_n),
         ("next_id", next_id_n),
         ("lines", lambda w, wo=world: min(1.0, wo.lines / 50.0)),
         ("last_byte", lambda w, wo=world: wo.last_byte / 255.0),
+        ("holes_n", holes_n),
+        ("last_d_holes", last_d_holes_n),
+        ("well_n", well_n),
+        ("max_well_n", max_well_n),
     ):
         sen = s.add_sensor(Sensor(id=f"{HOST_ID}:sen:{label}", label=label))
         sen.transfer = transfer
@@ -238,7 +269,21 @@ def build_symbioid(world: TetrisWorld) -> Symbioid:
 
 
 # Meta sensor labels used as stable policy state (always sampled)
-_POLICY_META_LABELS = frozenset({"piece_id", "next_id", "lines", "last_byte"})
+_POLICY_META_LABELS = frozenset(
+    {
+        "piece_id",
+        "next_id",
+        "lines",
+        "last_byte",
+        "holes_n",
+        "last_d_holes",
+        "well_n",
+        "max_well_n",
+    }
+)
+_PACKING_META_LABELS = frozenset(
+    {"holes_n", "last_d_holes", "well_n", "max_well_n"}
+)
 
 
 def policy_state_poles(s: Symbioid, world: TetrisWorld) -> list:
@@ -593,6 +638,48 @@ def graph_preferred_intent(
     return preferred, graph_bias, poles, hint
 
 
+def _update_pack_readings(s: Symbioid, world: TetrisWorld, coach: object | None = None) -> None:
+    """Refresh host-held packing readings for meta sensor.transfer callables."""
+    try:
+        from symbioid.world.tetris_learn import observe_board
+
+        obs = observe_board(world)
+        s._pack_holes = float(obs.get("holes", world.hole_count()))  # type: ignore[attr-defined]
+        s._pack_well = float(obs.get("well", 0.0))  # type: ignore[attr-defined]
+        s._pack_max_well = float(obs.get("max_well", 0.0))  # type: ignore[attr-defined]
+    except Exception:
+        s._pack_holes = float(world.hole_count())  # type: ignore[attr-defined]
+    if coach is not None:
+        s._last_d_holes = float(getattr(coach, "last_d_holes", 0.0) or 0.0)  # type: ignore[attr-defined]
+
+
+def sample_packing_meta_into_symbioid(
+    s: Symbioid, world: TetrisWorld, tick: int, *, coach: object | None = None
+) -> None:
+    """Force-sample packing meta sensors so lock Δholes becomes Observations."""
+    _update_pack_readings(s, world, coach)
+    w = world.sensor_world()
+    handoffs = []
+    for sen in s.sensors:
+        lab = sen.label or ""
+        if lab not in _PACKING_META_LABELS:
+            continue
+        sense = sen.sample(tick=tick, world=w)
+        if sense is None:
+            continue
+        h = s.interface.start_formation_for_sensor(sen, force=True, sense=sense)
+        if h is not None:
+            handoffs.append(h)
+    if not handoffs:
+        return
+    if len(handoffs) > 1:
+        s.innerface.post(
+            {"kind": "formation_batch", "handoffs": handoffs, "tick": tick}
+        )
+    else:
+        s.innerface.post(handoffs[0])
+
+
 def sample_into_symbioid(s: Symbioid, world: TetrisWorld, tick: int) -> None:
     """
     Sample meta sensors every call; cell map is **change-only** + **ROI**:
@@ -607,6 +694,7 @@ def sample_into_symbioid(s: Symbioid, world: TetrisWorld, tick: int) -> None:
     - **S1.9** invalidate cell last-readings on line clear (or rising ``lines``).
     - Iterate only candidate cells (not all 200 sensors).
     """
+    _update_pack_readings(s, world, coach=None)
     w = world.sensor_world()
     w["byte"] = float(s.actuators[0].output)
     handoffs = []
@@ -889,6 +977,16 @@ def draw(
             f"pack  holes={n_holes}  well={n_well:.0f}  maxW={n_mw:.0f}",
             True,
             (220, 160, 140) if (n_holes > 0 or n_mw >= 2) else (140, 170, 150),
+        ),
+        (sx, y),
+    )
+    y += 16
+    d_h = float(getattr(s, "_last_d_holes", 0.0) or 0.0)
+    screen.blit(
+        font_sm.render(
+            f"Δh    last_d_holes={d_h:+.0f}  (sensor net)",
+            True,
+            (220, 150, 130) if d_h > 0 else (130, 190, 150) if d_h < 0 else (120, 140, 160),
         ),
         (sx, y),
     )
@@ -1227,6 +1325,13 @@ def main(argv: list[str] | None = None) -> None:
                         apply_lock_valence_to_landing_cells(
                             s, lock_cells, float(coach.last_reward)
                         )
+                    # Network insight: mint Observations of holes_n / last_d_holes
+                    s._last_d_holes = float(  # type: ignore[attr-defined]
+                        getattr(coach, "last_d_holes", 0.0) or 0.0
+                    )
+                    sample_packing_meta_into_symbioid(
+                        s, world, tick=frame, coach=coach
+                    )
                     # Burst pulse so outcome valence can spread before next cmd
                     if s.mind.dynamics_enabled and PULSES_ON_LOCK > 0:
                         for _ in range(int(PULSES_ON_LOCK)):

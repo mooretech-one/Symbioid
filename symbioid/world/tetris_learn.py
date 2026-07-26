@@ -354,6 +354,9 @@ class TetrisCoach:
     # Cells occupied by the piece at last lock (for Mind placement valence)
     last_lock_cells: list[tuple[int, int]] = field(default_factory=list)
     last_lock_pose: Optional[tuple[str, int, int]] = None  # kind, rot, col
+    # Hole delta of last real lock (post.holes − pre.holes) for network sensors
+    last_d_holes: float = 0.0
+    last_post_holes: float = 0.0
     last_features: dict[str, float] = field(default_factory=dict)
     last_byte: int = 0
     last_effect: str = "noop"
@@ -847,6 +850,11 @@ class TetrisCoach:
         self.last_reward = reward
         self.last_features = post
         self.lines_total += lines_cleared
+        # Explicit packing outcome for Symbioid meta sensors
+        pre_h = float(pre.get("holes", 0.0))
+        post_h = float(post.get("holes", 0.0))
+        self.last_d_holes = post_h - pre_h
+        self.last_post_holes = post_h
 
         exp = DropExperience(
             kind=kind,
