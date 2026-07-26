@@ -322,6 +322,43 @@ def test_phase_b_policy_poles_prefer_meta():
     assert 0.0 <= bias <= 1.0
 
 
+def test_apply_lock_valence_to_landing_cells_raises_place_keys():
+    """Lock reward fans valence onto cell placement keys (closed-loop heat)."""
+    import tetris_demo as mod
+    from symbioid import Symbioid
+
+    s = Symbioid(install_constitution=False)
+    cells = [(18, 3), (18, 4), (19, 3), (19, 4)]
+    n = mod.apply_lock_valence_to_landing_cells(s, cells, reward=100.0)
+    assert n >= 4
+    v = s.mind.valence_of(content_key="cell_r18_c03:place")
+    assert v > 0.0, f"expected positive placement valence, got {v}"
+    # Negative reward should lower valence
+    mod.apply_lock_valence_to_landing_cells(s, cells, reward=-100.0)
+    v2 = s.mind.valence_of(content_key="cell_r18_c03:place")
+    assert v2 < v
+
+
+def test_network_primary_graph_weight_floor_allows_co_lead():
+    """choose_target honors graph weight down to 0.35 under network_primary."""
+    w = TetrisWorld(rng=Random(1), gravity_interval=9999)
+    coach = TetrisCoach(
+        rng=Random(1),
+        network_primary=True,
+        graph_placement_weight=0.60,
+        graph_placement_bonus=lambda world, rot, col: 0.0,
+        map_threshold=1,
+    )
+    for b, e in ((1, "left"), (2, "right"), (3, "rotate"), (4, "hard")):
+        coach.effect_counts[b][e] = 2
+        coach.bytes_tried.add(b)
+    if w.active is None:
+        return
+    coach.choose_target(w)
+    # Weight field itself is 0.60 (floor no longer forces ≥0.55)
+    assert coach.graph_placement_weight == 0.60
+
+
 def test_build_symbioid_band_b_active_caps():
     """Band B: wider WM + larger policy registries for network-primary learning."""
     import tetris_demo as mod

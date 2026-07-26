@@ -324,6 +324,61 @@ def _cell_obs_index(s: Symbioid) -> dict[str, list[tuple[str, object]]]:
     return idx
 
 
+def apply_lock_valence_to_landing_cells(
+    s: Symbioid,
+    cells: list[tuple[int, int]],
+    reward: float,
+    *,
+    scale: float = 50.0,
+) -> int:
+    """
+    Closed-loop placement credit: fan coach board reward onto Observation
+    valence for cells occupied by the piece at lock.
+
+    Enables ``cell_thought_placement_score`` to improve with experience (not
+    only fixed hole/depth heuristics). Returns number of content keys touched.
+    """
+    if not cells:
+        return 0
+    delta = max(-2.0, min(2.0, float(reward) / float(scale)))
+    if abs(delta) < 1e-12:
+        return 0
+    lab_index = _cell_obs_index(s)
+    rc_to_sid = {rc: sid for sid, rc in (getattr(s, "_cell_rc", {}) or {}).items()}
+    with s.innerface._local_lock:
+        last_by = dict(s.innerface._last_obs_by_sensor)
+    touched = 0
+    seen_ck: set[str] = set()
+    for r, c in cells:
+        lab = f"cell_r{int(r):02d}_c{int(c):02d}"
+        for ck, _oth in lab_index.get(lab, ()):
+            if ck in seen_ck:
+                continue
+            seen_ck.add(ck)
+            s.mind.note_valence(content_key=str(ck), delta=delta)
+            touched += 1
+        sid = rc_to_sid.get((int(r), int(c)))
+        th = last_by.get(sid) if sid else None
+        if th is not None:
+            with s.mind._lock:
+                ck = s.mind._thought_to_key.get(th.id)
+            if ck and ck not in seen_ck:
+                seen_ck.add(ck)
+                s.mind.note_valence(content_key=str(ck), delta=delta)
+                touched += 1
+            elif not ck:
+                # Direct thought_id path if registry key missing
+                s.mind.note_valence(thought_id=th.id, delta=delta)
+                touched += 1
+        # Stable synthetic key so cold cells still accumulate placement signal
+        synth = f"{lab}:place"
+        if synth not in seen_ck:
+            seen_ck.add(synth)
+            s.mind.note_valence(content_key=synth, delta=delta * 0.5)
+            touched += 1
+    return touched
+
+
 def cell_thought_placement_score(
     s: Symbioid,
     world: TetrisWorld,
@@ -376,6 +431,9 @@ def cell_thought_placement_score(
             score += 0.12 * float(getattr(oth, "activation", 0.0) or 0.0)
             score += 0.12 * float(valence.get(ck, 0.0))
             break
+        # Synthetic placement-credit key (see apply_lock_valence_to_landing_cells)
+        synth = f"{lab}:place"
+        score += 0.22 * float(valence.get(synth, 0.0))
     return score
 
 
@@ -949,8 +1007,9 @@ def main(argv: list[str] | None = None) -> None:
     )
     coach = TetrisCoach(network_primary=True)
     s = build_symbioid(world)
-    # Symbioid-primary: network scores placement; coach residual + byte map
-    coach.graph_placement_weight = 0.88
+    # Co-lead blend: network heat + coach residual (research 2026-07-26).
+    # Floor clamp in choose_target is 0.35 so 0.60 is honored.
+    coach.graph_placement_weight = 0.60
     coach.graph_placement_bonus = (
         lambda w, rot, col, _s=s: cell_thought_placement_score(_s, w, rot, col)
     )
@@ -1090,6 +1149,12 @@ def main(argv: list[str] | None = None) -> None:
                         channel="board",
                         delta=max(-2.0, min(2.0, float(coach.last_reward) / 50.0)),
                     )
+                    # Placement closed loop: credit lock reward onto landing cells
+                    lock_cells = list(getattr(coach, "last_lock_cells", None) or [])
+                    if lock_cells:
+                        apply_lock_valence_to_landing_cells(
+                            s, lock_cells, float(coach.last_reward)
+                        )
                     _record_thought_sample()
                     last_pieces_for_plot = world.pieces_placed
                 if coach.map_complete() and not was_mapped:

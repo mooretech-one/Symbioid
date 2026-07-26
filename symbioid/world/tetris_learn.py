@@ -247,9 +247,9 @@ class TetrisCoach:
     # When True (default): Symbioid drives placement scores + preferred intents;
     # coach supplies byte map, gravity/world model, and cold fallback.
     network_primary: bool = True
-    # Weight for Symbioid placement bonus in choose_target (higher = more network)
-    # network_primary default ~0.85; coach-primary demos can set 0.40.
-    graph_placement_weight: float = 0.85
+    # Weight for Symbioid placement bonus in choose_target (higher = more network).
+    # Demo uses ~0.60 co-lead; net-primary clamp floor is 0.35.
+    graph_placement_weight: float = 0.60
     graph_placement_bonus: Optional[
         Callable[[TetrisWorld, int, int], float]
     ] = field(default=None, repr=False)
@@ -262,6 +262,9 @@ class TetrisCoach:
     last_choice: tuple[int, int] = (0, 3)
     last_score: float = 0.0
     last_graph_bonus: float = 0.0
+    # Cells occupied by the piece at last lock (for Mind placement valence)
+    last_lock_cells: list[tuple[int, int]] = field(default_factory=list)
+    last_lock_pose: Optional[tuple[str, int, int]] = None  # kind, rot, col
     last_features: dict[str, float] = field(default_factory=dict)
     last_byte: int = 0
     last_effect: str = "noop"
@@ -645,7 +648,8 @@ class TetrisCoach:
         net_primary = bool(self.network_primary) and self.graph_placement_bonus is not None
         g_w = float(self.graph_placement_weight)
         if net_primary:
-            g_w = max(0.55, min(0.98, g_w))  # network owns strategy
+            # Allow coach residual co-lead (was ≥0.55 floor; research 2026-07-26)
+            g_w = max(0.35, min(0.98, g_w))
         for rot, col in options:
             sim = world.simulate_placement(rot, col)
             if sim is None:
@@ -1049,6 +1053,22 @@ class TetrisCoach:
         kind = before.kind or self._piece_kind or "?"
         rot = before.rotation
         col = before.col
+        # Snapshot lock cells for Mind placement-credit (board already has them)
+        self.last_lock_pose = (kind, int(rot) % 4, int(col))
+        self.last_lock_cells = []
+        if before.has_active and kind and kind != "?":
+            try:
+                from symbioid.world.tetris import ActivePiece
+
+                ap = ActivePiece(
+                    kind=kind,
+                    row=int(before.row),
+                    col=int(col),
+                    rotation=int(rot) % 4,
+                )
+                self.last_lock_cells = list(ap.cells())
+            except Exception:
+                self.last_lock_cells = []
         self._learn_from_real_drop(
             world,
             kind=kind,
@@ -1091,6 +1111,20 @@ class TetrisCoach:
                     break
         if ok:
             self.placements += 1
+            self.last_lock_pose = (kind, int(used_rot) % 4, int(used_col))
+            try:
+                from symbioid.world.tetris import ActivePiece
+
+                # Reconstruct final cells via hard-drop geometry on pre-lock board
+                # (board already locked — use offsets from piece_cells at used pose)
+                cells = world.landing_cells(used_rot, used_col)
+                if not cells:
+                    # Fallback: piece at top of column (approximate)
+                    off = piece_cells(kind, used_rot)
+                    cells = [(r, used_col + c) for r, c in off]
+                self.last_lock_cells = list(cells)
+            except Exception:
+                self.last_lock_cells = []
             self._learn_from_real_drop(
                 world,
                 kind=kind,
