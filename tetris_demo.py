@@ -398,14 +398,23 @@ def cell_thought_placement_score(
         return -8.0
     field = world.cell_field_state(with_active=False)
     score = 0.0
-    # --- Explicit hole avoidance (research 2026-07-26) ---
+    # --- Hole + open-well avoidance (edge-aware wells) ---
     hf = pose_hole_features(world, rot, col)
     if float(hf.get("ok", 0.0)) >= 0.5:
         d_h = float(hf.get("d_holes", 0.0))
+        d_w = float(hf.get("d_well", 0.0))
+        d_mw = float(hf.get("d_max_well", 0.0))
         # Strongly punish poses that create net new holes; reward clearing them
         score -= 3.0 * max(0.0, d_h)
         score += 1.5 * max(0.0, -d_h)
-        # Extra nudge for covering existing holes (also counted per-cell below)
+        # Open single-width trenches (left/right edges included)
+        score -= 2.5 * max(0.0, d_w)
+        score += 1.8 * max(0.0, -d_w)
+        score -= 2.0 * max(0.0, d_mw)
+        score += 1.2 * max(0.0, -d_mw)
+        # Prefer not leaving a deep residual well after the drop
+        score -= 0.8 * float(hf.get("post_max_well", 0.0))
+        # Extra nudge for covering existing sealed holes (also per-cell below)
         score += 0.8 * float(hf.get("holes_filled", 0.0))
     else:
         score -= 4.0  # illegal / failed sim
@@ -856,6 +865,29 @@ def draw(
     ):
         screen.blit(font_sm.render(line, True, color), (sx, y))
         y += 20
+
+    # Board packing sensors (holes = sealed; well = open trenches, edge-aware)
+    try:
+        from symbioid.world.tetris_learn import observe_board as _obs_board
+
+        _bo = _obs_board(world)
+        n_holes = int(_bo.get("holes", world.hole_count()))
+        n_well = float(_bo.get("well", 0.0))
+        n_mw = float(_bo.get("max_well", 0.0))
+    except Exception:
+        n_holes = int(world.hole_count())
+        n_well = float(getattr(world, "well_depth", lambda: 0.0)())
+        n_mw = float(getattr(world, "max_well_depth", lambda: 0.0)())
+    y += 6
+    screen.blit(
+        font_sm.render(
+            f"pack  holes={n_holes}  well={n_well:.0f}  maxW={n_mw:.0f}",
+            True,
+            (220, 160, 140) if (n_holes > 0 or n_mw >= 2) else (140, 170, 150),
+        ),
+        (sx, y),
+    )
+    y += 16
 
     # Active six-set breakdown (Band A caps; sense/sync/integrate)
     n_act, n_inact = thought_counts_active_inactive(s)

@@ -8,7 +8,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from symbioid.world.tetris import VALID_ACTIONS, TetrisWorld, piece_cells
+from symbioid.world.tetris import VALID_ACTIONS, TetrisWorld, piece_cells, well_metrics
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -125,6 +125,9 @@ def pose_hole_features(
       ok           — 1.0 if sim legal, else 0.0
     """
     pre_holes = float(world.hole_count())
+    pre_wm = well_metrics(world.column_heights())
+    pre_well = float(pre_wm["well"])
+    pre_max_well = float(pre_wm["max_well"])
     cells = world.landing_cells(rot, col)
     if not cells:
         return {
@@ -132,6 +135,12 @@ def pose_hole_features(
             "holes_filled": 0.0,
             "pre_holes": pre_holes,
             "post_holes": pre_holes,
+            "d_well": 0.0,
+            "d_max_well": 0.0,
+            "pre_well": pre_well,
+            "post_well": pre_well,
+            "pre_max_well": pre_max_well,
+            "post_max_well": pre_max_well,
             "ok": 0.0,
         }
     field = world.cell_field_state(with_active=False)
@@ -147,14 +156,35 @@ def pose_hole_features(
             "holes_filled": holes_filled,
             "pre_holes": pre_holes,
             "post_holes": pre_holes,
+            "d_well": 0.0,
+            "d_max_well": 0.0,
+            "pre_well": pre_well,
+            "post_well": pre_well,
+            "pre_max_well": pre_max_well,
+            "post_max_well": pre_max_well,
             "ok": 0.0,
         }
     post_holes = float(sim.get("holes", pre_holes))
+    # Prefer sim well metrics when present; else recompute from heights
+    if "well" in sim and "max_well" in sim:
+        post_well = float(sim["well"])
+        post_max_well = float(sim["max_well"])
+    else:
+        hs = sim.get("heights") or world.column_heights()
+        pwm = well_metrics([int(x) for x in hs])
+        post_well = float(pwm["well"])
+        post_max_well = float(pwm["max_well"])
     return {
         "d_holes": post_holes - pre_holes,
         "holes_filled": holes_filled,
         "pre_holes": pre_holes,
         "post_holes": post_holes,
+        "d_well": post_well - pre_well,
+        "d_max_well": post_max_well - pre_max_well,
+        "pre_well": pre_well,
+        "post_well": post_well,
+        "pre_max_well": pre_max_well,
+        "post_max_well": post_max_well,
         "ok": 1.0,
     }
 
@@ -171,12 +201,8 @@ def observe_board(world: TetrisWorld) -> dict[str, float]:
     max_h = float(max(heights) if heights else 0)
     min_h = float(min(heights) if heights else 0)
     agg = float(sum(heights))
-    # Well: empty cells under the skyline (deep single-column dips)
-    well = 0.0
-    for i, h in enumerate(heights):
-        left = heights[i - 1] if i > 0 else h
-        right = heights[i + 1] if i + 1 < len(heights) else h
-        well += max(0.0, min(left, right) - h)
+    # Well: open single-column dips (edge-aware — see well_metrics)
+    wm = well_metrics(heights)
     filled = sum(1 for row in world.board for c in row if c)
     out: dict[str, float] = {
         "holes": float(world.hole_count()),
@@ -185,7 +211,8 @@ def observe_board(world: TetrisWorld) -> dict[str, float]:
         "max_height": max_h,
         "min_height": min_h,
         "height_range": max_h - min_h,
-        "well": well,
+        "well": float(wm["well"]),
+        "max_well": float(wm["max_well"]),
         "filled": float(filled),
         "fill_n": filled / (rows * cols),
         "max_height_n": max_h / rows,
@@ -226,18 +253,26 @@ def board_quality_reward(
     r -= 0.25 * post.get("agg_height", 0.0)
     r -= 3.0 * post.get("holes", 0.0)
     r -= 0.35 * post.get("bumpiness", 0.0)
-    r -= 0.5 * post.get("well", 0.0)
+    # Open wells (incl. edge single-width trenches) — stronger than legacy 0.5
+    r -= 2.0 * post.get("well", 0.0)
+    r -= 1.5 * post.get("max_well", 0.0)
     r -= 0.4 * post.get("height_range", 0.0)
 
-    # Deltas: punish growing the stack / digging holes
+    # Deltas: punish growing the stack / digging holes / deepening wells
     d_max = post.get("max_height", 0.0) - pre.get("max_height", 0.0)
     d_agg = post.get("agg_height", 0.0) - pre.get("agg_height", 0.0)
     d_holes = post.get("holes", 0.0) - pre.get("holes", 0.0)
+    d_well = post.get("well", 0.0) - pre.get("well", 0.0)
+    d_max_well = post.get("max_well", 0.0) - pre.get("max_well", 0.0)
     r -= 2.5 * max(0.0, d_max)
     r -= 0.15 * max(0.0, d_agg)
     r -= 4.0 * max(0.0, d_holes)
-    # Small bonus when a drop lowers max height (line clear / packing)
+    r -= 2.5 * max(0.0, d_well)
+    r -= 2.0 * max(0.0, d_max_well)
+    # Bonus for packing: lower max height, fill holes, fill wells
     r += 3.0 * max(0.0, -d_max)
+    r += 1.5 * max(0.0, -d_well)
+    r += 1.0 * max(0.0, -d_max_well)
 
     # Mild game-score signal (lines already counted strongly; fall points weak)
     r += 0.02 * score_delta
@@ -290,7 +325,8 @@ class TetrisCoach:
     w_bump: float = -0.4
     w_agg: float = -0.3
     w_max_h: float = -4.0
-    w_well: float = -0.5
+    w_well: float = -2.0
+    w_max_well: float = -1.5
     w_range: float = -0.4
     # Blend: predicted slot value vs scored post-features after the fact
     lr: float = 0.05
@@ -541,6 +577,7 @@ class TetrisCoach:
             + self.w_agg * post.get("agg_height", 0.0)
             + self.w_max_h * post.get("max_height", 0.0)
             + self.w_well * post.get("well", 0.0)
+            + self.w_max_well * post.get("max_well", 0.0)
             + self.w_range * post.get("height_range", 0.0)
         )
 
@@ -866,8 +903,13 @@ class TetrisCoach:
             -0.5,
         )
         self.w_well = _clamp(
-            self.w_well + self.lr * err * (post.get("well", 0.0) + 0.5) * 0.04,
-            -3.0,
+            self.w_well + self.lr * err * (post.get("well", 0.0) + 0.5) * 0.06,
+            -6.0,
+            -0.2,
+        )
+        self.w_max_well = _clamp(
+            self.w_max_well + self.lr * err * (post.get("max_well", 0.0) + 0.5) * 0.06,
+            -5.0,
             0.0,
         )
         self.w_range = _clamp(

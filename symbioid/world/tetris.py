@@ -485,6 +485,14 @@ class TetrisWorld:
         h = self.column_heights()
         return sum(abs(h[i] - h[i + 1]) for i in range(len(h) - 1))
 
+    def well_depth(self) -> float:
+        """Total open single-column well depth (edge-aware)."""
+        return float(well_metrics(self.column_heights())["well"])
+
+    def max_well_depth(self) -> float:
+        """Deepest single open column well (edge-aware)."""
+        return float(well_metrics(self.column_heights())["max_well"])
+
     def aggregate_height(self) -> int:
         return sum(self.column_heights())
 
@@ -782,6 +790,39 @@ class TetrisWorld:
         return out
 
 
+def well_metrics(heights: list[int] | list[float]) -> dict[str, float]:
+    """
+    Open-column well depths from a skyline.
+
+    A well is how far a column sits below its **relevant** neighbour(s):
+      - interior: min(left, right) − h
+      - left edge (col 0): right − h only (not min(h, right) which is always ≤0)
+      - right edge: left − h only
+
+    Returns ``well`` (sum of positive contributions) and ``max_well`` (deepest
+    single column). These are **open trenches**, not sealed holes.
+    """
+    n = len(heights)
+    if n == 0:
+        return {"well": 0.0, "max_well": 0.0}
+    if n == 1:
+        return {"well": 0.0, "max_well": 0.0}
+    well = 0.0
+    max_well = 0.0
+    for i, h in enumerate(heights):
+        hh = float(h)
+        if i == 0:
+            contrib = max(0.0, float(heights[1]) - hh)
+        elif i == n - 1:
+            contrib = max(0.0, float(heights[n - 2]) - hh)
+        else:
+            contrib = max(0.0, float(min(heights[i - 1], heights[i + 1])) - hh)
+        well += contrib
+        if contrib > max_well:
+            max_well = contrib
+    return {"well": well, "max_well": max_well}
+
+
 def _clear_rows(
     board: list[list[str]], cols: int, rows: int
 ) -> tuple[list[list[str]], int]:
@@ -837,11 +878,7 @@ def _board_features(
     bump = sum(abs(heights[i] - heights[i + 1]) for i in range(cols - 1))
     max_h = float(max(heights) if heights else 0)
     min_h = float(min(heights) if heights else 0)
-    well = 0.0
-    for i, h in enumerate(heights):
-        left = heights[i - 1] if i > 0 else h
-        right = heights[i + 1] if i + 1 < len(heights) else h
-        well += max(0.0, float(min(left, right) - h))
+    wm = well_metrics(heights)
     filled = sum(1 for row in board for cell in row if cell)
     return {
         "agg_height": float(sum(heights)),
@@ -850,7 +887,8 @@ def _board_features(
         "max_height": max_h,
         "min_height": min_h,
         "height_range": max_h - min_h,
-        "well": well,
+        "well": float(wm["well"]),
+        "max_well": float(wm["max_well"]),
         "filled": float(filled),
         "fill_n": filled / float(max(1, rows * cols)),
         "max_height_n": max_h / float(max(1, rows)),

@@ -261,6 +261,71 @@ def test_landing_cells_matches_legal_drop():
     assert all(0 <= r < w.rows and 0 <= c < w.cols for r, c in cells)
 
 
+def test_edge_well_metrics_report_open_side_trenches():
+    """Left/right open single-width wells must contribute to well (edge-aware)."""
+    from symbioid.world.tetris import well_metrics
+
+    # Col 0 empty, rest height 5
+    h = [0, 5, 5, 5, 5, 5, 5, 5, 5, 5]
+    wm = well_metrics(h)
+    assert wm["well"] >= 5.0, f"left open well not reported: {wm}"
+    assert wm["max_well"] >= 5.0
+    # Right edge
+    h2 = [5, 5, 5, 5, 5, 5, 5, 5, 5, 0]
+    wm2 = well_metrics(h2)
+    assert wm2["well"] >= 5.0
+    assert wm2["max_well"] >= 5.0
+    # Interior well col 4
+    h3 = [5, 5, 5, 5, 0, 5, 5, 5, 5, 5]
+    wm3 = well_metrics(h3)
+    assert wm3["well"] >= 5.0
+    # Flat skyline
+    assert well_metrics([3] * 10)["well"] == 0.0
+
+
+def test_observe_board_edge_well_nonzero():
+    w = TetrisWorld(rng=Random(0), gravity_interval=9999)
+    w.board = [["" for _ in range(10)] for _ in range(20)]
+    for r in range(15, 20):
+        for c in range(1, 10):
+            w.board[r][c] = "X"
+    obs = observe_board(w)
+    assert obs["holes"] == 0.0  # open trench, not sealed hole
+    assert obs["well"] >= 5.0, f"expected edge well, got {obs['well']}"
+    assert obs["max_well"] >= 5.0
+
+
+def test_pose_features_penalize_deepening_edge_well():
+    """Dropping beside a left well (not into it) should worsen d_well vs filling."""
+    from symbioid.world.tetris import ActivePiece
+
+    w = TetrisWorld(rng=Random(0), gravity_interval=9999)
+    w.board = [["" for _ in range(10)] for _ in range(20)]
+    for r in range(16, 20):
+        for c in range(1, 10):
+            w.board[r][c] = "X"
+    # Pre: left well depth 4
+    assert observe_board(w)["max_well"] >= 4.0
+    w.active = ActivePiece(kind="I", row=0, col=0, rotation=1)  # vertical
+    # Vertical I into col 0 should reduce well; horizontal on top of stack may not
+    fill_opts = []
+    other_opts = []
+    for rot, col in w.legal_placements():
+        hf = pose_hole_features(w, rot, col)
+        if hf["ok"] < 0.5:
+            continue
+        if rot % 2 == 1 and col <= 0:
+            fill_opts.append(hf)
+        else:
+            other_opts.append(hf)
+    assert fill_opts, "expected vertical fill options near col 0"
+    best_fill = min(fill_opts, key=lambda x: x["d_well"])
+    # Filling the trench should not increase well more than a random other pose max
+    if other_opts:
+        worst_other = max(other_opts, key=lambda x: x["d_well"])
+        assert best_fill["d_well"] <= worst_other["d_well"]
+
+
 def test_pose_hole_features_prefers_lower_d_holes():
     """Fixture: buried hole — landings that dig more holes rank worse on d_holes."""
     from symbioid.world.tetris import ActivePiece
