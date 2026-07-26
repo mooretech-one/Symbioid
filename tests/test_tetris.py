@@ -261,6 +261,40 @@ def test_landing_cells_matches_legal_drop():
     assert all(0 <= r < w.rows and 0 <= c < w.cols for r, c in cells)
 
 
+def test_pred_holes_freed_foresight_for_target():
+    """Network foresight sensors report holes freed by current target pose."""
+    import tetris_demo as mod
+    from symbioid.world.tetris import ActivePiece
+
+    w = TetrisWorld(rng=Random(0), gravity_interval=9999)
+    w.board = [["" for _ in range(10)] for _ in range(20)]
+    # Sealed hole at (19,4)
+    for c in range(10):
+        if c != 4:
+            w.board[19][c] = "X"
+    w.board[18][4] = "X"
+    w.active = ActivePiece(kind="O", row=0, col=3, rotation=0)
+    s = mod.build_symbioid(w)
+    coach = TetrisCoach(rng=Random(0), map_threshold=1)
+    # Force a target; update foresight
+    coach._target = (0, 3)
+    out = mod.update_pred_pack_for_target(s, w, coach)
+    assert "holes_freed" in out and "pred_d_holes" in out
+    # Sensors present
+    labels = {sen.label for sen in s.sensors}
+    assert "holes_freed" in labels
+    assert "pred_d_holes" in labels
+    assert "holes_fill_n" in labels
+    sen = next(x for x in s.sensors if x.label == "holes_freed")
+    # Reading is non-negative scale of freed count
+    assert sen.transfer({}) >= 0.0
+    # Clear target → zero foresight
+    coach._target = None
+    out2 = mod.update_pred_pack_for_target(s, w, coach)
+    assert out2["holes_freed"] == 0.0
+    assert float(getattr(s, "_holes_freed", -1)) == 0.0
+
+
 def test_packing_meta_sensors_and_last_d_holes_insight():
     """holes_n / last_d_holes sensors exist; lock dig updates network-facing readings."""
     import tetris_demo as mod
@@ -277,8 +311,11 @@ def test_packing_meta_sensors_and_last_d_holes_insight():
     assert "last_d_holes" in labels
     assert "well_n" in labels
     assert "max_well_n" in labels
+    assert "pred_d_holes" in labels
+    assert "holes_freed" in labels
     assert "holes_n" in mod._POLICY_META_LABELS
     assert "last_d_holes" in mod._POLICY_META_LABELS
+    assert "holes_freed" in mod._POLICY_META_LABELS
 
     # Empty board → zero pack
     mod._update_pack_readings(s, w)
@@ -1023,18 +1060,20 @@ def _load_tetris_demo():
 
 
 def test_demo_build_has_full_cell_sensor_map():
-    """200 cell sensors + 8 meta (incl. packing); cells skip full awareness six-sets."""
+    """200 cell sensors + 11 meta (packing + foresight); cells skip full awareness."""
     mod = _load_tetris_demo()
     w = TetrisWorld(rng=Random(0))
     s = mod.build_symbioid(w)
-    # piece/next/lines/byte + holes_n/last_d_holes/well_n/max_well_n
-    assert len(s.sensors) == w.rows * w.cols + 8
+    # piece/next/lines/byte + 4 pack + 3 foresight
+    assert len(s.sensors) == w.rows * w.cols + 11
     cell_labels = [sen.label for sen in s.sensors if (sen.label or "").startswith("cell_")]
     assert len(cell_labels) == w.rows * w.cols
     assert any(sen.label == "piece_id" for sen in s.sensors)
     assert any(sen.label == "next_id" for sen in s.sensors)
     assert any(sen.label == "holes_n" for sen in s.sensors)
     assert any(sen.label == "last_d_holes" for sen in s.sensors)
+    assert any(sen.label == "holes_freed" for sen in s.sensors)
+    assert any(sen.label == "pred_d_holes" for sen in s.sensors)
     # Cell sensors are terminators without bloating awareness_sets
     cell_ids = [sen.id for sen in s.sensors if (sen.label or "").startswith("cell_")]
     assert all(cid in s.integration_terminators for cid in cell_ids)

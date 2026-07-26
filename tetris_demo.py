@@ -176,17 +176,29 @@ def build_symbioid(world: TetrisWorld) -> Symbioid:
     s.innerface.cofire_meta_labels = tuple(
         dict.fromkeys(
             list(s.innerface.cofire_meta_labels)
-            + ["holes_n", "last_d_holes", "well_n", "max_well_n"]
+            + [
+                "holes_n",
+                "last_d_holes",
+                "well_n",
+                "max_well_n",
+                "pred_d_holes",
+                "holes_freed",
+                "holes_fill_n",
+            ]
         )
     )
     s.mind.max_follows_registry = 4096
     s.mind.max_integrates_registry = 4096
     s.mind.policy_registry_priority = True
-    # Held packing readings for sensor.transfer (updated on sample / lock)
+    # Held packing readings for sensor.transfer (updated on sample / lock / target)
     s._pack_holes = 0.0  # type: ignore[attr-defined]
     s._last_d_holes = 0.0  # type: ignore[attr-defined]
     s._pack_well = 0.0  # type: ignore[attr-defined]
     s._pack_max_well = 0.0  # type: ignore[attr-defined]
+    # Foresight for current placement target (how many holes this drop frees/creates)
+    s._pred_d_holes = 0.0  # type: ignore[attr-defined]
+    s._holes_freed = 0.0  # type: ignore[attr-defined]  # max(0, -pred_d_holes)
+    s._holes_fill_n = 0.0  # type: ignore[attr-defined]  # landing cells that are holes
 
     # Last cell readings for change-only formation (sensor_id → float)
     s._cell_last_reading: dict[str, float] = {}  # type: ignore[attr-defined]
@@ -242,6 +254,18 @@ def build_symbioid(world: TetrisWorld) -> Symbioid:
     def max_well_n(_w: dict, _s: Symbioid = s) -> float:
         return min(1.0, max(0.0, float(getattr(_s, "_pack_max_well", 0.0)) / 20.0))
 
+    def pred_d_holes_n(_w: dict, _s: Symbioid = s) -> float:
+        # Predicted net Δholes for current target pose (negative = frees holes)
+        return max(-1.0, min(1.0, float(getattr(_s, "_pred_d_holes", 0.0)) / 8.0))
+
+    def holes_freed_n(_w: dict, _s: Symbioid = s) -> float:
+        # How many holes this target placement is predicted to free (net)
+        return min(1.0, max(0.0, float(getattr(_s, "_holes_freed", 0.0)) / 8.0))
+
+    def holes_fill_n(_w: dict, _s: Symbioid = s) -> float:
+        # Existing hole cells covered by target landing footprint
+        return min(1.0, max(0.0, float(getattr(_s, "_holes_fill_n", 0.0)) / 4.0))
+
     for label, transfer in (
         ("piece_id", piece_id_n),
         ("next_id", next_id_n),
@@ -251,6 +275,9 @@ def build_symbioid(world: TetrisWorld) -> Symbioid:
         ("last_d_holes", last_d_holes_n),
         ("well_n", well_n),
         ("max_well_n", max_well_n),
+        ("pred_d_holes", pred_d_holes_n),
+        ("holes_freed", holes_freed_n),
+        ("holes_fill_n", holes_fill_n),
     ):
         sen = s.add_sensor(Sensor(id=f"{HOST_ID}:sen:{label}", label=label))
         sen.transfer = transfer
@@ -279,10 +306,24 @@ _POLICY_META_LABELS = frozenset(
         "last_d_holes",
         "well_n",
         "max_well_n",
+        "pred_d_holes",
+        "holes_freed",
+        "holes_fill_n",
     }
 )
 _PACKING_META_LABELS = frozenset(
-    {"holes_n", "last_d_holes", "well_n", "max_well_n"}
+    {
+        "holes_n",
+        "last_d_holes",
+        "well_n",
+        "max_well_n",
+        "pred_d_holes",
+        "holes_freed",
+        "holes_fill_n",
+    }
+)
+_FORESIGHT_META_LABELS = frozenset(
+    {"pred_d_holes", "holes_freed", "holes_fill_n"}
 )
 
 
@@ -653,16 +694,72 @@ def _update_pack_readings(s: Symbioid, world: TetrisWorld, coach: object | None 
         s._last_d_holes = float(getattr(coach, "last_d_holes", 0.0) or 0.0)  # type: ignore[attr-defined]
 
 
+def update_pred_pack_for_target(
+    s: Symbioid, world: TetrisWorld, coach: object
+) -> dict[str, float]:
+    """
+    Foresight: how many holes the **current placement target** would free/create.
+
+    Uses ``pose_hole_features`` on ``coach._target`` (same sim as placement score).
+    Writes host fields read by ``pred_d_holes`` / ``holes_freed`` / ``holes_fill_n``.
+    """
+    empty = {
+        "pred_d_holes": 0.0,
+        "holes_freed": 0.0,
+        "holes_fill_n": 0.0,
+        "ok": 0.0,
+    }
+    tgt = getattr(coach, "_target", None)
+    if world.active is None or world.game_over or tgt is None:
+        s._pred_d_holes = 0.0  # type: ignore[attr-defined]
+        s._holes_freed = 0.0  # type: ignore[attr-defined]
+        s._holes_fill_n = 0.0  # type: ignore[attr-defined]
+        return empty
+    try:
+        rot, col = int(tgt[0]), int(tgt[1])
+    except (TypeError, ValueError, IndexError):
+        s._pred_d_holes = 0.0  # type: ignore[attr-defined]
+        s._holes_freed = 0.0  # type: ignore[attr-defined]
+        s._holes_fill_n = 0.0  # type: ignore[attr-defined]
+        return empty
+    hf = pose_hole_features(world, rot, col)
+    if float(hf.get("ok", 0.0)) < 0.5:
+        s._pred_d_holes = 0.0  # type: ignore[attr-defined]
+        s._holes_freed = 0.0  # type: ignore[attr-defined]
+        s._holes_fill_n = 0.0  # type: ignore[attr-defined]
+        return empty
+    d_h = float(hf.get("d_holes", 0.0))
+    filled = float(hf.get("holes_filled", 0.0))
+    freed = max(0.0, -d_h)
+    s._pred_d_holes = d_h  # type: ignore[attr-defined]
+    s._holes_freed = freed  # type: ignore[attr-defined]
+    s._holes_fill_n = filled  # type: ignore[attr-defined]
+    return {
+        "pred_d_holes": d_h,
+        "holes_freed": freed,
+        "holes_fill_n": filled,
+        "ok": 1.0,
+    }
+
+
 def sample_packing_meta_into_symbioid(
-    s: Symbioid, world: TetrisWorld, tick: int, *, coach: object | None = None
+    s: Symbioid,
+    world: TetrisWorld,
+    tick: int,
+    *,
+    coach: object | None = None,
+    labels: frozenset[str] | None = None,
 ) -> None:
-    """Force-sample packing meta sensors so lock Δholes becomes Observations."""
+    """Force-sample packing meta sensors so hole insights become Observations."""
     _update_pack_readings(s, world, coach)
+    if coach is not None:
+        update_pred_pack_for_target(s, world, coach)
+    want = labels if labels is not None else _PACKING_META_LABELS
     w = world.sensor_world()
     handoffs = []
     for sen in s.sensors:
         lab = sen.label or ""
-        if lab not in _PACKING_META_LABELS:
+        if lab not in want:
             continue
         sense = sen.sample(tick=tick, world=w)
         if sense is None:
@@ -984,9 +1081,21 @@ def draw(
     d_h = float(getattr(s, "_last_d_holes", 0.0) or 0.0)
     screen.blit(
         font_sm.render(
-            f"Δh    last_d_holes={d_h:+.0f}  (sensor net)",
+            f"Δh    last={d_h:+.0f}  (past lock)",
             True,
             (220, 150, 130) if d_h > 0 else (130, 190, 150) if d_h < 0 else (120, 140, 160),
+        ),
+        (sx, y),
+    )
+    y += 16
+    pred_d = float(getattr(s, "_pred_d_holes", 0.0) or 0.0)
+    freed = float(getattr(s, "_holes_freed", 0.0) or 0.0)
+    fill_n = float(getattr(s, "_holes_fill_n", 0.0) or 0.0)
+    screen.blit(
+        font_sm.render(
+            f"free  predΔ={pred_d:+.0f}  frees={freed:.0f}  fill={fill_n:.0f}",
+            True,
+            (130, 200, 150) if freed > 0 else (200, 160, 130) if pred_d > 0 else (120, 140, 160),
         ),
         (sx, y),
     )
@@ -1275,6 +1384,15 @@ def main(argv: list[str] | None = None) -> None:
                 # Symbioid-primary control: intent + placement from network
                 preferred, g_bias, poles, g_hint = graph_preferred_intent(
                     s, world, coach
+                )
+                # Foresight: how many holes the current target placement frees
+                update_pred_pack_for_target(s, world, coach)
+                sample_packing_meta_into_symbioid(
+                    s,
+                    world,
+                    tick=frame,
+                    coach=coach,
+                    labels=_FORESIGHT_META_LABELS,
                 )
                 last_graph_hint = g_hint
                 last_cmd_poles = poles

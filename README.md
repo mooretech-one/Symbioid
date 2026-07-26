@@ -195,7 +195,8 @@ Minted structure is **read for action choice**, not only stored:
 3. **Coach retains** — secret-byte discovery, gravity separation, stuck/force-hard survival, cold explore fallback (`last_network_cmd` marks who drove the last byte).
 4. **Lock credit** — coach `board_quality_reward` fans valence onto **landing cells** (`apply_lock_valence_to_landing_cells`) so placement heat can improve with experience.
 5. **Hole + well avoidance** — `pose_hole_features` / edge-aware `well_metrics`: sealed holes (`d_holes`) and open single-width trenches (`d_well`, `max_well`, including col 0/9). HUD shows `holes` / `well` / `maxW`.
-6. **Packing meta sensors (v0.0.36)** — `holes_n`, `last_d_holes`, `well_n`, `max_well_n` sampled into Mind so the Thought graph can form Observations of absolute holes and last-lock hole delta (not only Python placement score).
+6. **Packing meta sensors (v0.0.36+)** — `holes_n`, `last_d_holes`, `well_n`, `max_well_n` sampled into Mind.
+7. **Foresight free-count (v0.0.37)** — `pred_d_holes`, `holes_freed` (max(0,−Δ)), `holes_fill_n` for the **current target pose** so the network knows how many holes a planned placement will free (via `pose_hole_features` on `coach._target`).
 
 Content keys quantize float `reading` (`quantize_decimals=3` default). Registry Observations + Actions are protected from prune. Coach lock reward also fans into valence via `mind.note_valence(channel="board", delta=…)`.
 
