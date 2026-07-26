@@ -194,6 +194,7 @@ Minted structure is **read for action choice**, not only stored:
 2. **Commands** — `graph_preferred_intent` derives micro-intents from the network-scored target (geo), with Mind `recommend_action` as strong-score override; `tick` takes that intent at high `graph_bias` (~0.93).
 3. **Coach retains** — secret-byte discovery, gravity separation, stuck/force-hard survival, cold explore fallback (`last_network_cmd` marks who drove the last byte).
 4. **Lock credit** — coach `board_quality_reward` fans valence onto **landing cells** (`apply_lock_valence_to_landing_cells`) so placement heat can improve with experience.
+5. **Hole avoidance** — graph placement uses `pose_hole_features` (`d_holes` from `simulate_placement`, holes filled) so landings that create net holes score worse.
 
 Content keys quantize float `reading` (`quantize_decimals=3` default). Registry Observations + Actions are protected from prune. Coach lock reward also fans into valence via `mind.note_valence(channel="board", delta=…)`.
 

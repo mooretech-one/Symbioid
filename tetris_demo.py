@@ -51,7 +51,7 @@ from symbioid.world.tetris import (
     TetrisWorld,
     piece_cells,
 )
-from symbioid.world.tetris_learn import TetrisCoach
+from symbioid.world.tetris_learn import TetrisCoach, pose_hole_features
 
 # Stable host id so Thought/Action content keys match across runs
 HOST_ID = "sym-tetris-byte-learner"
@@ -386,16 +386,30 @@ def cell_thought_placement_score(
     col: int,
 ) -> float:
     """
-    Phase C: score a landing pose using the cell map + Thought heat.
+    Phase C: score a landing pose using the cell map + Thought heat +
+    counterfactual hole features (``pose_hole_features``).
 
-    Prefers filling **holes** (0.5), deeper rows, and cells whose Observations
-    are active / high-valence in Mind. Illegal landings return a large penalty.
+    Prefers filling **holes** (0.5), lower ``d_holes`` after sim lock, deeper
+    rows, and cells with high Mind valence. Illegal landings return a large
+    penalty.
     """
     cells = world.landing_cells(rot, col)
     if not cells:
         return -8.0
     field = world.cell_field_state(with_active=False)
     score = 0.0
+    # --- Explicit hole avoidance (research 2026-07-26) ---
+    hf = pose_hole_features(world, rot, col)
+    if float(hf.get("ok", 0.0)) >= 0.5:
+        d_h = float(hf.get("d_holes", 0.0))
+        # Strongly punish poses that create net new holes; reward clearing them
+        score -= 3.0 * max(0.0, d_h)
+        score += 1.5 * max(0.0, -d_h)
+        # Extra nudge for covering existing holes (also counted per-cell below)
+        score += 0.8 * float(hf.get("holes_filled", 0.0))
+    else:
+        score -= 4.0  # illegal / failed sim
+
     # sensor_id for each (r,c)
     rc_to_sid = {rc: sid for sid, rc in (getattr(s, "_cell_rc", {}) or {}).items()}
     with s.innerface._local_lock:

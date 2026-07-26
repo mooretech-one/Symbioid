@@ -106,6 +106,59 @@ def classify_effect(before: WorldSnapshot, world: TetrisWorld) -> str:
     return "noop"
 
 
+def pose_hole_features(
+    world: TetrisWorld,
+    rot: int,
+    col: int,
+) -> dict[str, float]:
+    """
+    Counterfactual hole signal for a candidate landing (rot, col).
+
+    Uses locked-board hole count + ``simulate_placement`` (no cipher).
+    Also counts how many **existing** holes (cell reading 0.5) the landing
+    would cover.
+
+    Returns keys:
+      d_holes      — post.holes − pre.holes (positive = created/net more holes)
+      holes_filled — landing cells that are currently holes
+      pre_holes, post_holes
+      ok           — 1.0 if sim legal, else 0.0
+    """
+    pre_holes = float(world.hole_count())
+    cells = world.landing_cells(rot, col)
+    if not cells:
+        return {
+            "d_holes": 0.0,
+            "holes_filled": 0.0,
+            "pre_holes": pre_holes,
+            "post_holes": pre_holes,
+            "ok": 0.0,
+        }
+    field = world.cell_field_state(with_active=False)
+    holes_filled = 0.0
+    for r, c in cells:
+        if 0 <= r < world.rows and 0 <= c < world.cols:
+            if abs(float(field[r][c]) - 0.5) < 0.05:
+                holes_filled += 1.0
+    sim = world.simulate_placement(rot, col)
+    if sim is None:
+        return {
+            "d_holes": 0.0,
+            "holes_filled": holes_filled,
+            "pre_holes": pre_holes,
+            "post_holes": pre_holes,
+            "ok": 0.0,
+        }
+    post_holes = float(sim.get("holes", pre_holes))
+    return {
+        "d_holes": post_holes - pre_holes,
+        "holes_filled": holes_filled,
+        "pre_holes": pre_holes,
+        "post_holes": post_holes,
+        "ok": 1.0,
+    }
+
+
 def observe_board(world: TetrisWorld) -> dict[str, float]:
     """
     Sensors the agent may use — locked board only, no drop simulation.

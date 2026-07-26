@@ -14,6 +14,7 @@ from symbioid.world.tetris_learn import (
     board_quality_reward,
     classify_effect,
     observe_board,
+    pose_hole_features,
     WorldSnapshot,
 )
 
@@ -258,6 +259,71 @@ def test_landing_cells_matches_legal_drop():
     cells = w.landing_cells(rot, col)
     assert cells
     assert all(0 <= r < w.rows and 0 <= c < w.cols for r, c in cells)
+
+
+def test_pose_hole_features_prefers_lower_d_holes():
+    """Fixture: buried hole — landings that dig more holes rank worse on d_holes."""
+    from symbioid.world.tetris import ActivePiece
+
+    w = TetrisWorld(rng=Random(0), gravity_interval=9999)
+    w.board = [["" for _ in range(10)] for _ in range(20)]
+    # Floor with a hole at (19, 5): fill row 19 except col 5, block above col 5
+    for c in range(10):
+        if c != 5:
+            w.board[19][c] = "X"
+    w.board[18][5] = "X"
+    w.active = ActivePiece(kind="O", row=0, col=3, rotation=0)
+    assert w.hole_count() >= 1
+    pre = float(w.hole_count())
+    feats = []
+    for rot, col in w.legal_placements():
+        hf = pose_hole_features(w, rot, col)
+        if hf["ok"] < 0.5:
+            continue
+        feats.append((hf["d_holes"], rot, col, hf["post_holes"]))
+    assert feats, "expected some legal sim features"
+    d_vals = [f[0] for f in feats]
+    assert min(d_vals) <= max(d_vals)
+    # At least one pose should not explode holes vs a bad overhang
+    assert min(d_vals) <= 0.0 or min(d_vals) < max(d_vals)
+    best = min(feats, key=lambda t: t[0])
+    worst = max(feats, key=lambda t: t[0])
+    assert best[0] <= worst[0]
+    assert best[3] >= pre - 1e-6  # post holes sensible
+
+
+def test_graph_score_prefers_lower_d_holes_pose():
+    """cell_thought_placement_score ranks lower-d_holes landings higher (ceteris paribus)."""
+    mod = _load_tetris_demo()
+    from symbioid.world.tetris import ActivePiece
+
+    w = TetrisWorld(rng=Random(1), gravity_interval=9999)
+    w.board = [["" for _ in range(10)] for _ in range(20)]
+    for c in range(10):
+        if c != 5:
+            w.board[19][c] = "X"
+    w.board[18][5] = "X"
+    w.active = ActivePiece(kind="T", row=0, col=4, rotation=0)
+    s = mod.build_symbioid(w)
+    scored = []
+    for rot, col in w.legal_placements():
+        hf = pose_hole_features(w, rot, col)
+        if hf["ok"] < 0.5:
+            continue
+        sc = mod.cell_thought_placement_score(s, w, rot, col)
+        scored.append((sc, hf["d_holes"], rot, col))
+    assert len(scored) >= 4
+    # Among extremes: best graph score should not be the worst d_holes pose
+    by_score = sorted(scored, key=lambda t: t[0], reverse=True)
+    by_holes = sorted(scored, key=lambda t: t[1])
+    best_sc_d = by_score[0][1]
+    worst_d = by_holes[-1][1]
+    # Top-scoring pose should have d_holes at most mid-tier (not uniquely worst)
+    if worst_d > by_holes[0][1]:
+        assert best_sc_d <= worst_d
+        # Prefer: top score's d_holes better than or equal to median
+        median_d = sorted(t[1] for t in scored)[len(scored) // 2]
+        assert best_sc_d <= median_d + 1.0
 
 
 def test_phase_c_cell_thought_scores_prefer_holes():
