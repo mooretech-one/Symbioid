@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 from symbioid.Core.System import System
 from symbioid.Core.Thought import Thought
+from symbioid.Core.thought_layers import ThoughtLayer, assert_mind_not_thought
 
 
 @dataclass
@@ -38,6 +39,9 @@ class RecommendResult:
 class Mind(System):
     """
     Processor substrate + recognition + policy bias from minted structure.
+
+    **Mind ≠ Thought** — Mind is a System aspect (this class), never graph content.
+    Graph content lives in host.thoughts as Thought/Link poles.
 
     Dual-triad roles (design reframe, not six seed poles):
       Thought    — content-addressed Observation + Follows + Integrates + Actions
@@ -261,6 +265,10 @@ class Mind(System):
             ids.update(t.id for t in self._actions.values())
             return ids
 
+    def __post_init__(self) -> None:
+        # Enforce Mind ≠ Thought at construction (architecture MVP)
+        assert_mind_not_thought(self)
+
     def action_content_key(self, domain: str, token: str) -> str:
         return f"act:{domain}:{token}"
 
@@ -282,7 +290,10 @@ class Mind(System):
                 return existing
             oid = f"{host_id}:act:{self._hash_key(ck)}"
             lab = token if with_labels else None
-            thought = Thought(id=oid, label=lab, transient=False)
+            # Action poles are FEELING-layer policy content (not Mind itself)
+            thought = Thought(
+                id=oid, label=lab, transient=False, layer=ThoughtLayer.FEELING
+            )
             self._actions[ck] = thought
             self._action_tokens[ck] = token
             self._thought_to_key[thought.id] = ck

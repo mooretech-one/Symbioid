@@ -9,6 +9,7 @@ from typing import Callable, Iterator, Optional, Set
 
 from symbioid.Core.Actuator import Actuator
 from symbioid.Core.Body import Body
+from symbioid.Core.Energy import Energy
 from symbioid.Core.Innerface import Innerface
 from symbioid.Core.Interface import Interface
 from symbioid.Core.Law import Law, constitutional_seed
@@ -22,6 +23,7 @@ from symbioid.Core.Thought import Thought
 from symbioid.Core.formation import complete_awareness_set, emit_six_set, ensure_sensor_thought
 from symbioid.Core.ids import _new_id
 from symbioid.Core.seed import is_minimal_symbioid_shape, minimal_seed
+from symbioid.Core.thought_layers import assert_mind_not_thought
 
 # legacy = single global pulse (current faces); hybrid/spike reserved for engine migration
 ENGINES_MODES = ("legacy", "hybrid", "spike")
@@ -36,7 +38,7 @@ class Symbioid(System):
     Siamese twin System ⋈ Environment; also a System (not a Thought).
 
     Contained aspects (Antelligence):
-      body, mind, sensors[], actuators[], thoughts{} (list via thought_list),
+      body, mind, energy, sensors[], actuators[], thoughts{} (list via thought_list),
       innerface, interface, outerface
 
     Structural twin seed (six Thoughts) lives in `thoughts` when seed_minimal=True.
@@ -50,6 +52,9 @@ class Symbioid(System):
 
     Phase 5: port_queues decouple I→N→O; pulse_partition energy_budget;
     cross-engine Hebb only on Port Links (is_port=True).
+
+    Architecture MVP: Mind≠Thought enforced; Thought layers Structure/Pattern/Feeling;
+    act_from_graph / think_tick are core Outerface agency (not demo-only).
     """
 
     id: str = field(default_factory=lambda: _new_id("sym-"))
@@ -58,9 +63,12 @@ class Symbioid(System):
     mirror_in_environment: bool = False
     install_constitution: bool = True
     engines_mode: str = "legacy"
+    # When True, pulse_tick spends host.energy (nested budget) if energy_budget not set
+    energy_enforced: bool = False
 
     body: Body = field(default_factory=Body)
     mind: Mind = field(default_factory=Mind)
+    energy: Energy = field(default_factory=Energy)
     sensors: list[Sensor] = field(default_factory=list)
     actuators: list[Actuator] = field(default_factory=list)
     innerface: Innerface = field(default_factory=Innerface)
@@ -98,6 +106,10 @@ class Symbioid(System):
             self.body.label = "Body"
         if self.mind.label is None:
             self.mind.label = "Mind"
+        if self.energy.label is None:
+            self.energy.label = "Energy"
+        # Architecture MVP: Mind is substrate, never Thought content
+        assert_mind_not_thought(self.mind)
         self.innerface.host = self
         self.interface.host = self
         self.outerface.host = self
@@ -843,6 +855,66 @@ class Symbioid(System):
     def check_action(self, **kwargs) -> tuple[bool, str]:
         """Delegate to Outerface constitutional gate."""
         return self.outerface.check_action(self, **kwargs)
+
+    def act_from_graph(
+        self,
+        *,
+        domain: Optional[str] = None,
+        poles: Optional[list[Thought]] = None,
+    ) -> list[tuple[bool, str]]:
+        """
+        Core agency: Outerface fires from Mind graph recommendation.
+
+        Prefer this over demo-local control paths when the host should act from
+        minted Action poles + valence. Fail-open empty list when cold.
+        """
+        return self.outerface.propose_actions_from_graph(domain=domain, poles=poles)
+
+    def think_tick(
+        self,
+        *,
+        domain: Optional[str] = None,
+        poles: Optional[list[Thought]] = None,
+        run_agency: bool = True,
+    ) -> dict:
+        """
+        One host cognitive step: pulse dynamics (+ optional energy), then agency.
+
+        Returns a small report for tests/HUD:
+          pulse, actions (list of (ok, reason)), energy_remaining
+        """
+        budget = None
+        if self.energy_enforced and self.energy is not None:
+            # Cap this tick to remaining host energy (falsifiable)
+            budget = max(0.0, float(self.energy.remaining))
+        if budget is not None:
+            pulse = self.pulse_partition(
+                membership=None, engine_name="global", energy_budget=budget
+            )
+        else:
+            pulse = self.pulse_tick()
+        # Map pulse energy spend into host Energy pool when enforced
+        if self.energy_enforced and self.energy is not None:
+            used = float(pulse.get("energy_used", 0.0) or 0.0)
+            if used > 0:
+                # pulse_partition already "used" virtual budget; sync host pool
+                self.energy.spend(used)
+            elif budget is not None and budget <= 0:
+                # Already empty — pulse may have capped; count refuse
+                self.energy.refuse_count += 1
+        actions: list[tuple[bool, str]] = []
+        if run_agency:
+            actions = self.act_from_graph(domain=domain, poles=poles)
+        return {
+            "pulse": pulse,
+            "actions": actions,
+            "energy_remaining": float(self.energy.remaining) if self.energy else 0.0,
+            "energy_refused": int(self.energy.refuse_count) if self.energy else 0,
+        }
+
+    def nest_energy(self, capacity: float, *, label: Optional[str] = None) -> Energy:
+        """Allocate a nested Energy sub-budget from this host (falsifiable)."""
+        return self.energy.nest(capacity, label=label)
 
     def is_minimal(self) -> bool:
         return is_minimal_symbioid_shape(

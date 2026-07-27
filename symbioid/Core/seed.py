@@ -6,6 +6,7 @@ from typing import Optional
 
 from symbioid.Core.Link import Link
 from symbioid.Core.Thought import Thought
+from symbioid.Core.thought_layers import ThoughtLayer
 
 
 def minimal_seed(
@@ -18,7 +19,9 @@ def minimal_seed(
     lab = (lambda s: s) if with_labels else (lambda s: None)
 
     # High threshold: structural seed poles do not spam-fire
-    _struct = dict(threshold=10.0, dynamics_enabled=True)
+    _struct = dict(
+        threshold=10.0, dynamics_enabled=True, layer=ThoughtLayer.STRUCTURE
+    )
     system = Thought(id=f"{p}system", label=lab("System"), **_struct)
     environment = Thought(id=f"{p}environment", label=lab("Environment"), **_struct)
     exists_in = Thought(id=f"{p}exists_in", label=lab("ExistsIn"), **_struct)

@@ -3,21 +3,33 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Union
 
 from symbioid.Core.System import System
+from symbioid.Core.thought_layers import (
+    SIMON_ATOMIC_THOUGHT,
+    ThoughtLayer,
+    normalize_layer,
+)
 
 
 @dataclass
 class Thought(System):
     """
-    Atomic Thought (Simon); also a System.
+    Atomic Thought (Simon MVP); also a System.
 
-    Dynamics: Thoughts double as neurons — activation, fire, decay.
-    Structure (id/label/links) is long-term; activation is short-term Signal energy.
+    Dual contract (Simon):
+      - **Structure** — id / label / links (long-term graph identity)
+      - **Signal** — activation / threshold / decay (short-term energy)
+
+    Layer (Structure / Pattern / Feeling) reduces which cognitive surface this
+    Thought primarily serves — see ``thought_layers`` and SevenSphere mapping.
+    Mind is **not** a Thought (processor aspect lives on Symbioid.mind).
     """
 
     transient: bool = False
+    # Structure | Pattern | Feeling (Thought MVP layers)
+    layer: ThoughtLayer = ThoughtLayer.PATTERN
     # --- Thought-as-neuron dynamics ---
     activation: float = 0.0
     resting: float = 0.0
@@ -37,6 +49,28 @@ class Thought(System):
     export_activation: float = 0.0
     # Set True for one tick after successful try_fire (consumers / HUD)
     just_fired: bool = field(default=False, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.layer = normalize_layer(self.layer)
+
+    def set_layer(self, layer: Union[ThoughtLayer, str]) -> "Thought":
+        """Assign cognitive layer; returns self for chaining."""
+        self.layer = normalize_layer(layer)
+        return self
+
+    def is_structure(self) -> bool:
+        return self.layer is ThoughtLayer.STRUCTURE
+
+    def is_pattern(self) -> bool:
+        return self.layer is ThoughtLayer.PATTERN
+
+    def is_feeling(self) -> bool:
+        return self.layer is ThoughtLayer.FEELING
+
+    @staticmethod
+    def simon_contract() -> dict:
+        """Documented Simon Atomic Thought dual (structure + signal)."""
+        return dict(SIMON_ATOMIC_THOUGHT)
 
     def receive(self, amount: float) -> None:
         """Add stimulus; clamp. Does not fire (pulse_tick decides)."""
@@ -91,6 +125,7 @@ class Thought(System):
             "id": self.id,
             "label": self.label,
             "transient": self.transient,
+            "layer": self.layer.value if isinstance(self.layer, ThoughtLayer) else str(self.layer),
             "activation": self.activation,
             "threshold": self.threshold,
             "refractory_ticks": self.refractory_ticks,

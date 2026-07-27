@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from symbioid.Core.Thought import Thought
+from symbioid.Core.thought_layers import ThoughtLayer
 
 
 @dataclass(kw_only=True)
@@ -19,8 +20,11 @@ class Link(Thought):
     weight: float = 1.0
     # Phase 5: Port channel Links — no pulse spread; cross-engine Hebb + transfer gain
     is_port: bool = False
+    # Link instances are PATTERN events; LinkType poles stay STRUCTURE
+    layer: ThoughtLayer = ThoughtLayer.PATTERN
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         for name, comp in (
             ("source", self.source),
             ("link_type", self.link_type),
@@ -28,6 +32,15 @@ class Link(Thought):
         ):
             if not isinstance(comp, Thought):
                 raise TypeError(f"Link.{name} must be a Thought, got {type(comp)!r}")
+        # LinkType poles are structural vocabulary
+        if getattr(self.link_type, "layer", None) is ThoughtLayer.PATTERN:
+            # only auto-promote unlabeled defaults that look like type poles
+            if self.link_type.dynamics_enabled is False or (
+                self.link_type.label
+                and not self.link_type.transient
+                and self.link_type.threshold >= 5.0
+            ):
+                self.link_type.layer = ThoughtLayer.STRUCTURE
 
     def adjust_weight(
         self,

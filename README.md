@@ -2,6 +2,8 @@
 
 Personal **experimentation sandbox** for Antelligence / Symbioid architecture ideas (Thought formation, Faces, Rodin doubling, interface grounding, Outerfaces loops, etc.).
 
+**Architecture MVP (v0.0.39):** Thought layers **Structure / Pattern / Feeling** (Simon + SevenSphere map); **Mind ≠ Thought** enforced; core **`act_from_graph` / `think_tick`**; nested **`Energy`** budgets (`energy_enforced`). See vault [[Maps/symbioid-thinking]].
+
 | | |
 |--|--|
 | **Path** | `~/Desktop/Areas/Personal/Symbioid` |

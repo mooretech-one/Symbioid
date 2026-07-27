@@ -4,19 +4,22 @@ Core package: one class per module (+ seed/formation/ids helpers).
 Hierarchy:
 
   System
-    ├── Thought → Link
+    ├── Thought → Link   (layers: Structure / Pattern / Feeling)
     ├── Symbioid
-    ├── Body, Mind, Sensor, Actuator
+    ├── Body, Mind, Energy, Sensor, Actuator
 
   Process
     ├── SpikingEngine   (phased: faces become engines)
     ├── Innerface
     ├── Interface
     └── Outerface
+
+  Mind ≠ Thought (processor aspect vs graph content).
 """
 
 from symbioid.Core.Actuator import Actuator
 from symbioid.Core.Body import Body
+from symbioid.Core.Energy import Energy
 from symbioid.Core.Innerface import Innerface
 from symbioid.Core.Interface import Interface
 from symbioid.Core.Law import Law, constitutional_seed
@@ -29,6 +32,16 @@ from symbioid.Core.SpikingEngine import PortPacket, SpikingEngine
 from symbioid.Core.Symbioid import ENGINES_MODES, PORT_I_N, PORT_N_O, Symbioid
 from symbioid.Core.System import System
 from symbioid.Core.Thought import Thought
+from symbioid.Core.thought_layers import (
+    SEVENSPHERE_ALIGNMENT,
+    SIMON_ATOMIC_THOUGHT,
+    ThoughtLayer,
+    assert_mind_not_thought,
+    is_mind_aspect,
+    is_thought_content,
+    layer_for_role,
+    normalize_layer,
+)
 from symbioid.Core.formation import (
     FORMATION_ROLES,
     FOLLOWS_ROLES,
@@ -66,6 +79,7 @@ __all__ = [
     "Link",
     "Body",
     "Mind",
+    "Energy",
     "Sensor",
     "Actuator",
     "Process",
@@ -76,6 +90,14 @@ __all__ = [
     "Outerface",
     "Law",
     "Symbioid",
+    "ThoughtLayer",
+    "SIMON_ATOMIC_THOUGHT",
+    "SEVENSPHERE_ALIGNMENT",
+    "assert_mind_not_thought",
+    "is_mind_aspect",
+    "is_thought_content",
+    "layer_for_role",
+    "normalize_layer",
     "ENGINES_MODES",
     "PORT_I_N",
     "PORT_N_O",

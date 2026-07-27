@@ -590,11 +590,18 @@ class Outerface(SpikingEngine):
         with host.innerface._local_lock:
             return list(host.innerface._last_obs_by_sensor.values())
 
-    def propose_actions_from_graph(self) -> list[tuple[bool, str]]:
+    def propose_actions_from_graph(
+        self,
+        *,
+        domain: Optional[str] = None,
+        poles: Optional[list[Thought]] = None,
+    ) -> list[tuple[bool, str]]:
         """
-        Behavior from minted Thoughts: recommend Action via Mind graph+valence.
+        Core Outerface agency: recommend Action via Mind graph+valence, then fire.
 
         Fail open (empty list) when cold so beliefs / explore can take over.
+        ``domain`` overrides host.label (demos pass e.g. ``tetris``).
+        ``poles`` optional explicit state poles (default: last Observations).
         """
         host = self.host
         if host is None or host.mind is None or not host.mind.enabled:
@@ -603,14 +610,14 @@ class Outerface(SpikingEngine):
         with self._local_lock:
             if self.wait_for_feedback and self._pending_feedback:
                 return []
-        poles = self._current_state_poles()
-        if not poles:
+        state = poles if poles is not None else self._current_state_poles()
+        if not state:
             return []
-        domain = (host.label or "default").replace(" ", "_")
-        rec = host.mind.recommend_action(poles, domain=domain)
-        if rec is None:
+        dom = (domain or host.label or "default").replace(" ", "_")
+        rec = host.mind.recommend_action(state, domain=dom)
+        if rec is None and dom != "default":
             # Also try generic domain used by demos
-            rec = host.mind.recommend_action(poles, domain="default")
+            rec = host.mind.recommend_action(state, domain="default")
         if rec is None:
             return []
         with host.graph_lock:
