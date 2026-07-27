@@ -4,7 +4,7 @@ Personal **experimentation sandbox** for Antelligence / Symbioid architecture id
 
 **Architecture MVP (v0.0.39):** Thought layers **Structure / Pattern / Feeling** (Simon + SevenSphere map); **Mind ≠ Thought** enforced; core **`act_from_graph` / `think_tick`**; nested **`Energy`** budgets (`energy_enforced`). See vault [[Maps/symbioid-thinking]].
 
-**Audio demo Phase 0–1 (v0.0.40):** mic/synthetic PCM → **FFT20** log bands (80 Hz–12 kHz) → 20 Sensors. Sense-only host loop; actuators/speakers in later phases. See `audio_demo.py` and `symbioid/world/audio.py`.
+**Audio demo Phases 0–5 (v0.0.41):** mic/synthetic → **FFT20** → 20 Sensors + 20 Actuators → band synth → speakers; digital self-mix closed loop; contingent IM valence. See `audio_demo.py` and `symbioid/world/audio.py`.
 
 | | |
 |--|--|
@@ -48,7 +48,7 @@ On exit, Tetris/Pong save **agent cognition only** — a **lean** snapshot by de
 |------|----------------|
 | Tetris | `~/.local/share/symbioid/tetris_memory.json` |
 | Pong | `~/.local/share/symbioid/pong_memory.json` |
-| Audio (Phase 0–1) | `~/.local/share/symbioid/audio_memory.json` |
+| Audio (Phases 0–5) | `~/.local/share/symbioid/audio_memory.json` |
 
 ```bash
 .venv/bin/python tetris_demo.py              # load if present, save lean on quit
@@ -57,27 +57,36 @@ On exit, Tetris/Pong save **agent cognition only** — a **lean** snapshot by de
 .venv/bin/python tetris_demo.py --memory /tmp/my_mind.json
 ```
 
-### Audio demo (Phase 0–1 — sense only)
+### Audio demo (Phases 0–5 — sense + babble + contingency)
 
 ```bash
-# Offline synthetic bursts (no mic)
-PYTHONPATH=. .venv/bin/python audio_demo.py --headless --frames 30 --no-memory
+# Phase 1 — sense only
+PYTHONPATH=. .venv/bin/python audio_demo.py --sense-only --headless --frames 20 --no-memory
 
-# Live Logitech C925e (ALSA plughw:1,0 by default — hw:1,0 often rejects mono)
-PYTHONPATH=. .venv/bin/python audio_demo.py --mic
+# Phase 2 — open-loop babble (silent motor for CI)
+PYTHONPATH=. .venv/bin/python audio_demo.py --babble --headless --frames 30 --no-play --no-memory
+
+# Phase 3 — closed digital self-mix
+PYTHONPATH=. .venv/bin/python audio_demo.py --closed --headless --frames 30 --no-play --no-memory
+
+# Phase 4 — contingent vs non-contingent IM
+PYTHONPATH=. .venv/bin/python audio_demo.py --contingent --headless --frames 40 --no-play --no-memory --seed 1
+PYTHONPATH=. .venv/bin/python audio_demo.py --noncontingent --headless --frames 40 --no-play --no-memory --seed 1
+
+# Live mic + speakers (GUI default closed+play)
+PYTHONPATH=. .venv/bin/python audio_demo.py --mic --play
 PYTHONPATH=. .venv/bin/python audio_demo.py --list-devices
-# override: --device hw:1,0   or env SYMBIOID_AUDIO_ALSA_DEVICE
-
-# Pure tone check
-PYTHONPATH=. .venv/bin/python audio_demo.py --tone 1000 --headless --frames 10 --no-memory
 ```
 
 | Setting | Value |
 |---------|--------|
 | Rate / block | 48 kHz mono, 2048 samples (~42.7 ms) |
-| Interface | 20 log FFT bands 80 Hz–12 kHz → `band_00`…`band_19` |
-| Capture | synthetic (default) or `arecord` S16_LE (`--mic`) |
-| Not yet | actuators, speakers, inverse-FFT (Phase 2+) |
+| In / out | 20 log bands 80 Hz–12 kHz → Sensors / Actuators |
+| Capture | synthetic or `arecord` (`plughw:1,0`) |
+| Playback | `aplay` (`--play`) or null (`--no-play`) |
+| Motor | coach writes `Actuator.output` (not primary `request_fire`) |
+| Closed loop | digital `self_mix * synth + mic_gain * mic` before FFT |
+| Success | sense stable · audible babble · contingent R > non-contingent |
 
 API (`symbioid.persist`): `export_memory(host, mode="lean"|"full")`, `save_memory`, `try_load_into`.
 

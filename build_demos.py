@@ -39,6 +39,10 @@ DEMOS = {
         "script": ROOT / "tetris_demo.py",
         "name": "SymbioidTetris",
     },
+    "audio": {
+        "script": ROOT / "audio_demo.py",
+        "name": "SymbioidAudio",
+    },
 }
 
 

@@ -1,23 +1,26 @@
-"""Audio world for Symbioid demo — capture, FFT20 bands, sense world.
+"""Audio world for Symbioid demo — capture, FFT20, synth, babble coach.
 
 Phase 0–1: mic / synthetic PCM → 20 log-spaced magnitude bands [0, 1].
-Phase 2+ (later): actuators → synthesis → speakers.
+Phase 2:   20 actuators → band oscillators → speakers (open-loop babble).
+Phase 3:   digital self-mix so production changes hearing.
+Phase 4:   contingent vs non-contingent intrinsic-motivation valence.
 
-Defaults match the tower plan: 48 kHz, mono, 2048-sample blocks (~42.7 ms),
-bands 80 Hz … 12 kHz. Mic default ALSA ``plughw:1,0`` (Logitech C925e —
-``hw:1,0`` often rejects mono channel count); override with env
-``SYMBIOID_AUDIO_ALSA_DEVICE`` or ``GROK_AUDIO_ALSA_DEVICE``.
+Defaults: 48 kHz mono, 2048-sample blocks (~42.7 ms), bands 80 Hz … 12 kHz.
+Mic default ALSA ``plughw:1,0`` (Logitech C925e). Playback default system
+``default`` via aplay. Override with ``SYMBIOID_AUDIO_ALSA_DEVICE`` /
+``GROK_AUDIO_ALSA_DEVICE`` (capture) and ``SYMBIOID_AUDIO_PLAY_DEVICE``.
 """
 
 from __future__ import annotations
 
 import math
 import os
+import random
 import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
-from typing import Optional, Protocol
+from typing import Any, Optional, Protocol
 
 import numpy as np
 
@@ -35,6 +38,7 @@ DEFAULT_ALSA_DEVICE = os.environ.get(
     "SYMBIOID_AUDIO_ALSA_DEVICE",
     os.environ.get("GROK_AUDIO_ALSA_DEVICE", "plughw:1,0"),
 )
+DEFAULT_PLAY_DEVICE = os.environ.get("SYMBIOID_AUDIO_PLAY_DEVICE", "default")
 
 
 def block_duration_s(
@@ -44,7 +48,7 @@ def block_duration_s(
 
 
 # ---------------------------------------------------------------------------
-# FFT → 20 log bands (AtomIc-style; local copy, no atomic import)
+# FFT → 20 log bands
 # ---------------------------------------------------------------------------
 
 
@@ -76,7 +80,6 @@ class FFT20Bands:
             for i in range(self.num_bands)
         ]
         self._buffer = np.zeros(self.fft_size, dtype=np.float32)
-        # Soft ceiling for unit-scale PCM: full-scale sine energy in rFFT
         self._norm_ref = math.log1p(float(self.fft_size) * 0.25)
 
     @staticmethod
@@ -107,7 +110,6 @@ class FFT20Bands:
     def normalize(self, band_mags: np.ndarray) -> np.ndarray:
         """Map raw band magnitudes → [0, 1] with log compression."""
         m = np.asarray(band_mags, dtype=np.float32)
-        # log1p compress; divide by full-scale-ish ref
         out = np.log1p(m) / max(self._norm_ref, 1e-9)
         return np.clip(out, 0.0, 1.0).astype(np.float32)
 
@@ -170,7 +172,6 @@ class SyntheticCapture:
             freq = self.freqs[0]
             env = 1.0
         else:
-            # burst: hold each tone a few chunks, then near-silence
             freq = self.freqs[(self._chunk_idx // 3) % len(self.freqs)]
             env = 1.0 if (self._chunk_idx % 6) < 4 else 0.02
 
@@ -198,7 +199,7 @@ class ArecordCapture:
         self.sample_rate = sample_rate
         self.chunk_size = chunk_size
         self.device = device if device is not None else DEFAULT_ALSA_DEVICE
-        self._bytes_per_chunk = chunk_size * 2  # S16_LE mono
+        self._bytes_per_chunk = chunk_size * 2
 
         cmd = [
             "arecord",
@@ -254,24 +255,14 @@ def open_capture(
     synthetic_mode: str = "burst",
     synthetic_freq: Optional[float] = None,
 ) -> tuple[AudioCapture, str]:
-    """
-    Open a capture source.
-
-    ``backend``: ``synthetic`` | ``arecord`` | ``auto``
-      - auto → arecord if available, else synthetic
-    """
+    """Open a capture source. ``backend``: synthetic | arecord | auto."""
     b = (backend or "synthetic").lower().strip()
     if b == "auto":
-        if shutil.which("arecord"):
-            b = "arecord"
-        else:
-            b = "synthetic"
+        b = "arecord" if shutil.which("arecord") else "synthetic"
 
     if b == "synthetic":
         freqs = [float(synthetic_freq)] if synthetic_freq else None
-        mode = synthetic_mode if synthetic_mode != "tone" or freqs else "burst"
-        if synthetic_freq is not None:
-            mode = "tone"
+        mode = "tone" if synthetic_freq is not None else synthetic_mode
         return (
             SyntheticCapture(
                 sample_rate=sample_rate,
@@ -296,45 +287,205 @@ def open_capture(
 
 
 def probe_arecord_devices() -> str:
-    """Return ``arecord -l`` text (or error string)."""
     if shutil.which("arecord") is None:
         return "arecord not found"
     try:
         r = subprocess.run(
-            ["arecord", "-l"],
-            capture_output=True,
-            text=True,
-            timeout=5,
+            ["arecord", "-l"], capture_output=True, text=True, timeout=5
         )
         return (r.stdout or "") + (r.stderr or "")
-    except Exception as e:  # noqa: BLE001 — probe helper
+    except Exception as e:  # noqa: BLE001
         return f"arecord -l failed: {e}"
 
 
 # ---------------------------------------------------------------------------
-# AudioWorld — band levels for Sensor.transfer
+# Phase 2 — band synthesis + playback
+# ---------------------------------------------------------------------------
+
+
+class BandSynth:
+    """Sum of band-center oscillators controlled by 20 gains in [0, 1]."""
+
+    def __init__(
+        self,
+        *,
+        sample_rate: int = SAMPLE_RATE,
+        chunk_size: int = CHUNK_SIZE,
+        band_centers: Optional[list[float]] = None,
+        master_gain: float = 0.22,
+    ) -> None:
+        self.sample_rate = sample_rate
+        self.chunk_size = chunk_size
+        if band_centers is None:
+            edges = np.geomspace(F_MIN, F_MAX, NUM_BANDS + 1)
+            band_centers = [
+                float((edges[i] + edges[i + 1]) / 2.0) for i in range(NUM_BANDS)
+            ]
+        self.band_centers = list(band_centers)
+        self.num_bands = len(self.band_centers)
+        self.master_gain = float(master_gain)
+        self._phase = np.zeros(self.num_bands, dtype=np.float64)
+        self._omega = (
+            2.0 * math.pi * np.asarray(self.band_centers, dtype=np.float64) / sample_rate
+        )
+
+    def render(self, gains: list[float] | np.ndarray) -> np.ndarray:
+        g = np.asarray(gains, dtype=np.float64).reshape(-1)
+        if len(g) < self.num_bands:
+            g = np.pad(g, (0, self.num_bands - len(g)))
+        g = np.clip(g[: self.num_bands], 0.0, 1.0)
+        n = self.chunk_size
+        t = np.arange(n, dtype=np.float64)
+        out = np.zeros(n, dtype=np.float64)
+        for i in range(self.num_bands):
+            if g[i] < 1e-6:
+                self._phase[i] = (self._phase[i] + self._omega[i] * n) % (2.0 * math.pi)
+                continue
+            ph = self._phase[i] + self._omega[i] * t
+            out += g[i] * np.sin(ph)
+            self._phase[i] = float(ph[-1] + self._omega[i]) % (2.0 * math.pi)
+        # soft peak limit
+        peak = float(np.max(np.abs(out))) if n else 0.0
+        scale = self.master_gain
+        if peak * scale > 0.95:
+            scale = 0.95 / max(peak, 1e-9)
+        return (out * scale).astype(np.float32)
+
+
+class AudioPlayback(Protocol):
+    def write(self, pcm: np.ndarray) -> None: ...
+
+    def close(self) -> None: ...
+
+
+class NullPlayback:
+    """Discard PCM (headless / CI)."""
+
+    def __init__(self) -> None:
+        self.blocks = 0
+        self.last_rms = 0.0
+
+    def write(self, pcm: np.ndarray) -> None:
+        x = np.asarray(pcm, dtype=np.float32)
+        self.blocks += 1
+        if len(x):
+            self.last_rms = float(np.sqrt(np.mean(np.square(x))))
+
+    def close(self) -> None:
+        pass
+
+
+class AplayPlayback:
+    """Stream S16_LE mono to ALSA via ``aplay``."""
+
+    def __init__(
+        self,
+        *,
+        sample_rate: int = SAMPLE_RATE,
+        device: Optional[str] = None,
+    ) -> None:
+        if shutil.which("aplay") is None:
+            raise RuntimeError("aplay not found; install alsa-utils")
+        self.sample_rate = sample_rate
+        self.device = device if device is not None else DEFAULT_PLAY_DEVICE
+        cmd = [
+            "aplay",
+            "-q",
+            "-f",
+            "S16_LE",
+            "-r",
+            str(sample_rate),
+            "-c",
+            "1",
+            "-t",
+            "raw",
+        ]
+        if self.device:
+            cmd.extend(["-D", self.device])
+        self._proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if self._proc.stdin is None:
+            raise RuntimeError("aplay stdin unavailable")
+
+    def write(self, pcm: np.ndarray) -> None:
+        if self._proc.poll() is not None:
+            err = ""
+            if self._proc.stderr:
+                err = self._proc.stderr.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"aplay exited: {err}")
+        x = np.clip(np.asarray(pcm, dtype=np.float32), -1.0, 1.0)
+        i16 = (x * 32767.0).astype(np.int16)
+        assert self._proc.stdin is not None
+        self._proc.stdin.write(i16.tobytes())
+        self._proc.stdin.flush()
+
+    def close(self) -> None:
+        if self._proc.stdin:
+            try:
+                self._proc.stdin.close()
+            except Exception:  # noqa: BLE001
+                pass
+        if self._proc.poll() is None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+
+
+def open_playback(
+    *,
+    backend: str = "null",
+    sample_rate: int = SAMPLE_RATE,
+    device: Optional[str] = None,
+) -> tuple[AudioPlayback, str]:
+    """``backend``: null | aplay | auto (aplay if present else null)."""
+    b = (backend or "null").lower().strip()
+    if b == "auto":
+        b = "aplay" if shutil.which("aplay") else "null"
+    if b in ("null", "none", "silent"):
+        return NullPlayback(), "null"
+    if b == "aplay":
+        return AplayPlayback(sample_rate=sample_rate, device=device), "aplay"
+    raise ValueError(f"unknown playback backend: {backend!r}")
+
+
+# ---------------------------------------------------------------------------
+# AudioWorld — sense + motor + closed-loop mix
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class AudioWorld:
     """
-    Sense-side audio world: latest 20 band levels + capture stats.
+    Audio world: hear (FFT20) + optional babble synth/playback.
 
-    ``sensor_world()`` returns ``band_00`` … ``band_19`` in [0, 1] for
-    Sensor.transfer closures (Pong/Tetris pattern).
+    ``sensor_world()`` → band_00…band_19 for Sensor.transfer.
+    ``act_levels`` written by coach / actuators; ``render_and_play`` for Phase 2.
+    ``self_mix`` digitally mixes last synth into next hear (Phase 3).
     """
 
     sample_rate: int = SAMPLE_RATE
     chunk_size: int = CHUNK_SIZE
     num_bands: int = NUM_BANDS
     fft: FFT20Bands = field(init=False)
+    synth: BandSynth = field(init=False)
     bands: list[float] = field(init=False)
+    act_levels: list[float] = field(init=False)
     last_rms: float = 0.0
     last_peak: float = 0.0
     last_block_ms: float = 0.0
+    last_synth_rms: float = 0.0
+    last_pred_err: float = 0.0
     blocks: int = 0
     backend: str = "synthetic"
+    # Phase 3: mix self-output into heard PCM (digital; offline-safe)
+    self_mix: float = 0.0
+    mic_gain: float = 1.0
+    last_synth: Optional[np.ndarray] = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.fft = FFT20Bands(
@@ -342,10 +493,49 @@ class AudioWorld:
             fft_size=self.chunk_size,
             num_bands=self.num_bands,
         )
+        self.synth = BandSynth(
+            sample_rate=self.sample_rate,
+            chunk_size=self.chunk_size,
+            band_centers=list(self.fft.band_centers),
+        )
         self.bands = [0.0] * self.num_bands
+        self.act_levels = [0.0] * self.num_bands
+
+    def set_act_levels(self, levels: list[float] | np.ndarray) -> None:
+        g = [float(max(0.0, min(1.0, x))) for x in levels]
+        if len(g) < self.num_bands:
+            g = g + [0.0] * (self.num_bands - len(g))
+        self.act_levels = g[: self.num_bands]
+
+    def pull_actuators(self, actuators: list[Any]) -> None:
+        """Copy Actuator.output → act_levels (demo writes actuators, not request_fire)."""
+        levels = []
+        for i in range(self.num_bands):
+            if i < len(actuators):
+                levels.append(float(getattr(actuators[i], "output", 0.0)))
+            else:
+                levels.append(0.0)
+        self.set_act_levels(levels)
+
+    def push_actuators(self, actuators: list[Any]) -> None:
+        for i, a in enumerate(actuators):
+            if i >= self.num_bands:
+                break
+            a.output = float(self.act_levels[i])
+
+    def render_synth(self) -> np.ndarray:
+        pcm = self.synth.render(self.act_levels)
+        self.last_synth = pcm
+        self.last_synth_rms = float(np.sqrt(np.mean(np.square(pcm)))) if len(pcm) else 0.0
+        return pcm
+
+    def play(self, playback: AudioPlayback, pcm: Optional[np.ndarray] = None) -> None:
+        if pcm is None:
+            pcm = self.last_synth if self.last_synth is not None else self.render_synth()
+        playback.write(pcm)
 
     def step_pcm(self, chunk: np.ndarray, *, block_ms: Optional[float] = None) -> list[float]:
-        """Analyze one PCM block; update bands and stats. Returns unit bands."""
+        """Analyze one PCM block (after optional self-mix applied by caller)."""
         t0 = time.perf_counter()
         x = np.asarray(chunk, dtype=np.float32).reshape(-1)
         if len(x) == 0:
@@ -361,33 +551,220 @@ class AudioWorld:
             self.last_block_ms = float(block_ms)
         else:
             self.last_block_ms = (time.perf_counter() - t0) * 1000.0
+        # prediction error: hear vs current act (closed-loop match signal)
+        pred = np.asarray(self.act_levels, dtype=np.float32)
+        hear = np.asarray(self.bands, dtype=np.float32)
+        self.last_pred_err = float(np.mean(np.square(hear - pred)))
         return list(self.bands)
 
-    def step(self, capture: AudioCapture) -> list[float]:
-        """Read one block from capture, analyze, return unit bands."""
+    def mix_with_self(self, mic: np.ndarray) -> np.ndarray:
+        """mic_gain * mic + self_mix * last_synth (digital closed loop)."""
+        x = self.mic_gain * np.asarray(mic, dtype=np.float32).reshape(-1)
+        if self.self_mix > 0.0 and self.last_synth is not None:
+            s = np.asarray(self.last_synth, dtype=np.float32).reshape(-1)
+            n = min(len(x), len(s))
+            if n > 0:
+                y = x.copy()
+                y[:n] = y[:n] + float(self.self_mix) * s[:n]
+                # soft clip
+                peak = float(np.max(np.abs(y))) if n else 0.0
+                if peak > 1.0:
+                    y = y / peak
+                return y
+        return x
+
+    def step(
+        self,
+        capture: AudioCapture,
+        *,
+        playback: Optional[AudioPlayback] = None,
+        render_motor: bool = False,
+    ) -> list[float]:
+        """
+        One block: optional motor render/play → capture → self-mix → FFT.
+
+        Order matches developmental loop: produce, then hear (including self).
+        """
+        if render_motor:
+            pcm = self.render_synth()
+            if playback is not None:
+                self.play(playback, pcm)
+
         t0 = time.perf_counter()
-        chunk = capture.read()
+        mic = capture.read()
         wall_ms = (time.perf_counter() - t0) * 1000.0
-        bands = self.step_pcm(chunk, block_ms=wall_ms)
-        return bands
+        heard = self.mix_with_self(mic)
+        return self.step_pcm(heard, block_ms=wall_ms)
 
     def sensor_world(self) -> dict[str, float]:
-        """Map for Sensor.transfer: band_00 … band_{n-1}."""
         w: dict[str, float] = {}
         for i, v in enumerate(self.bands):
             w[f"band_{i:02d}"] = float(v)
+        for i, v in enumerate(self.act_levels):
+            w[f"act_{i:02d}"] = float(v)
         w["rms"] = float(self.last_rms)
         w["peak"] = float(self.last_peak)
+        w["synth_rms"] = float(self.last_synth_rms)
+        w["pred_err"] = float(self.last_pred_err)
         return w
 
     def band_label(self, i: int) -> str:
         return f"band_{i:02d}"
 
     def summary_line(self) -> str:
-        bars = "".join("█" if v > 0.35 else ("░" if v > 0.08 else "·") for v in self.bands)
+        hear = "".join("█" if v > 0.35 else ("░" if v > 0.08 else "·") for v in self.bands)
+        act = "".join("█" if v > 0.35 else ("░" if v > 0.08 else "·") for v in self.act_levels)
         return (
-            f"blk={self.blocks} rms={self.last_rms:.4f} peak={self.last_peak:.4f} "
-            f"cap_ms={self.last_block_ms:.1f} |{bars}|"
+            f"blk={self.blocks} rms={self.last_rms:.4f} synth={self.last_synth_rms:.4f} "
+            f"err={self.last_pred_err:.3f} cap_ms={self.last_block_ms:.1f} "
+            f"H|{hear}| A|{act}|"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2–4 — babble coach + contingent IM
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BabbleCoach:
+    """
+    Open-loop spectral play + optional contingent valence.
+
+    Writes Actuator.output directly (plan: not primary request_fire).
+    Modes:
+      explore       — random-walk gains (Phase 2)
+      contingent    — reward when hear≈play (self-mix / acoustic) (Phase 4)
+      noncontingent — same motor, reward from unrelated noise (control)
+    """
+
+    num_bands: int = NUM_BANDS
+    mode: str = "explore"  # explore | contingent | noncontingent | freeze
+    step_sigma: float = 0.12
+    mutate_p: float = 0.08
+    seed: Optional[int] = None
+    levels: list[float] = field(init=False)
+    steps: int = 0
+    total_reward: float = 0.0
+    last_reward: float = 0.0
+    last_err: float = 1.0
+    learning_progress: float = 0.0
+    _rng: random.Random = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._rng = random.Random(self.seed)
+        self.levels = [self._rng.random() * 0.4 for _ in range(self.num_bands)]
+
+    def _explore(self) -> None:
+        for i in range(self.num_bands):
+            if self._rng.random() < self.mutate_p:
+                self.levels[i] = self._rng.random()
+            else:
+                self.levels[i] += self._rng.gauss(0.0, self.step_sigma)
+            self.levels[i] = max(0.0, min(1.0, self.levels[i]))
+        # keep a few bands quiet to reduce density / howl risk
+        if self._rng.random() < 0.3:
+            k = self._rng.randrange(self.num_bands)
+            self.levels[k] = 0.0
+
+    def decide(self, world: AudioWorld) -> list[float]:
+        """Update motor levels for this block; return copy."""
+        if self.mode != "freeze":
+            self._explore()
+        world.set_act_levels(self.levels)
+        self.steps += 1
+        return list(self.levels)
+
+    def apply_to_host(self, host: Any) -> None:
+        acts = getattr(host, "actuators", []) or []
+        for i, a in enumerate(acts):
+            if i >= self.num_bands:
+                break
+            a.output = float(self.levels[i])
+
+    def action_token(self) -> str:
+        """Coarse action key for Mind (top band + energy bucket)."""
+        if not self.levels:
+            return "act:silence"
+        peak_i = int(max(range(len(self.levels)), key=lambda i: self.levels[i]))
+        energy = sum(self.levels) / max(1, len(self.levels))
+        bucket = int(min(9, max(0, energy * 10)))
+        return f"act:b{peak_i:02d}_e{bucket}"
+
+    def compute_reward(self, world: AudioWorld) -> float:
+        """
+        Intrinsic reward.
+
+        contingent: learning progress on pred_err (hear vs act) + match bonus
+        noncontingent: random reward (same scale) — control
+        explore: mild novelty on motor energy only
+        """
+        err = float(world.last_pred_err)
+        prev = self.last_err
+        lp = prev - err  # positive when error decreases
+        self.learning_progress = lp
+        self.last_err = err
+
+        if self.mode == "noncontingent":
+            r = self._rng.uniform(-0.3, 0.5)
+        elif self.mode == "contingent":
+            # match quality: low err → positive; learning progress bonus
+            match = max(0.0, 1.0 - err * 4.0)  # err~0.25 → 0
+            r = 0.6 * match + 1.2 * max(0.0, lp) - 0.15 * err
+        else:
+            # explore: small energy novelty (prefer mid energy)
+            e = sum(self.levels) / max(1, len(self.levels))
+            r = 0.1 * (1.0 - abs(e - 0.35)) + 0.05 * self._rng.random()
+
+        self.last_reward = float(r)
+        self.total_reward += self.last_reward
+        return self.last_reward
+
+    def reinforce(self, host: Any, world: AudioWorld) -> float:
+        """Apply reward via Mind.record_outcome + direct action valence."""
+        r = self.compute_reward(world)
+        mind = getattr(host, "mind", None)
+        if mind is None or not getattr(mind, "enabled", True):
+            return r
+
+        host_id = str(getattr(host, "id", "host"))
+        token = self.action_token()
+        # Collect a few high-activation observation poles if any (optional state)
+        state_thoughts: list[Any] = []
+        try:
+            with mind._lock:
+                obs = list(mind._observations.values())
+            obs.sort(key=lambda t: float(getattr(t, "activation", 0.0)), reverse=True)
+            state_thoughts = obs[:4]
+        except Exception:  # noqa: BLE001
+            state_thoughts = []
+
+        # Scale reward to Mind's /50 path: pass r*50 so delta ≈ r
+        action = mind.record_outcome(
+            state_thoughts,
+            token,
+            domain="audio",
+            host_id=host_id,
+            reward=float(r) * 50.0,
+            channel="audio",
+            host=host,
+        )
+        # Always stamp valence on the Action pole (empty state still learns motor)
+        if action is not None:
+            mind.note_valence(thought_id=action.id, delta=float(r))
+            # also content-key path if mapping missing
+            try:
+                ck = mind.action_content_key("audio", token)
+                mind.note_valence(content_key=ck, delta=float(r) * 0.5)
+            except Exception:  # noqa: BLE001
+                pass
+        return r
+
+    def summary(self) -> str:
+        return (
+            f"coach[{self.mode}] steps={self.steps} R={self.total_reward:.2f} "
+            f"lastR={self.last_reward:.3f} lp={self.learning_progress:.3f} "
+            f"err={self.last_err:.3f}"
         )
 
 
@@ -403,8 +780,48 @@ def band_index_for_freq(
         return 0
     if freq_hz >= f_max:
         return num_bands - 1
-    # invert geomspace: edges = geomspace(f_min, f_max, n+1)
-    # index = floor( n * log(f/f_min) / log(f_max/f_min) )
     ratio = math.log(freq_hz / f_min) / math.log(f_max / f_min)
     idx = int(math.floor(ratio * num_bands))
     return max(0, min(num_bands - 1, idx))
+
+
+def compare_contingent_vs_noncontingent(
+    *,
+    blocks: int = 40,
+    seed: int = 0,
+) -> dict[str, float]:
+    """
+    Offline Phase 4 check: same motor seed; contingent should accumulate
+    more total reward when self-mix makes hear≈play.
+    """
+    from symbioid import Actuator, Sensor, Symbioid
+
+    def _run(mode: str) -> float:
+        world = AudioWorld()
+        world.self_mix = 0.85
+        world.mic_gain = 0.0  # pure self-hearing
+        cap = SyntheticCapture(mode="silence")
+        coach = BabbleCoach(mode=mode, seed=seed)
+        host = Symbioid(id=f"cmp-{mode}", label=mode)
+        host.interface.continuous_inputs = False
+        host.outerface.wait_for_feedback = False
+        for i in range(NUM_BANDS):
+            host.add_sensor(
+                Sensor(id=f"cmp-{mode}:sen:band_{i:02d}", label=f"band_{i:02d}"),
+                awareness=False,
+            )
+            host.add_actuator(
+                Actuator(id=f"cmp-{mode}:act:act_{i:02d}", label=f"act_{i:02d}"),
+                awareness=False,
+            )
+        for _ in range(blocks):
+            coach.decide(world)
+            coach.apply_to_host(host)
+            world.step(cap, render_motor=True)
+            coach.reinforce(host, world)
+        cap.close()
+        return float(coach.total_reward)
+
+    c = _run("contingent")
+    n = _run("noncontingent")
+    return {"contingent": c, "noncontingent": n, "delta": c - n}
