@@ -329,7 +329,12 @@ class BandSynth:
             2.0 * math.pi * np.asarray(self.band_centers, dtype=np.float64) / sample_rate
         )
 
-    def render(self, gains: list[float] | np.ndarray) -> np.ndarray:
+    def render(
+        self,
+        gains: list[float] | np.ndarray,
+        *,
+        gain_scale: float = 1.0,
+    ) -> np.ndarray:
         g = np.asarray(gains, dtype=np.float64).reshape(-1)
         if len(g) < self.num_bands:
             g = np.pad(g, (0, self.num_bands - len(g)))
@@ -344,12 +349,103 @@ class BandSynth:
             ph = self._phase[i] + self._omega[i] * t
             out += g[i] * np.sin(ph)
             self._phase[i] = float(ph[-1] + self._omega[i]) % (2.0 * math.pi)
-        # soft peak limit
+        # soft peak limit + external duck scale
         peak = float(np.max(np.abs(out))) if n else 0.0
-        scale = self.master_gain
+        scale = self.master_gain * float(max(0.0, min(1.0, gain_scale)))
         if peak * scale > 0.95:
             scale = 0.95 / max(peak, 1e-9)
         return (out * scale).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Acoustic closed-loop howl mitigation
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AcousticDucker:
+    """
+    Soft-gain ducking + mic high-pass for live speaker→mic feedback (howl).
+
+    When mic energy is high relative to intended synth (or absolute ceiling),
+    lower ``play_gain`` quickly; recover slowly when quiet. Optional spectral
+    subtract of last synth from mic before FFT (leakage cancel).
+    """
+
+    enabled: bool = False
+    play_gain: float = 1.0
+    min_gain: float = 0.04
+    max_gain: float = 1.0
+    attack: float = 0.45  # fraction toward min on howl
+    release: float = 0.06  # fraction toward max when clear
+    howl_rms: float = 0.22
+    howl_ratio: float = 1.6  # mic_rms / max(synth_rms, eps)
+    peak_ceil: float = 0.85
+    # one-pole high-pass (~80 Hz @ 48k): y[n] = a*(y[n-1] + x[n] - x[n-1])
+    highpass: bool = True
+    hp_coeff: float = 0.9895  # ~80 Hz @ 48 kHz
+    # subtract attenuated last_synth from mic (acoustic echo cancel lite)
+    leakage_cancel: float = 0.35
+    last_howl_score: float = 0.0
+    duck_events: int = 0
+    _hp_x1: float = field(default=0.0, init=False, repr=False)
+    _hp_y1: float = field(default=0.0, init=False, repr=False)
+
+    def highpass_filter(self, mic: np.ndarray) -> np.ndarray:
+        if not self.highpass:
+            return np.asarray(mic, dtype=np.float32)
+        x = np.asarray(mic, dtype=np.float64).reshape(-1)
+        if len(x) == 0:
+            return x.astype(np.float32)
+        a = float(self.hp_coeff)
+        y = np.empty_like(x)
+        x1, y1 = self._hp_x1, self._hp_y1
+        for i, xi in enumerate(x):
+            yi = a * (y1 + xi - x1)
+            y[i] = yi
+            x1, y1 = xi, yi
+        self._hp_x1, self._hp_y1 = float(x1), float(y1)
+        return y.astype(np.float32)
+
+    def cancel_leakage(self, mic: np.ndarray, last_synth: Optional[np.ndarray]) -> np.ndarray:
+        """mic - leakage_cancel * play_gain * last_synth (when enabled)."""
+        x = np.asarray(mic, dtype=np.float32).reshape(-1)
+        if (
+            not self.enabled
+            or self.leakage_cancel <= 0.0
+            or last_synth is None
+        ):
+            return x
+        s = np.asarray(last_synth, dtype=np.float32).reshape(-1)
+        n = min(len(x), len(s))
+        if n == 0:
+            return x
+        out = x.copy()
+        out[:n] = out[:n] - float(self.leakage_cancel) * float(self.play_gain) * s[:n]
+        return out
+
+    def update(self, *, mic_rms: float, synth_rms: float, mic_peak: float) -> float:
+        """Update play_gain from levels; return current play_gain."""
+        if not self.enabled:
+            self.play_gain = self.max_gain
+            return self.play_gain
+        eps = 1e-3
+        ratio = float(mic_rms) / max(float(synth_rms), eps)
+        howl = 0.0
+        if mic_rms >= self.howl_rms and ratio >= self.howl_ratio:
+            howl = min(1.0, (ratio / self.howl_ratio - 1.0) + (mic_rms / self.howl_rms - 1.0))
+        if mic_peak >= self.peak_ceil:
+            howl = max(howl, 0.75)
+        self.last_howl_score = float(howl)
+        if howl > 0.05:
+            # duck toward min_gain
+            target = self.min_gain + (self.max_gain - self.min_gain) * max(0.0, 1.0 - howl)
+            self.play_gain += self.attack * (target - self.play_gain)
+            self.duck_events += 1
+        else:
+            self.play_gain += self.release * (self.max_gain - self.play_gain)
+        self.play_gain = float(max(self.min_gain, min(self.max_gain, self.play_gain)))
+        return self.play_gain
 
 
 class AudioPlayback(Protocol):
@@ -485,7 +581,11 @@ class AudioWorld:
     # Phase 3: mix self-output into heard PCM (digital; offline-safe)
     self_mix: float = 0.0
     mic_gain: float = 1.0
+    # Live acoustic howl guard (speaker → mic)
+    duck: AcousticDucker = field(default_factory=AcousticDucker)
     last_synth: Optional[np.ndarray] = field(default=None, init=False, repr=False)
+    last_mic_rms: float = 0.0
+    last_play_gain: float = 1.0
 
     def __post_init__(self) -> None:
         self.fft = FFT20Bands(
@@ -500,6 +600,8 @@ class AudioWorld:
         )
         self.bands = [0.0] * self.num_bands
         self.act_levels = [0.0] * self.num_bands
+        if not isinstance(self.duck, AcousticDucker):
+            self.duck = AcousticDucker()
 
     def set_act_levels(self, levels: list[float] | np.ndarray) -> None:
         g = [float(max(0.0, min(1.0, x))) for x in levels]
@@ -524,7 +626,9 @@ class AudioWorld:
             a.output = float(self.act_levels[i])
 
     def render_synth(self) -> np.ndarray:
-        pcm = self.synth.render(self.act_levels)
+        scale = float(self.duck.play_gain) if self.duck.enabled else 1.0
+        self.last_play_gain = scale
+        pcm = self.synth.render(self.act_levels, gain_scale=scale)
         self.last_synth = pcm
         self.last_synth_rms = float(np.sqrt(np.mean(np.square(pcm)))) if len(pcm) else 0.0
         return pcm
@@ -573,6 +677,16 @@ class AudioWorld:
                 return y
         return x
 
+    def prepare_mic(self, mic: np.ndarray) -> np.ndarray:
+        """High-pass + optional leakage cancel for acoustic closed loop."""
+        x = self.duck.highpass_filter(mic) if self.duck.enabled else np.asarray(
+            mic, dtype=np.float32
+        )
+        if self.duck.enabled and self.self_mix <= 0.0:
+            # acoustic path: cancel predicted speaker leakage before FFT
+            x = self.duck.cancel_leakage(x, self.last_synth)
+        return x
+
     def step(
         self,
         capture: AudioCapture,
@@ -581,7 +695,7 @@ class AudioWorld:
         render_motor: bool = False,
     ) -> list[float]:
         """
-        One block: optional motor render/play → capture → self-mix → FFT.
+        One block: optional motor render/play → capture → duck update → mix → FFT.
 
         Order matches developmental loop: produce, then hear (including self).
         """
@@ -591,8 +705,23 @@ class AudioWorld:
                 self.play(playback, pcm)
 
         t0 = time.perf_counter()
-        mic = capture.read()
+        mic_raw = capture.read()
         wall_ms = (time.perf_counter() - t0) * 1000.0
+
+        mic = self.prepare_mic(mic_raw)
+        mic_f = np.asarray(mic, dtype=np.float32)
+        self.last_mic_rms = (
+            float(np.sqrt(np.mean(np.square(mic_f)))) if len(mic_f) else 0.0
+        )
+        mic_peak = float(np.max(np.abs(mic_f))) if len(mic_f) else 0.0
+        # Update duck from this capture (affects *next* render_synth play_gain)
+        self.duck.update(
+            mic_rms=self.last_mic_rms,
+            synth_rms=self.last_synth_rms,
+            mic_peak=mic_peak,
+        )
+        self.last_play_gain = float(self.duck.play_gain)
+
         heard = self.mix_with_self(mic)
         return self.step_pcm(heard, block_ms=wall_ms)
 
@@ -606,6 +735,9 @@ class AudioWorld:
         w["peak"] = float(self.last_peak)
         w["synth_rms"] = float(self.last_synth_rms)
         w["pred_err"] = float(self.last_pred_err)
+        w["play_gain"] = float(self.last_play_gain)
+        w["mic_rms"] = float(self.last_mic_rms)
+        w["howl"] = float(self.duck.last_howl_score)
         return w
 
     def band_label(self, i: int) -> str:
@@ -614,9 +746,14 @@ class AudioWorld:
     def summary_line(self) -> str:
         hear = "".join("█" if v > 0.35 else ("░" if v > 0.08 else "·") for v in self.bands)
         act = "".join("█" if v > 0.35 else ("░" if v > 0.08 else "·") for v in self.act_levels)
+        duck = (
+            f" pg={self.last_play_gain:.2f} howl={self.duck.last_howl_score:.2f}"
+            if self.duck.enabled
+            else ""
+        )
         return (
             f"blk={self.blocks} rms={self.last_rms:.4f} synth={self.last_synth_rms:.4f} "
-            f"err={self.last_pred_err:.3f} cap_ms={self.last_block_ms:.1f} "
+            f"err={self.last_pred_err:.3f} cap_ms={self.last_block_ms:.1f}{duck} "
             f"H|{hear}| A|{act}|"
         )
 
@@ -729,15 +866,7 @@ class BabbleCoach:
 
         host_id = str(getattr(host, "id", "host"))
         token = self.action_token()
-        # Collect a few high-activation observation poles if any (optional state)
-        state_thoughts: list[Any] = []
-        try:
-            with mind._lock:
-                obs = list(mind._observations.values())
-            obs.sort(key=lambda t: float(getattr(t, "activation", 0.0)), reverse=True)
-            state_thoughts = obs[:4]
-        except Exception:  # noqa: BLE001
-            state_thoughts = []
+        state_thoughts = collect_audio_state_poles(host, world, top_k=6)
 
         # Scale reward to Mind's /50 path: pass r*50 so delta ≈ r
         action = mind.record_outcome(
@@ -752,7 +881,6 @@ class BabbleCoach:
         # Always stamp valence on the Action pole (empty state still learns motor)
         if action is not None:
             mind.note_valence(thought_id=action.id, delta=float(r))
-            # also content-key path if mapping missing
             try:
                 ck = mind.action_content_key("audio", token)
                 mind.note_valence(content_key=ck, delta=float(r) * 0.5)
@@ -783,6 +911,168 @@ def band_index_for_freq(
     ratio = math.log(freq_hz / f_min) / math.log(f_max / f_min)
     idx = int(math.floor(ratio * num_bands))
     return max(0, min(num_bands - 1, idx))
+
+
+def _ensure_meta_observation(
+    mind: Any,
+    host: Any,
+    *,
+    channel: str,
+    token: str,
+    label: str,
+    host_id: str,
+) -> Any:
+    """Stable meta Observation pole registered in Mind (for record_outcome state)."""
+    from symbioid.Core.Thought import Thought
+    from symbioid.Core.thought_layers import ThoughtLayer
+
+    ck = f"meta:audio:{channel}:{token}"
+    with mind._lock:
+        existing = mind._observations.get(ck)
+        if existing is not None:
+            return existing
+        oid = f"{host_id}:obs:meta:{mind._hash_key(ck)}"
+        thought = Thought(
+            id=oid,
+            label=label,
+            transient=False,
+            layer=ThoughtLayer.PATTERN,
+        )
+        mind._register(ck, thought, sensor_id=f"meta:{channel}", valence=0.05)
+    if host is not None and hasattr(host, "add_thought"):
+        if thought.id not in getattr(host, "thoughts", {}):
+            host.add_thought(thought)
+    return thought
+
+
+def collect_audio_state_poles(
+    host: Any,
+    world: AudioWorld,
+    *,
+    top_k: int = 6,
+) -> list[Any]:
+    """
+    Rich state poles for Mind.record_outcome:
+
+    1. Latest band Observations from top-energy sensors (Innerface last_obs)
+    2. Meta poles: peak band bucket, energy bucket, pred_err bucket, howl/duck
+    """
+    poles: list[Any] = []
+    seen: set[str] = set()
+
+    def _add(t: Any) -> None:
+        if t is None:
+            return
+        tid = getattr(t, "id", None)
+        if tid is None or tid in seen:
+            return
+        seen.add(tid)
+        poles.append(t)
+
+    # --- (1) top-k band Observations by current energy ---
+    sensors = list(getattr(host, "sensors", []) or [])
+    by_label = {str(getattr(s, "label", "") or ""): s for s in sensors}
+    ranked = sorted(
+        range(world.num_bands),
+        key=lambda i: float(world.bands[i]) if i < len(world.bands) else 0.0,
+        reverse=True,
+    )
+    inner = getattr(host, "innerface", None)
+    last_map = getattr(inner, "_last_obs_by_sensor", {}) if inner is not None else {}
+    for i in ranked[: max(1, top_k)]:
+        lab = f"band_{i:02d}"
+        sen = by_label.get(lab)
+        if sen is None:
+            continue
+        obs = last_map.get(sen.id)
+        _add(obs)
+
+    # Fallback: high-activation mind observations
+    mind = getattr(host, "mind", None)
+    if mind is not None and len(poles) < 2:
+        try:
+            with mind._lock:
+                obs_list = list(mind._observations.values())
+            obs_list.sort(
+                key=lambda t: float(getattr(t, "activation", 0.0)), reverse=True
+            )
+            for t in obs_list[:top_k]:
+                _add(t)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # --- (2) meta poles (always available, content-stable) ---
+    if mind is not None and getattr(mind, "enabled", True):
+        host_id = str(getattr(host, "id", "host"))
+        peak_i = (
+            int(max(range(len(world.bands)), key=lambda j: world.bands[j]))
+            if world.bands
+            else 0
+        )
+        energy = (
+            sum(world.bands) / max(1, len(world.bands)) if world.bands else 0.0
+        )
+        e_bucket = int(min(9, max(0, energy * 10)))
+        err_bucket = int(min(9, max(0, world.last_pred_err * 10)))
+        howl_bucket = int(min(9, max(0, world.duck.last_howl_score * 10)))
+        pg_bucket = int(min(9, max(0, world.last_play_gain * 10)))
+
+        _add(
+            _ensure_meta_observation(
+                mind,
+                host,
+                channel="peak",
+                token=f"b{peak_i:02d}",
+                label=f"hear_peak:{peak_i:02d}",
+                host_id=host_id,
+            )
+        )
+        _add(
+            _ensure_meta_observation(
+                mind,
+                host,
+                channel="energy",
+                token=f"e{e_bucket}",
+                label=f"hear_energy:{e_bucket}",
+                host_id=host_id,
+            )
+        )
+        _add(
+            _ensure_meta_observation(
+                mind,
+                host,
+                channel="err",
+                token=f"r{err_bucket}",
+                label=f"pred_err:{err_bucket}",
+                host_id=host_id,
+            )
+        )
+        if world.duck.enabled:
+            _add(
+                _ensure_meta_observation(
+                    mind,
+                    host,
+                    channel="howl",
+                    token=f"h{howl_bucket}_g{pg_bucket}",
+                    label=f"howl:{howl_bucket}/pg:{pg_bucket}",
+                    host_id=host_id,
+                )
+            )
+        # act peak meta (motor context)
+        if world.act_levels:
+            ap = int(max(range(len(world.act_levels)), key=lambda j: world.act_levels[j]))
+            _add(
+                _ensure_meta_observation(
+                    mind,
+                    host,
+                    channel="act_peak",
+                    token=f"a{ap:02d}",
+                    label=f"act_peak:{ap:02d}",
+                    host_id=host_id,
+                )
+            )
+
+    return poles
 
 
 def compare_contingent_vs_noncontingent(

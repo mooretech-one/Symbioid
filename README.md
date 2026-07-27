@@ -4,7 +4,7 @@ Personal **experimentation sandbox** for Antelligence / Symbioid architecture id
 
 **Architecture MVP (v0.0.39):** Thought layers **Structure / Pattern / Feeling** (Simon + SevenSphere map); **Mind ≠ Thought** enforced; core **`act_from_graph` / `think_tick`**; nested **`Energy`** budgets (`energy_enforced`). See vault [[Maps/symbioid-thinking]].
 
-**Audio demo Phases 0–5 (v0.0.41):** mic/synthetic → **FFT20** → 20 Sensors + 20 Actuators → band synth → speakers; digital self-mix closed loop; contingent IM valence. See `audio_demo.py` and `symbioid/world/audio.py`.
+**Audio demo Phases 0–5 + polish (v0.0.42):** mic/synthetic → **FFT20** → 20 Sensors + 20 Actuators → band synth → speakers; digital self-mix; **acoustic howl ducking**; contingent IM with **rich state poles**; optional `build_demos.py audio --dir`. See `audio_demo.py` and `symbioid/world/audio.py`.
 
 | | |
 |--|--|
@@ -73,9 +73,14 @@ PYTHONPATH=. .venv/bin/python audio_demo.py --closed --headless --frames 30 --no
 PYTHONPATH=. .venv/bin/python audio_demo.py --contingent --headless --frames 40 --no-play --no-memory --seed 1
 PYTHONPATH=. .venv/bin/python audio_demo.py --noncontingent --headless --frames 40 --no-play --no-memory --seed 1
 
-# Live mic + speakers (GUI default closed+play)
+# Live mic + speakers (GUI default closed+play; ducking auto-on)
 PYTHONPATH=. .venv/bin/python audio_demo.py --mic --play
+PYTHONPATH=. .venv/bin/python audio_demo.py --mic --play --duck   # force duck
 PYTHONPATH=. .venv/bin/python audio_demo.py --list-devices
+
+# Optional PyInstaller onedir binary
+.venv/bin/python build_demos.py audio --dir
+# → dist/SymbioidAudio/SymbioidAudio
 ```
 
 | Setting | Value |
@@ -86,7 +91,9 @@ PYTHONPATH=. .venv/bin/python audio_demo.py --list-devices
 | Playback | `aplay` (`--play`) or null (`--no-play`) |
 | Motor | coach writes `Actuator.output` (not primary `request_fire`) |
 | Closed loop | digital `self_mix * synth + mic_gain * mic` before FFT |
-| Success | sense stable · audible babble · contingent R > non-contingent |
+| Howl guard | `AcousticDucker`: high-pass, leakage cancel, adaptive `play_gain` |
+| State poles | top band Observations + meta peak/energy/err/howl for `record_outcome` |
+| Success | sense stable · babble · contingent R > non-contingent · no runaway howl |
 
 API (`symbioid.persist`): `export_memory(host, mode="lean"|"full")`, `save_memory`, `try_load_into`.
 

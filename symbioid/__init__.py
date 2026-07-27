@@ -120,4 +120,4 @@ __all__ = [
     "default_memory_path",
 ]
 
-__version__ = "0.0.41"
+__version__ = "0.0.42"

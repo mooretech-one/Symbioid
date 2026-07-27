@@ -112,10 +112,19 @@ def build_one(demo_key: str, *, onefile: bool, console: bool, clean: bool) -> Pa
         "--hidden-import=symbioid.world.paddle_learn",
         "--hidden-import=symbioid.world.tetris",
         "--hidden-import=symbioid.world.tetris_learn",
+        "--hidden-import=symbioid.world.audio",
         "--hidden-import=symbioid.Core",
         "--hidden-import=symbioid.Core.Symbioid",
         "--hidden-import=symbioid.core",
+        "--hidden-import=numpy",
     ]
+    if demo_key == "audio":
+        args.extend(
+            [
+                "--collect-submodules=numpy",
+                "--collect-binaries=numpy",
+            ]
+        )
     if onefile:
         args.append("--onefile")
     else:
@@ -156,13 +165,13 @@ def build_one(demo_key: str, *, onefile: bool, console: bool, clean: bool) -> Pa
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build Symbioid Pong/Tetris single-file executables"
+        description="Build Symbioid Pong/Tetris/Audio executables"
     )
     parser.add_argument(
         "demos",
         nargs="*",
         choices=sorted(DEMOS.keys()),
-        help="Demos to build (default: both pong and tetris)",
+        help="Demos to build (default: pong + tetris; pass 'audio' for SymbioidAudio)",
     )
     parser.add_argument(
         "--dir",
@@ -180,7 +189,8 @@ def main() -> None:
         help="Skip PyInstaller --clean",
     )
     args = parser.parse_args()
-    targets = list(args.demos) if args.demos else list(DEMOS.keys())
+    # Default stays pong+tetris (fast path); audio is opt-in (needs numpy collect)
+    targets = list(args.demos) if args.demos else ["pong", "tetris"]
 
     _check_deps()
     print(f"Platform: {_platform_tag()}")

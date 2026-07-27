@@ -127,6 +127,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Mic gain before mix (default 1; closed modes often keep 1 or 0 for pure self)",
     )
+    p.add_argument(
+        "--duck",
+        action="store_true",
+        help="Enable acoustic howl ducking (auto-on with --mic --play)",
+    )
+    p.add_argument(
+        "--no-duck",
+        action="store_true",
+        help="Disable ducking even for live mic+play",
+    )
+    p.add_argument(
+        "--leakage",
+        type=float,
+        default=None,
+        metavar="G",
+        help="Leakage cancel gain for duck path (default 0.35 when ducking)",
+    )
     return p.parse_args(argv)
 
 
@@ -294,7 +311,7 @@ def run_headless(
     target = frames if frames > 0 else 60
     print(
         f"[audio] headless mode={loop_mode} cap={backend} play={play_name} "
-        f"self_mix={world.self_mix} blocks={target}",
+        f"self_mix={world.self_mix} duck={world.duck.enabled} blocks={target}",
         flush=True,
     )
     for tick in range(1, target + 1):
@@ -410,6 +427,15 @@ def main(argv: list[str] | None = None) -> int:
     elif loop_mode in ("closed", "contingent", "noncontingent") and not args.mic:
         # pure digital self-hearing for offline babble
         world.mic_gain = 0.0
+
+    # Acoustic howl guard: default on for live mic + playback
+    want_play = bool(args.play) or (motor and not args.headless and not args.no_play)
+    if args.no_duck:
+        world.duck.enabled = False
+    elif args.duck or (args.mic and want_play):
+        world.duck.enabled = True
+    if args.leakage is not None:
+        world.duck.leakage_cancel = float(args.leakage)
 
     synth_mode = "tone" if args.tone is not None else "burst"
     if motor and not args.mic and args.tone is None:
