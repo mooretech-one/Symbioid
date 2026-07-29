@@ -109,6 +109,11 @@ class Mind(System):
     forget_activation_eps: float = 1e-6
     forget_transient_only: bool = False  # when cold-forget on: any unprotected Thought
     forget_max_per_pass: int = 64
+    # Dynamics mode (Mode B spectral-primary):
+    #   graph    — Link spread + Hebb only; no FFT mix
+    #   hybrid   — graph pulse + optional FFT residual (default)
+    #   spectral — no Link spread/Hebb; FFT mix is the only associative dynamics
+    dynamics_mode: str = "hybrid"
     # Spectral substrate (Phase 2–3 defaults ON for mix + holonomic)
     spectral_mix_enabled: bool = True  # FFT residual mix after innerface/global pulse
     holonomic_store_enabled: bool = True  # Phase 3: interference memory on admit
@@ -196,13 +201,74 @@ class Mind(System):
             self.spectral_bin_gains = np.ones(n_bins, dtype=np.float32)
         return self.spectral_bank
 
-    def enable_spectral_demo(self, *, phase_hebb: bool = True) -> None:
-        """Convenience for audio ``--spectral``: mix + holonomic + optional phase Hebb."""
+    DYNAMICS_MODES = frozenset({"graph", "hybrid", "spectral"})
+
+    def normalize_dynamics_mode(self, mode: Optional[str] = None) -> str:
+        m = str(mode if mode is not None else self.dynamics_mode or "hybrid").strip().lower()
+        if m not in self.DYNAMICS_MODES:
+            m = "hybrid"
+        return m
+
+    def set_dynamics_mode(self, mode: str) -> str:
+        """
+        Set graph | hybrid | spectral dynamics.
+
+        spectral (Mode B): forces mix on, disables Link spread/Hebb in pulse.
+        graph: forces mix off.
+        hybrid: restores residual-mix flag True (holonomic unchanged).
+        """
+        m = self.normalize_dynamics_mode(mode)
+        self.dynamics_mode = m
+        if m == "spectral":
+            self.spectral_mix_enabled = True
+            self.ensure_spectral_bank()
+            if self.holonomic_store_enabled:
+                self.ensure_holonomic_store()
+        elif m == "graph":
+            self.spectral_mix_enabled = False
+        else:  # hybrid
+            self.spectral_mix_enabled = True
+        return m
+
+    def enable_spectral_demo(
+        self,
+        *,
+        phase_hebb: bool = True,
+        primary: bool = False,
+    ) -> None:
+        """
+        Convenience for audio ``--spectral``: mix + holonomic + optional phase Hebb.
+
+        primary=True → Mode B spectral-primary (no Link spread/Hebb).
+        """
         self.spectral_mix_enabled = True
         self.holonomic_store_enabled = True
         self.hebb_phase_enabled = bool(phase_hebb)
         self.ensure_spectral_bank()
         self.ensure_holonomic_store()
+        if primary:
+            self.set_dynamics_mode("spectral")
+        else:
+            # hybrid residual unless already spectral
+            if self.normalize_dynamics_mode() != "spectral":
+                self.dynamics_mode = "hybrid"
+
+    def enable_spectral_primary(self, *, phase_hebb: bool = True) -> None:
+        """Mode B: FFT mix (+ holonomic) is the only pulse-time association."""
+        self.enable_spectral_demo(phase_hebb=phase_hebb, primary=True)
+
+    def graph_spread_enabled(self) -> bool:
+        """True when one-hop Link spread + Hebb should run in pulse_partition."""
+        return self.normalize_dynamics_mode() in ("graph", "hybrid")
+
+    def spectral_mix_wanted(self) -> bool:
+        """True when FFT residual mix should run after innerface/global pulse."""
+        mode = self.normalize_dynamics_mode()
+        if mode == "spectral":
+            return True
+        if mode == "graph":
+            return False
+        return bool(self.spectral_mix_enabled)
 
     def ensure_holonomic_store(self) -> Any:
         """Lazy-create HolonomicStore (Phase 3)."""

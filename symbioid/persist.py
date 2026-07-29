@@ -120,6 +120,7 @@ def _export_mind(mind: Any) -> dict[str, Any]:
             "habituate_after": int(getattr(mind, "habituate_after", 2)),
             "hebb_enabled": bool(getattr(mind, "hebb_enabled", True)),
             "dynamics_enabled": bool(getattr(mind, "dynamics_enabled", True)),
+            "dynamics_mode": str(getattr(mind, "dynamics_mode", "hybrid") or "hybrid"),
             "spectral_mix_enabled": bool(getattr(mind, "spectral_mix_enabled", True)),
             "holonomic_store_enabled": bool(
                 getattr(mind, "holonomic_store_enabled", True)
@@ -433,6 +434,11 @@ def apply_memory(
             mind.hebb_enabled = bool(md["hebb_enabled"])
         if "dynamics_enabled" in md:
             mind.dynamics_enabled = bool(md["dynamics_enabled"])
+        if "dynamics_mode" in md and hasattr(mind, "set_dynamics_mode"):
+            try:
+                mind.set_dynamics_mode(str(md["dynamics_mode"]))
+            except Exception:  # noqa: BLE001
+                mind.dynamics_mode = "hybrid"
         if "spectral_mix_enabled" in md:
             mind.spectral_mix_enabled = bool(md["spectral_mix_enabled"])
         if "holonomic_store_enabled" in md:

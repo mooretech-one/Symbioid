@@ -148,7 +148,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--spectral",
         action="store_true",
-        help="Phase 5: enable FFT residual mix + holonomic envelope + phase Hebb",
+        help="Phase 5: hybrid residual mix + holonomic envelope + phase Hebb",
+    )
+    p.add_argument(
+        "--spectral-primary",
+        action="store_true",
+        help="Mode B: FFT mix only (no Link spread/Hebb); implies --spectral",
     )
     p.add_argument(
         "--no-spectral",
@@ -178,15 +183,19 @@ def build_symbioid(
     *,
     with_actuators: bool,
     spectral: bool = False,
+    spectral_primary: bool = False,
 ) -> Symbioid:
     s = Symbioid(id=HOST_ID, label="audio-fft20")
     s.interface.continuous_inputs = False
     s.outerface.wait_for_feedback = False
 
-    if spectral:
-        s.mind.enable_spectral_demo(phase_hebb=True)
+    if spectral_primary or spectral:
+        s.mind.enable_spectral_demo(
+            phase_hebb=True, primary=bool(spectral_primary)
+        )
     else:
         # Explicit off so demos stay predictable unless --spectral
+        s.mind.set_dynamics_mode("graph")
         s.mind.spectral_mix_enabled = False
         s.mind.holonomic_store_enabled = False
         s.mind.hebb_phase_enabled = False
@@ -500,8 +509,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"playback open failed ({e}); falling back to null", file=sys.stderr)
         playback, play_name = open_playback(backend="null")
 
-    want_spectral = bool(args.spectral) and not bool(args.no_spectral)
-    s = build_symbioid(world, with_actuators=motor, spectral=want_spectral)
+    want_primary = bool(args.spectral_primary) and not bool(args.no_spectral)
+    want_spectral = (bool(args.spectral) or want_primary) and not bool(
+        args.no_spectral
+    )
+    s = build_symbioid(
+        world,
+        with_actuators=motor,
+        spectral=want_spectral,
+        spectral_primary=want_primary,
+    )
 
     coach: BabbleCoach | None = None
     if motor:

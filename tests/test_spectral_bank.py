@@ -27,9 +27,9 @@ from symbioid import (
 from symbioid.persist import apply_memory
 
 
-def test_version_at_least_046():
+def test_version_at_least_047():
     parts = [int(x) for x in __version__.split(".")]
-    assert parts >= [0, 0, 46]
+    assert parts >= [0, 0, 47]
 
 
 def test_ceil_pow2():
@@ -369,3 +369,80 @@ def test_enable_spectral_demo_helper():
     assert m.hebb_phase_enabled is True
     assert m.spectral_bank is not None
     assert m.holonomic_store is not None
+    assert m.dynamics_mode == "hybrid"
+
+
+# --- Mode B: spectral-primary dynamics ---------------------------------------
+
+
+def test_dynamics_mode_default_hybrid():
+    m = Mind()
+    assert m.dynamics_mode == "hybrid"
+    assert m.graph_spread_enabled() is True
+    assert m.spectral_mix_wanted() is True
+
+
+def test_mode_b_spectral_skips_link_spread():
+    """With dynamics_mode=spectral, hot A does not recruit B via Link."""
+    from symbioid import Link
+
+    host = Symbioid()
+    host.mind.enable_spectral_primary(phase_hebb=False)
+    assert host.mind.dynamics_mode == "spectral"
+    assert host.mind.graph_spread_enabled() is False
+
+    a = Thought(id="sa", activation=3.0, threshold=0.5, activation_max=5.0)
+    b = Thought(id="sb", activation=0.0, threshold=0.5, activation_max=5.0)
+    lt = Thought(id="slt", label="Follows", dynamics_enabled=False, threshold=10.0)
+    host.add_thought(a)
+    host.add_thought(b)
+    host.add_thought(lt)
+    link = Link(id="SL1", source=a, link_type=lt, target=b, weight=4.0)
+    host.add_thought(link)
+    host.mark_hot(a)
+    # Bind only A so mix does not dump energy into B from shared bank residual
+    bank = host.mind.ensure_spectral_bank()
+    bank.bind("sa", prefer_slot=0)
+    # Disable mix residual for this check (still spectral mode skips spread)
+    host.mind.spectral_mix_gain = 0.0
+    # spectral mode forces gain back to 0.15 if zero — set gain very small instead
+    host.mind.spectral_mix_gain = 1e-9
+    b0 = float(b.activation)
+    stats = host.pulse_tick()
+    assert stats.get("dynamics_mode") == "spectral"
+    assert stats.get("graph_spread") is False
+    assert stats.get("spread", 0) == 0
+    # B must not rise via Link spread (tiny mix gain + B unbound → ~0 change)
+    assert float(b.activation) <= b0 + 0.05
+
+
+def test_mode_b_graph_has_no_spectral_mix():
+    host = Symbioid()
+    host.mind.set_dynamics_mode("graph")
+    t = Thought(id="g1", activation=1.5, threshold=0.5)
+    host.add_thought(t)
+    host.mark_hot(t)
+    stats = host.pulse_tick()
+    assert stats.get("dynamics_mode") == "graph"
+    assert "spectral" not in stats
+
+
+def test_mode_b_spectral_mix_runs():
+    host = Symbioid()
+    host.mind.enable_spectral_primary(phase_hebb=False)
+    t = Thought(id="sp1", activation=1.5, threshold=0.5)
+    host.add_thought(t)
+    host.mark_hot(t)
+    stats = host.pulse_tick()
+    assert stats.get("dynamics_mode") == "spectral"
+    assert "spectral" in stats
+    assert stats["spectral"].get("skipped") is False
+
+
+def test_enable_spectral_primary_helper():
+    m = Mind()
+    m.enable_spectral_primary(phase_hebb=True)
+    assert m.dynamics_mode == "spectral"
+    assert m.spectral_mix_enabled is True
+    assert m.holonomic_store_enabled is True
+    assert m.hebb_phase_enabled is True

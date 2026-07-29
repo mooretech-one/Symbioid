@@ -1111,12 +1111,14 @@ def compare_contingent_vs_noncontingent(
     blocks: int = 40,
     seed: int = 0,
     spectral: bool = False,
+    spectral_primary: bool = False,
 ) -> dict[str, float]:
     """
     Offline Phase 4 check: same motor seed; contingent should accumulate
     more total reward when self-mix makes hear≈play.
 
     spectral=True enables Mind spectral mix + holonomic + phase Hebb (Phase 5).
+    spectral_primary=True uses Mode B (FFT mix only, no Link spread).
     """
     from symbioid import Actuator, Sensor, Symbioid
 
@@ -1129,10 +1131,13 @@ def compare_contingent_vs_noncontingent(
         host = Symbioid(id=f"cmp-{mode}", label=mode)
         host.interface.continuous_inputs = False
         host.outerface.wait_for_feedback = False
-        if spectral:
-            host.mind.enable_spectral_demo(phase_hebb=True)
+        if spectral or spectral_primary:
+            host.mind.enable_spectral_demo(
+                phase_hebb=True, primary=bool(spectral_primary)
+            )
         else:
             # keep compare stable for legacy tests
+            host.mind.set_dynamics_mode("graph")
             host.mind.spectral_mix_enabled = False
             host.mind.holonomic_store_enabled = False
         for i in range(NUM_BANDS):

@@ -6,7 +6,7 @@ Personal **experimentation sandbox** for Antelligence / Symbioid architecture id
 
 **Audio demo Phases 0–5 + polish (v0.0.42):** mic/synthetic → **FFT20** → 20 Sensors + 20 Actuators → band synth → speakers; digital self-mix; **acoustic howl ducking**; contingent IM with **rich state poles**; optional `build_demos.py audio --dir`. See `audio_demo.py` and `symbioid/world/audio.py`.
 
-**Spectral substrate Phase 0–5 (v0.0.46):** SpectralBank + FFT mix + HolonomicStore + **phase-locked Hebb** (default off) + audio **`--spectral`**. Plan: vault `Work-Log/2026-07-29-research-loop-symbioid-fft-attention.md`.
+**Spectral substrate Phase 0–5 + Mode B (v0.0.47):** SpectralBank + FFT mix + HolonomicStore + phase Hebb + **`dynamics_mode`** (`graph` | `hybrid` | **`spectral`** primary). Audio: `--spectral` / `--spectral-primary`.
 
 | | |
 |--|--|
@@ -77,6 +77,8 @@ PYTHONPATH=. .venv/bin/python audio_demo.py --noncontingent --headless --frames 
 
 # Phase 5 — spectral substrate (FFT mix + holonomic + phase Hebb)
 PYTHONPATH=. .venv/bin/python audio_demo.py --contingent --spectral --headless --frames 40 --no-play --no-memory --seed 1
+# Mode B — spectral-primary (no Link spread)
+PYTHONPATH=. .venv/bin/python audio_demo.py --contingent --spectral-primary --headless --frames 40 --no-play --no-memory --seed 1
 
 # Live mic + speakers (GUI default closed+play; ducking auto-on)
 PYTHONPATH=. .venv/bin/python audio_demo.py --mic --play
@@ -108,6 +110,7 @@ Frequency-domain helpers for FFT mix / future holonomic memory (vault `Work-Log/
 
 | Mind flag | Default | Phase | Role |
 |-----------|---------|-------|------|
+| `dynamics_mode` | **`hybrid`** | B | `graph` = Links only; `hybrid` = Links + mix; **`spectral`** = mix only (Mode B) |
 | `spectral_mix_enabled` | **True** | 2 | FFT residual mix after `innerface` / `global` pulse |
 | `spectral_mix_gain` | `0.15` | 2 | Residual add scale (`0` → skip mix, bit-identical) |
 | `spectral_soft_threshold` | `0.05` | 2 | Zero bins below thr × max\|S\| |
@@ -120,18 +123,21 @@ Frequency-domain helpers for FFT mix / future holonomic memory (vault `Work-Log/
 | `hebb_phase_tolerance` | `0.5` | 4 | Radians; within → boost Hebb Δ |
 | `spectral_filter_lr` | `0.02` | 4 | Outcome nudge on mix bin gains |
 
-**Phase 0–5 shipped (v0.0.46):**
+**Phase 0–5 + Mode B shipped (v0.0.47):**
 
 - `SpectralBank` — bind / pack / unpack / fft / ifft / `apply_mix_filter` / phase sync
 - `Mind.spectral_mix_step` — residual mix after `innerface`/`global` pulse
 - `HolonomicStore` — interference write/read; lean persist
 - Phase-locked Hebb + spectral bin-gain nudge from `record_outcome`
-- Audio: `--spectral` enables mix + holonomic + phase Hebb; envelope write/probe in coach
+- **Mode B** `dynamics_mode="spectral"`: decay/fire still run; **no** Link spread/Hebb; FFT mix is the associative path (`enable_spectral_primary()`)
+- Audio: `--spectral` (hybrid) · `--spectral-primary` (Mode B)
 
 ```bash
 .venv/bin/python -m pytest tests/test_spectral_bank.py tests/test_audio_phase2.py -q
-# Spectral audio demo
+# Hybrid residual
 PYTHONPATH=. .venv/bin/python audio_demo.py --contingent --spectral --headless --frames 40 --no-play --no-memory
+# Mode B spectral-primary
+PYTHONPATH=. .venv/bin/python audio_demo.py --contingent --spectral-primary --headless --frames 40 --no-play --no-memory
 ```
 
 Audio **FFT20** remains the Interface sense path; the spectral bank is the cognitive mixer/store on Mind.

@@ -400,7 +400,12 @@ class Symbioid(System):
         energy_budget: Optional[float] = None,
     ) -> dict:
         """
-        Masked spiking tick: decay → fire → one-hop spread → Hebb.
+        Masked spiking tick: decay → fire → (optional) one-hop spread → Hebb.
+
+        Mind.dynamics_mode:
+          graph    — spread + Hebb; no FFT mix
+          hybrid   — spread + Hebb + optional FFT residual (default)
+          spectral — no Link spread/Hebb; FFT mix is the associative path (Mode B)
 
         membership:
           None  — all Thoughts (legacy pulse_tick)
@@ -433,7 +438,19 @@ class Symbioid(System):
                 "energy_used": 0.0,
                 "energy_left": 0.0,
                 "energy_capped": 0,
+                "dynamics_mode": getattr(mind, "dynamics_mode", "hybrid"),
             }
+
+        dyn_mode = (
+            mind.normalize_dynamics_mode()
+            if mind is not None and hasattr(mind, "normalize_dynamics_mode")
+            else "hybrid"
+        )
+        graph_spread = (
+            mind.graph_spread_enabled()
+            if mind is not None and hasattr(mind, "graph_spread_enabled")
+            else True
+        )
 
         gain = float(getattr(mind, "propagate_gain", 0.6) if mind else 0.6)
         hebb_on = (
@@ -441,6 +458,9 @@ class Symbioid(System):
             if hebb is not None
             else bool(getattr(mind, "hebb_enabled", True) if mind else True)
         )
+        # Mode B spectral: no Link Hebb even if hebb_enabled
+        if not graph_spread:
+            hebb_on = False
         hebb_lr = float(getattr(mind, "hebb_lr", 0.08) if mind else 0.08)
         co_scale = float(getattr(mind, "hebb_co_fire_scale", 1.0) if mind else 1.0)
         pre_post = float(getattr(mind, "hebb_pre_post_scale", 0.35) if mind else 0.35)
@@ -522,51 +542,52 @@ class Symbioid(System):
 
             firer_ids = {f.id for f in firers}
 
-            # 3) One-hop spread + Hebb via adjacency index (not full graph scan)
+            # 3) One-hop spread + Hebb (skipped in dynamics_mode=spectral / Mode B)
             spread = 0
             hebb_n = 0
-            for firer in firers:
-                strength = max(float(firer.threshold), float(firer.activation))
-                for link in self._outgoing_links_unlocked(
-                    firer.id, synapse_filter=synapse_filter
-                ):
-                    tgt = link.target
-                    if tgt is None:
-                        continue
-                    w = float(getattr(link, "weight", 1.0))
-                    amt = strength * w * gain
-                    if amt != 0:
-                        if energy_left < spread_cost:
-                            energy_capped += 1
-                        else:
-                            energy_left -= spread_cost
-                            tgt.receive(amt)
-                            still_hot.add(tgt.id)
-                            self._register_in_store_unlocked(tgt)
-                            # Targets that receive become globally hot
-                            self._hot_ids.add(tgt.id)
-                            spread += 1
-
-                    if not hebb_on or not hasattr(link, "adjust_weight"):
-                        continue
-                    # Phase 5: under membership, non-Port Hebb only if target in set
-                    if (
-                        membership is not None
-                        and cross_only
-                        and tgt.id not in eligible  # type: ignore[operator]
+            if graph_spread:
+                for firer in firers:
+                    strength = max(float(firer.threshold), float(firer.activation))
+                    for link in self._outgoing_links_unlocked(
+                        firer.id, synapse_filter=synapse_filter
                     ):
-                        continue
-                    if tgt.id in firer_ids:
-                        delta = hebb_lr * co_scale
-                    elif float(tgt.activation) >= 0.5 * float(tgt.threshold):
-                        delta = hebb_lr * pre_post
-                    else:
-                        continue
-                    # Phase 4: phase-locked Hebb scale (no-op when disabled)
-                    if mind is not None and hasattr(mind, "phase_hebb_scale"):
-                        delta *= float(mind.phase_hebb_scale(firer, tgt))
-                    link.adjust_weight(delta, w_min=w_min, w_max=w_max)
-                    hebb_n += 1
+                        tgt = link.target
+                        if tgt is None:
+                            continue
+                        w = float(getattr(link, "weight", 1.0))
+                        amt = strength * w * gain
+                        if amt != 0:
+                            if energy_left < spread_cost:
+                                energy_capped += 1
+                            else:
+                                energy_left -= spread_cost
+                                tgt.receive(amt)
+                                still_hot.add(tgt.id)
+                                self._register_in_store_unlocked(tgt)
+                                # Targets that receive become globally hot
+                                self._hot_ids.add(tgt.id)
+                                spread += 1
+
+                        if not hebb_on or not hasattr(link, "adjust_weight"):
+                            continue
+                        # Phase 5: under membership, non-Port Hebb only if target in set
+                        if (
+                            membership is not None
+                            and cross_only
+                            and tgt.id not in eligible  # type: ignore[operator]
+                        ):
+                            continue
+                        if tgt.id in firer_ids:
+                            delta = hebb_lr * co_scale
+                        elif float(tgt.activation) >= 0.5 * float(tgt.threshold):
+                            delta = hebb_lr * pre_post
+                        else:
+                            continue
+                        # Phase 4: phase-locked Hebb scale (no-op when disabled)
+                        if mind is not None and hasattr(mind, "phase_hebb_scale"):
+                            delta *= float(mind.phase_hebb_scale(firer, tgt))
+                        link.adjust_weight(delta, w_min=w_min, w_max=w_max)
+                        hebb_n += 1
 
             # Hot set: retain non-eligible hot ids; update eligible from still_hot
             if membership is None:
@@ -606,14 +627,25 @@ class Symbioid(System):
             "energy_used": energy_used,
             "energy_left": energy_rem,
             "energy_capped": energy_capped,
+            "dynamics_mode": dyn_mode,
+            "graph_spread": bool(graph_spread),
         }
-        # Phase 2: FNet-shaped residual mix once after Innerface/global pulse
-        # (skip Interface/Outerface partitions to avoid triple-mix in hybrid mode).
-        if mind is not None and getattr(mind, "spectral_mix_enabled", False):
+        # FFT residual mix: hybrid when enabled; spectral Mode B always
+        want_mix = (
+            mind.spectral_mix_wanted()
+            if mind is not None and hasattr(mind, "spectral_mix_wanted")
+            else bool(getattr(mind, "spectral_mix_enabled", False) if mind else False)
+        )
+        if mind is not None and want_mix:
             if engine_name in ("innerface", "global"):
                 cands = list(self._hot_ids)
                 if membership is not None:
                     cands = list(set(cands) | set(membership))
+                # Mode B: ensure mix is not soft-disabled by zero gain
+                if dyn_mode == "spectral" and float(
+                    getattr(mind, "spectral_mix_gain", 0.0) or 0.0
+                ) == 0.0:
+                    mind.spectral_mix_gain = 0.15
                 mix = mind.spectral_mix_step(self, candidate_ids=cands or None)
                 stats["spectral"] = mix
         return stats
