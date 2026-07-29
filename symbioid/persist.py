@@ -108,6 +108,10 @@ def _export_mind(mind: Any) -> dict[str, Any]:
             }
             for ck, t in mind._actions.items()
         }
+        holo = None
+        store = getattr(mind, "holonomic_store", None)
+        if store is not None and hasattr(store, "to_serializable"):
+            holo = store.to_serializable()
         return {
             "recognition_enabled": bool(getattr(mind, "recognition_enabled", True)),
             "forget_cold_enabled": bool(getattr(mind, "forget_cold_enabled", True)),
@@ -116,12 +120,17 @@ def _export_mind(mind: Any) -> dict[str, Any]:
             "habituate_after": int(getattr(mind, "habituate_after", 2)),
             "hebb_enabled": bool(getattr(mind, "hebb_enabled", True)),
             "dynamics_enabled": bool(getattr(mind, "dynamics_enabled", True)),
+            "spectral_mix_enabled": bool(getattr(mind, "spectral_mix_enabled", True)),
+            "holonomic_store_enabled": bool(
+                getattr(mind, "holonomic_store_enabled", True)
+            ),
             "observations": observations,
             "actions": actions,
             "valence": {k: float(v) for k, v in mind._valence.items()},
             "thought_to_key": dict(mind._thought_to_key),
             "follows": dict(mind._follows),
             "integrates": dict(mind._integrates),
+            "holonomic": holo,
             "stats": {
                 "admits_mint": int(mind.admits_mint),
                 "admits_reuse": int(mind.admits_reuse),
@@ -132,6 +141,8 @@ def _export_mind(mind: Any) -> dict[str, Any]:
                 "outcomes_recorded": int(mind.outcomes_recorded),
                 "hebb_updates": int(mind.hebb_updates),
                 "forgets_cold": int(mind.forgets_cold),
+                "holonomic_writes": int(getattr(mind, "holonomic_writes", 0)),
+                "holonomic_reads": int(getattr(mind, "holonomic_reads", 0)),
             },
         }
 
@@ -422,6 +433,10 @@ def apply_memory(
             mind.hebb_enabled = bool(md["hebb_enabled"])
         if "dynamics_enabled" in md:
             mind.dynamics_enabled = bool(md["dynamics_enabled"])
+        if "spectral_mix_enabled" in md:
+            mind.spectral_mix_enabled = bool(md["spectral_mix_enabled"])
+        if "holonomic_store_enabled" in md:
+            mind.holonomic_store_enabled = bool(md["holonomic_store_enabled"])
 
         mind._observations.clear()
         mind._actions.clear()
@@ -489,9 +504,18 @@ def apply_memory(
             "outcomes_recorded",
             "hebb_updates",
             "forgets_cold",
+            "holonomic_writes",
+            "holonomic_reads",
         ):
             if attr in stats:
                 setattr(mind, attr, int(stats[attr]))
+
+        # Phase 3: restore interference buffer if present
+        holo = md.get("holonomic")
+        if holo and isinstance(holo, dict):
+            from symbioid.Core.spectral import HolonomicStore
+
+            mind.holonomic_store = HolonomicStore.from_serializable(holo)
 
 
 def save_memory(

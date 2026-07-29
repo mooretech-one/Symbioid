@@ -868,6 +868,37 @@ class BabbleCoach:
         token = self.action_token()
         state_thoughts = collect_audio_state_poles(host, world, top_k=6)
 
+        # Phase 5 spectral: imprint / probe band envelope in holonomic store
+        spectral_bonus = 0.0
+        if getattr(mind, "holonomic_store_enabled", False):
+            try:
+                import numpy as np
+
+                cap = int(getattr(mind, "holonomic_capacity", 64) or 64)
+                vec = np.zeros(cap, dtype=np.float32)
+                bands = list(getattr(world, "bands", []) or [])
+                n = min(len(bands), cap)
+                if n > 0:
+                    vec[:n] = np.asarray(bands[:n], dtype=np.float32)
+                    store = mind.ensure_holonomic_store()
+                    # write envelope every step (strength scales with reward polarity)
+                    strength = max(0.15, abs(float(r))) if r != 0 else 0.1
+                    store.write(vec, strength=strength)
+                    mind.holonomic_writes += 1
+                    if self.mode == "contingent":
+                        score = float(store.score_probe(vec))
+                        spectral_bonus = 0.12 * score
+                        if spectral_bonus != 0.0:
+                            mind.note_valence(
+                                channel="board",
+                                delta=spectral_bonus,
+                                recent=6,
+                            )
+                            r = float(r) + spectral_bonus
+                            self.last_reward = float(r)
+            except Exception:  # noqa: BLE001
+                pass
+
         # Scale reward to Mind's /50 path: pass r*50 so delta ≈ r
         action = mind.record_outcome(
             state_thoughts,
@@ -1079,10 +1110,13 @@ def compare_contingent_vs_noncontingent(
     *,
     blocks: int = 40,
     seed: int = 0,
+    spectral: bool = False,
 ) -> dict[str, float]:
     """
     Offline Phase 4 check: same motor seed; contingent should accumulate
     more total reward when self-mix makes hear≈play.
+
+    spectral=True enables Mind spectral mix + holonomic + phase Hebb (Phase 5).
     """
     from symbioid import Actuator, Sensor, Symbioid
 
@@ -1095,6 +1129,12 @@ def compare_contingent_vs_noncontingent(
         host = Symbioid(id=f"cmp-{mode}", label=mode)
         host.interface.continuous_inputs = False
         host.outerface.wait_for_feedback = False
+        if spectral:
+            host.mind.enable_spectral_demo(phase_hebb=True)
+        else:
+            # keep compare stable for legacy tests
+            host.mind.spectral_mix_enabled = False
+            host.mind.holonomic_store_enabled = False
         for i in range(NUM_BANDS):
             host.add_sensor(
                 Sensor(id=f"cmp-{mode}:sen:band_{i:02d}", label=f"band_{i:02d}"),
@@ -1109,6 +1149,8 @@ def compare_contingent_vs_noncontingent(
             coach.apply_to_host(host)
             world.step(cap, render_motor=True)
             coach.reinforce(host, world)
+            if spectral and getattr(host.mind, "dynamics_enabled", True):
+                host.pulse_tick()
         cap.close()
         return float(coach.total_reward)
 

@@ -1353,7 +1353,11 @@ class Innerface(SpikingEngine):
                 self.co_fire_consolidations += 1
         return n
     def post_ports(self) -> None:
-        """Co-fire consolidators + sparse depth-fold/prune."""
+        """Co-fire consolidators + sparse depth-fold/prune.
+
+        Spectral FFT residual mix runs inside ``pulse_partition`` (engine_name
+        innerface/global), not here — avoids double-mix after hybrid pulse.
+        """
         host = self.host
         if host is None:
             return

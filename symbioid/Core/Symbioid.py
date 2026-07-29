@@ -562,6 +562,9 @@ class Symbioid(System):
                         delta = hebb_lr * pre_post
                     else:
                         continue
+                    # Phase 4: phase-locked Hebb scale (no-op when disabled)
+                    if mind is not None and hasattr(mind, "phase_hebb_scale"):
+                        delta *= float(mind.phase_hebb_scale(firer, tgt))
                     link.adjust_weight(delta, w_min=w_min, w_max=w_max)
                     hebb_n += 1
 
@@ -593,7 +596,7 @@ class Symbioid(System):
             )
             energy_rem = 0.0 if energy_left == float("inf") else max(0.0, energy_left)
 
-        return {
+        stats: dict = {
             "cycle": cycle,
             "hot": self.last_pulse_hot,
             "fired": self.last_pulse_fired,
@@ -604,6 +607,16 @@ class Symbioid(System):
             "energy_left": energy_rem,
             "energy_capped": energy_capped,
         }
+        # Phase 2: FNet-shaped residual mix once after Innerface/global pulse
+        # (skip Interface/Outerface partitions to avoid triple-mix in hybrid mode).
+        if mind is not None and getattr(mind, "spectral_mix_enabled", False):
+            if engine_name in ("innerface", "global"):
+                cands = list(self._hot_ids)
+                if membership is not None:
+                    cands = list(set(cands) | set(membership))
+                mix = mind.spectral_mix_step(self, candidate_ids=cands or None)
+                stats["spectral"] = mix
+        return stats
 
     def reinforce_edge(
         self,

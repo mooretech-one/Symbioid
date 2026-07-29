@@ -6,6 +6,8 @@ Personal **experimentation sandbox** for Antelligence / Symbioid architecture id
 
 **Audio demo Phases 0–5 + polish (v0.0.42):** mic/synthetic → **FFT20** → 20 Sensors + 20 Actuators → band synth → speakers; digital self-mix; **acoustic howl ducking**; contingent IM with **rich state poles**; optional `build_demos.py audio --dir`. See `audio_demo.py` and `symbioid/world/audio.py`.
 
+**Spectral substrate Phase 0–5 (v0.0.46):** SpectralBank + FFT mix + HolonomicStore + **phase-locked Hebb** (default off) + audio **`--spectral`**. Plan: vault `Work-Log/2026-07-29-research-loop-symbioid-fft-attention.md`.
+
 | | |
 |--|--|
 | **Path** | `~/Desktop/Areas/Personal/Symbioid` |
@@ -73,6 +75,9 @@ PYTHONPATH=. .venv/bin/python audio_demo.py --closed --headless --frames 30 --no
 PYTHONPATH=. .venv/bin/python audio_demo.py --contingent --headless --frames 40 --no-play --no-memory --seed 1
 PYTHONPATH=. .venv/bin/python audio_demo.py --noncontingent --headless --frames 40 --no-play --no-memory --seed 1
 
+# Phase 5 — spectral substrate (FFT mix + holonomic + phase Hebb)
+PYTHONPATH=. .venv/bin/python audio_demo.py --contingent --spectral --headless --frames 40 --no-play --no-memory --seed 1
+
 # Live mic + speakers (GUI default closed+play; ducking auto-on)
 PYTHONPATH=. .venv/bin/python audio_demo.py --mic --play
 PYTHONPATH=. .venv/bin/python audio_demo.py --mic --play --duck   # force duck
@@ -96,6 +101,40 @@ PYTHONPATH=. .venv/bin/python audio_demo.py --list-devices
 | Success | sense stable · babble · contingent R > non-contingent · no runaway howl |
 
 API (`symbioid.persist`): `export_memory(host, mode="lean"|"full")`, `save_memory`, `try_load_into`.
+
+## Spectral substrate (experimental)
+
+Frequency-domain helpers for FFT mix / future holonomic memory (vault `Work-Log/2026-07-29-research-loop-symbioid-fft-attention.md`). **Does not replace** graph pulse, Hebb Links, or Outerface laws — residual is **added** after one-hop spread.
+
+| Mind flag | Default | Phase | Role |
+|-----------|---------|-------|------|
+| `spectral_mix_enabled` | **True** | 2 | FFT residual mix after `innerface` / `global` pulse |
+| `spectral_mix_gain` | `0.15` | 2 | Residual add scale (`0` → skip mix, bit-identical) |
+| `spectral_soft_threshold` | `0.05` | 2 | Zero bins below thr × max\|S\| |
+| `spectral_mix_lowpass` | `0.75` | 2 | Keep lowest fraction of freq bins (`1.0` = no low-pass) |
+| `spectral_bank_size` | `64` | 1 | Channel count (padded to power of two) |
+| `holonomic_store_enabled` | **True** | 3 | Interference write on mint / probe on reuse |
+| `holonomic_read_valence` | `0.08` | 3 | Valence boost scale × match score on reuse |
+| `holonomic_capacity` | `64` | 3 | Real embedding length (fixed buffer size) |
+| `hebb_phase_enabled` | **False** | 4 | Phase-locked Hebb scale on co-fire (on with audio `--spectral`) |
+| `hebb_phase_tolerance` | `0.5` | 4 | Radians; within → boost Hebb Δ |
+| `spectral_filter_lr` | `0.02` | 4 | Outcome nudge on mix bin gains |
+
+**Phase 0–5 shipped (v0.0.46):**
+
+- `SpectralBank` — bind / pack / unpack / fft / ifft / `apply_mix_filter` / phase sync
+- `Mind.spectral_mix_step` — residual mix after `innerface`/`global` pulse
+- `HolonomicStore` — interference write/read; lean persist
+- Phase-locked Hebb + spectral bin-gain nudge from `record_outcome`
+- Audio: `--spectral` enables mix + holonomic + phase Hebb; envelope write/probe in coach
+
+```bash
+.venv/bin/python -m pytest tests/test_spectral_bank.py tests/test_audio_phase2.py -q
+# Spectral audio demo
+PYTHONPATH=. .venv/bin/python audio_demo.py --contingent --spectral --headless --frames 40 --no-play --no-memory
+```
+
+Audio **FFT20** remains the Interface sense path; the spectral bank is the cognitive mixer/store on Mind.
 
 **Do not** use bare `python3 -m pip install …` against system Python (externally-managed-environment).  
 **Do not** use bare `pytest` from `~/.local/bin` (may pull pytest-qt / PySide errors from other projects). Use `.venv/bin/pytest` if you install pytest here.

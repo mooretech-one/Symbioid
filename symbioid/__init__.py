@@ -22,11 +22,16 @@ from symbioid.Core import (
     PortPacket,
     Process,
     Sensor,
+    HolonomicStore,
+    SpectralBank,
     SpikingEngine,
     Symbioid,
     System,
     Thought,
     ThoughtLayer,
+    abs_phase_diff,
+    ceil_pow2,
+    key_to_vector,
     assert_mind_not_thought,
     begin_sensor_formation,
     complete_belief_set,
@@ -71,6 +76,11 @@ __all__ = [
     "Sensor",
     "Actuator",
     "Process",
+    "SpectralBank",
+    "HolonomicStore",
+    "ceil_pow2",
+    "key_to_vector",
+    "abs_phase_diff",
     "SpikingEngine",
     "PortPacket",
     "Innerface",
@@ -120,4 +130,4 @@ __all__ = [
     "default_memory_path",
 ]
 
-__version__ = "0.0.42"
+__version__ = "0.0.46"

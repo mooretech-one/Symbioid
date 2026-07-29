@@ -72,6 +72,13 @@ from symbioid.Core.formation import (
     six_set_poles,
 )
 from symbioid.Core.seed import is_minimal_symbioid_shape, minimal_seed
+from symbioid.Core.spectral import (
+    HolonomicStore,
+    SpectralBank,
+    abs_phase_diff,
+    ceil_pow2,
+    key_to_vector,
+)
 
 __all__ = [
     "System",
@@ -131,4 +138,9 @@ __all__ = [
     "emit_six_set",
     "set_console_emit",
     "console_emit_enabled",
+    "SpectralBank",
+    "HolonomicStore",
+    "ceil_pow2",
+    "key_to_vector",
+    "abs_phase_diff",
 ]

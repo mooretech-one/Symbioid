@@ -49,6 +49,8 @@ class Thought(System):
     export_activation: float = 0.0
     # Set True for one tick after successful try_fire (consumers / HUD)
     just_fired: bool = field(default=False, init=False, repr=False)
+    # Spectral substrate (Phase 1+): phase for optional phase-locked Hebb (radians)
+    spectral_phase: float = 0.0
 
     def __post_init__(self) -> None:
         self.layer = normalize_layer(self.layer)
@@ -130,4 +132,5 @@ class Thought(System):
             "threshold": self.threshold,
             "refractory_ticks": self.refractory_ticks,
             "dynamics_enabled": self.dynamics_enabled,
+            "spectral_phase": float(self.spectral_phase),
         }

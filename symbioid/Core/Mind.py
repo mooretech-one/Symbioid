@@ -109,6 +109,32 @@ class Mind(System):
     forget_activation_eps: float = 1e-6
     forget_transient_only: bool = False  # when cold-forget on: any unprotected Thought
     forget_max_per_pass: int = 64
+    # Spectral substrate (Phase 2–3 defaults ON for mix + holonomic)
+    spectral_mix_enabled: bool = True  # FFT residual mix after innerface/global pulse
+    holonomic_store_enabled: bool = True  # Phase 3: interference memory on admit
+    spectral_bank_size: int = 64  # power-of-two recommended; bank pads up
+    spectral_mix_gain: float = 0.15  # residual add scale (0 → skip, bit-identical)
+    spectral_soft_threshold: float = 0.05  # zero bins below thr × max|S|
+    spectral_mix_lowpass: float = 0.75  # keep lowest fraction of freq bins (1.0 = off)
+    spectral_mix_max_bind: int = 64  # max hot Thoughts bound per mix step
+    holonomic_capacity: int = 64  # real-vector length for key embeddings
+    holonomic_write_strength: float = 1.0
+    holonomic_read_valence: float = 0.08  # valence boost scale on reuse score
+    holonomic_decay: float = 0.002
+    # Phase 4: phase-locked Hebb (default OFF per research; enable for audio --spectral)
+    hebb_phase_enabled: bool = False
+    hebb_phase_tolerance: float = 0.5  # radians; |Δφ| within → boost
+    hebb_phase_boost: float = 1.5  # multiply Hebb Δ when phase-locked
+    hebb_phase_mismatch: float = 0.75  # multiply when out of tolerance
+    spectral_filter_lr: float = 0.02  # outcome → spectral bin gain nudge
+    spectral_bank: Any = field(default=None, init=False, repr=False)
+    holonomic_store: Any = field(default=None, init=False, repr=False)
+    spectral_bin_gains: Any = field(default=None, init=False, repr=False)
+    last_spectral_stats: dict = field(default_factory=dict, init=False, repr=False)
+    spectral_mix_steps: int = field(default=0, init=False, repr=False)
+    holonomic_writes: int = field(default=0, init=False, repr=False)
+    holonomic_reads: int = field(default=0, init=False, repr=False)
+    phase_hebb_hits: int = field(default=0, init=False, repr=False)
 
     # stats (Observation + Follows + Integrates combined mint counters)
     admits_mint: int = field(default=0, init=False, repr=False)
@@ -156,6 +182,211 @@ class Mind(System):
     # action content_key → token string
     _action_tokens: dict[str, str] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+
+    def ensure_spectral_bank(self) -> Any:
+        """Lazy-create SpectralBank sized to ``spectral_bank_size`` (Phase 1)."""
+        if self.spectral_bank is None:
+            from symbioid.Core.spectral import SpectralBank
+
+            self.spectral_bank = SpectralBank(size=int(self.spectral_bank_size))
+        if self.spectral_bin_gains is None:
+            import numpy as np
+
+            n_bins = self.spectral_bank.size // 2 + 1
+            self.spectral_bin_gains = np.ones(n_bins, dtype=np.float32)
+        return self.spectral_bank
+
+    def enable_spectral_demo(self, *, phase_hebb: bool = True) -> None:
+        """Convenience for audio ``--spectral``: mix + holonomic + optional phase Hebb."""
+        self.spectral_mix_enabled = True
+        self.holonomic_store_enabled = True
+        self.hebb_phase_enabled = bool(phase_hebb)
+        self.ensure_spectral_bank()
+        self.ensure_holonomic_store()
+
+    def ensure_holonomic_store(self) -> Any:
+        """Lazy-create HolonomicStore (Phase 3)."""
+        if self.holonomic_store is None:
+            from symbioid.Core.spectral import HolonomicStore
+
+            self.holonomic_store = HolonomicStore(
+                capacity=int(self.holonomic_capacity),
+                write_gain=1.0,
+                read_gain=1.0,
+                decay=float(self.holonomic_decay),
+            )
+        return self.holonomic_store
+
+    def _holonomic_on_mint(self, content_key: str) -> None:
+        """Write content-key embedding into interference buffer."""
+        if not self.holonomic_store_enabled:
+            return
+        store = self.ensure_holonomic_store()
+        store.decay = float(self.holonomic_decay)
+        store.write_key(str(content_key), strength=float(self.holonomic_write_strength))
+        self.holonomic_writes += 1
+
+    def _holonomic_on_reuse(self, content_key: str) -> float:
+        """
+        Probe store with content key; boost valence by scaled match score.
+
+        Returns score used (0 if disabled / empty).
+        """
+        if not self.holonomic_store_enabled:
+            return 0.0
+        store = self.ensure_holonomic_store()
+        if store.n_writes <= 0 and store.energy() <= 0.0:
+            return 0.0
+        score = float(store.score_key(str(content_key)))
+        boost = float(self.holonomic_read_valence) * score
+        if boost != 0.0:
+            v = self._valence.get(content_key, 0.0) + boost
+            self._valence[content_key] = max(
+                self.valence_floor, min(self.valence_ceil, v)
+            )
+        self.holonomic_reads += 1
+        return score
+
+    def spectral_mix_step(
+        self,
+        host: Any,
+        candidate_ids: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        """
+        Phase 2: bind hot/candidate Thoughts → pack → FFT filter → residual add.
+
+        Skips when disabled or ``spectral_mix_gain == 0`` (bit-identical path).
+        """
+        empty = {
+            "mixed": 0,
+            "skipped": True,
+            "mix_energy": 0.0,
+            "top_bin": 0,
+            "n_bound": 0,
+        }
+        if not bool(self.spectral_mix_enabled):
+            self.last_spectral_stats = dict(empty)
+            return self.last_spectral_stats
+        gain = float(self.spectral_mix_gain)
+        if gain == 0.0:
+            empty["reason"] = "zero_gain"
+            self.last_spectral_stats = dict(empty)
+            return self.last_spectral_stats
+        if host is None:
+            empty["reason"] = "no_host"
+            self.last_spectral_stats = dict(empty)
+            return self.last_spectral_stats
+
+        bank = self.ensure_spectral_bank()
+        thoughts = getattr(host, "thoughts", {}) or {}
+        max_bind = max(1, int(self.spectral_mix_max_bind))
+        max_bind = min(max_bind, int(bank.size))
+
+        # Rank candidates by activation (hot-set preferred)
+        if candidate_ids is None:
+            hot = getattr(host, "_hot_ids", None)
+            if hot:
+                ids = [tid for tid in hot if tid in thoughts]
+            else:
+                ids = list(thoughts.keys())
+        else:
+            ids = [tid for tid in candidate_ids if tid in thoughts]
+
+        scored: list[tuple[float, str]] = []
+        for tid in ids:
+            t = thoughts.get(tid)
+            if t is None or not getattr(t, "dynamics_enabled", True):
+                continue
+            # Skip pure Link scaffolding without dynamics interest
+            scored.append((float(getattr(t, "activation", 0.0) or 0.0), tid))
+        scored.sort(key=lambda p: (-p[0], p[1]))
+        # Prefer already-bound slots, then fill with top activations
+        chosen: list[str] = []
+        for tid in list(bank.thought_to_slot.keys()):
+            if tid in thoughts and tid not in chosen:
+                chosen.append(tid)
+            if len(chosen) >= max_bind:
+                break
+        for _, tid in scored:
+            if tid not in chosen:
+                chosen.append(tid)
+            if len(chosen) >= max_bind:
+                break
+
+        if not chosen:
+            empty["reason"] = "no_candidates"
+            self.last_spectral_stats = dict(empty)
+            return self.last_spectral_stats
+
+        for tid in chosen:
+            bank.bind(tid)
+
+        bank.pack_from_activations(host)
+        bank.sync_phases_to_thoughts(host)
+        filt = bank.apply_mix_filter(
+            soft_threshold=float(self.spectral_soft_threshold),
+            lowpass=float(self.spectral_mix_lowpass),
+            bin_gains=self.spectral_bin_gains,
+        )
+        n = bank.unpack_to_activations(host, gain=gain, mode="add")
+        # Keep hot-set coherent when residual lands on bound Thoughts
+        mark = getattr(host, "mark_hot", None)
+        if callable(mark):
+            for tid in chosen:
+                t = thoughts.get(tid)
+                if t is not None:
+                    mark(t)
+
+        self.spectral_mix_steps += 1
+        stats = {
+            "mixed": int(n),
+            "skipped": False,
+            "mix_energy": float(filt.get("mix_energy", 0.0)),
+            "top_bin": int(filt.get("top_bin", 0)),
+            "n_bound": len(bank.thought_to_slot),
+            "gain": gain,
+            "steps": int(self.spectral_mix_steps),
+        }
+        self.last_spectral_stats = dict(stats)
+        return stats
+
+    def phase_hebb_scale(self, pre: Any, post: Any) -> float:
+        """
+        Phase 4: scale factor for Hebb Δ based on spectral phase lock.
+
+        Returns 1.0 when phase Hebb disabled or phases missing.
+        """
+        if not bool(self.hebb_phase_enabled):
+            return 1.0
+        if pre is None or post is None:
+            return 1.0
+        from symbioid.Core.spectral import abs_phase_diff
+
+        dphi = abs_phase_diff(
+            getattr(pre, "spectral_phase", 0.0),
+            getattr(post, "spectral_phase", 0.0),
+        )
+        if dphi <= float(self.hebb_phase_tolerance):
+            self.phase_hebb_hits += 1
+            return float(self.hebb_phase_boost)
+        return float(self.hebb_phase_mismatch)
+
+    def nudge_spectral_filter(self, *, reward_sign: float) -> None:
+        """Slow Hebb-like update of bin gains around last mix top_bin (Phase 4)."""
+        if self.spectral_bin_gains is None or not self.spectral_mix_enabled:
+            return
+        import numpy as np
+
+        g = self.spectral_bin_gains
+        top = int(self.last_spectral_stats.get("top_bin", 0) or 0)
+        lr = float(self.spectral_filter_lr) * (1.0 if reward_sign >= 0 else -1.0)
+        if g.size == 0:
+            return
+        top = max(0, min(int(g.size) - 1, top))
+        # local bump ±1 bin
+        for j in (top - 1, top, top + 1):
+            if 0 <= j < g.size:
+                g[j] = float(np.clip(float(g[j]) + lr, 0.25, 2.5))
 
     def content_key(self, sensor_id: str, sense: Optional[dict[str, Any]]) -> str:
         """Stable signature for one Input on one Sensor channel."""
@@ -456,6 +687,9 @@ class Mind(System):
 
         with self._lock:
             self.outcomes_recorded += 1
+        # Phase 4: nudge spectral mix filter from outcome polarity
+        if self.spectral_mix_enabled and abs(delta) > 1e-12:
+            self.nudge_spectral_filter(reward_sign=float(delta))
         return action
 
     def recommend_action(
@@ -699,6 +933,8 @@ class Mind(System):
                 self.admits_reuse += 1
                 v = self._valence.get(ck, 0.0) - self.reuse_valence_decay
                 self._valence[ck] = max(self.valence_floor, v)
+                # Phase 3: holonomic probe can offset reuse decay when match is strong
+                self._holonomic_on_reuse(ck)
                 self._touch_channel(sensor_id, ck)
                 self._recent_keys.append(ck)
                 if len(self._recent_keys) > 64:
@@ -727,6 +963,8 @@ class Mind(System):
                 ck, obs, sensor_id=sensor_id, valence=self.surprise_valence
             )
             self.admits_mint += 1
+            # Phase 3: imprint content key into interference store
+            self._holonomic_on_mint(ck)
             return AdmitResult(
                 action="mint",
                 content_key=ck,

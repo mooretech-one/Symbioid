@@ -7,6 +7,7 @@ Symbioid audio demo — Phases 0–5: mic/synth → FFT20 → network → babble
   PYTHONPATH=. .venv/bin/python audio_demo.py --babble --no-play   # Phase 2 silent motor
   PYTHONPATH=. .venv/bin/python audio_demo.py --closed --no-play   # Phase 3 digital self-mix
   PYTHONPATH=. .venv/bin/python audio_demo.py --contingent --headless --frames 40 --no-play
+  PYTHONPATH=. .venv/bin/python audio_demo.py --contingent --spectral --headless --frames 40 --no-play
   PYTHONPATH=. .venv/bin/python audio_demo.py --mic --play         # live hear + speakers
   PYTHONPATH=. .venv/bin/python audio_demo.py --list-devices
 
@@ -144,6 +145,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="G",
         help="Leakage cancel gain for duck path (default 0.35 when ducking)",
     )
+    p.add_argument(
+        "--spectral",
+        action="store_true",
+        help="Phase 5: enable FFT residual mix + holonomic envelope + phase Hebb",
+    )
+    p.add_argument(
+        "--no-spectral",
+        action="store_true",
+        help="Force spectral substrate off (overrides Mind defaults)",
+    )
     return p.parse_args(argv)
 
 
@@ -162,10 +173,23 @@ def resolve_loop_mode(args: argparse.Namespace) -> str:
     return "closed"
 
 
-def build_symbioid(world: AudioWorld, *, with_actuators: bool) -> Symbioid:
+def build_symbioid(
+    world: AudioWorld,
+    *,
+    with_actuators: bool,
+    spectral: bool = False,
+) -> Symbioid:
     s = Symbioid(id=HOST_ID, label="audio-fft20")
     s.interface.continuous_inputs = False
     s.outerface.wait_for_feedback = False
+
+    if spectral:
+        s.mind.enable_spectral_demo(phase_hebb=True)
+    else:
+        # Explicit off so demos stay predictable unless --spectral
+        s.mind.spectral_mix_enabled = False
+        s.mind.holonomic_store_enabled = False
+        s.mind.hebb_phase_enabled = False
 
     for i in range(world.num_bands):
         lab = f"band_{i:02d}"
@@ -476,7 +500,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"playback open failed ({e}); falling back to null", file=sys.stderr)
         playback, play_name = open_playback(backend="null")
 
-    s = build_symbioid(world, with_actuators=motor)
+    want_spectral = bool(args.spectral) and not bool(args.no_spectral)
+    s = build_symbioid(world, with_actuators=motor, spectral=want_spectral)
 
     coach: BabbleCoach | None = None
     if motor:
