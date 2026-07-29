@@ -20,6 +20,8 @@ is loaded from / saved to ~/.local/share/symbioid/tetris_memory.json by default.
 
   PYTHONPATH=. .venv/bin/python tetris_demo.py
   PYTHONPATH=. .venv/bin/python tetris_demo.py --verbose
+  PYTHONPATH=. .venv/bin/python tetris_demo.py --spectral
+  PYTHONPATH=. .venv/bin/python tetris_demo.py --spectral-primary
 """
 
 from __future__ import annotations
@@ -122,6 +124,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Delete memory file before start (fresh Mind; still saves on exit unless --no-memory).",
     )
+    p.add_argument(
+        "--spectral",
+        action="store_true",
+        help="Hybrid residual FFT mix + holonomic + phase Hebb (Links still spread).",
+    )
+    p.add_argument(
+        "--spectral-primary",
+        action="store_true",
+        help="Mode B: FFT mix only (no Link spread/Hebb); implies spectral substrate.",
+    )
+    p.add_argument(
+        "--no-spectral",
+        action="store_true",
+        help="Force spectral substrate off (graph dynamics only).",
+    )
     return p.parse_args(argv)
 
 
@@ -153,7 +170,12 @@ def thought_counts_active_inactive(s: Symbioid) -> tuple[int, int]:
     return n_active, n_inactive
 
 
-def build_symbioid(world: TetrisWorld) -> Symbioid:
+def build_symbioid(
+    world: TetrisWorld,
+    *,
+    spectral: bool = False,
+    spectral_primary: bool = False,
+) -> Symbioid:
     """
     Sensors: full 10×20 cell map (block / hole / open) + meta
     (piece_id, next_id, lines, last_byte, holes_n, last_d_holes).
@@ -162,10 +184,24 @@ def build_symbioid(world: TetrisWorld) -> Symbioid:
     awareness six-sets. Sampling is change-only (see sample_into_symbioid).
     Packing meta (holes_n / last_d_holes) gives the Thought graph explicit
     insight into sealed-hole count and last lock's hole delta.
+
+    spectral / spectral_primary: Mind FFT substrate (hybrid residual or Mode B).
+    Default (neither): graph-only dynamics for stable baseline play.
     """
     s = Symbioid(id=HOST_ID, label="tetris-byte-learner")
     s.interface.continuous_inputs = False
     s.outerface.wait_for_feedback = False
+
+    if spectral_primary or spectral:
+        s.mind.enable_spectral_demo(
+            phase_hebb=True, primary=bool(spectral_primary)
+        )
+    else:
+        s.mind.set_dynamics_mode("graph")
+        s.mind.spectral_mix_enabled = False
+        s.mind.holonomic_store_enabled = False
+        s.mind.hebb_phase_enabled = False
+
     # Faster face workers so sample→formation is not stuck on 50 ms sleeps
     s.interface.tick_interval = float(FACE_TICK_INTERVAL)
     s.innerface.tick_interval = float(FACE_TICK_INTERVAL)
@@ -1282,7 +1318,13 @@ def main(argv: list[str] | None = None) -> None:
         rng=rng_world,
     )
     coach = TetrisCoach(network_primary=True)
-    s = build_symbioid(world)
+    want_primary = bool(args.spectral_primary) and not bool(args.no_spectral)
+    want_spectral = (bool(args.spectral) or want_primary) and not bool(
+        args.no_spectral
+    )
+    s = build_symbioid(
+        world, spectral=want_spectral, spectral_primary=want_primary
+    )
     # Co-lead blend: network heat + coach residual (research 2026-07-26).
     # Floor clamp in choose_target is 0.35 so 0.60 is honored.
     coach.graph_placement_weight = 0.60
@@ -1316,11 +1358,23 @@ def main(argv: list[str] | None = None) -> None:
     log("(Cipher hidden from learner; not printed here.)", flush=True)
     if use_memory:
         log(f"(Agent memory: {mem_path})", flush=True)
+    dyn = getattr(s.mind, "dynamics_mode", "hybrid")
+    log(
+        f"(Spectral: mode={dyn} mix={s.mind.spectral_mix_enabled} "
+        f"holonomic={s.mind.holonomic_store_enabled} "
+        f"primary={want_primary})",
+        flush=True,
+    )
 
     s.start_processes()
     pygame.init()
     screen = pygame.display.set_mode((W, H))
-    pygame.display.set_caption("Symbioid Tetris — secret byte controls")
+    caption = "Symbioid Tetris — secret byte controls"
+    if want_primary:
+        caption += " [spectral-primary]"
+    elif want_spectral:
+        caption += " [spectral]"
+    pygame.display.set_caption(caption)
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("DejaVu Sans", 20)
     font_sm = pygame.font.SysFont("DejaVu Sans", 14)

@@ -6,7 +6,7 @@ Personal **experimentation sandbox** for Antelligence / Symbioid architecture id
 
 **Audio demo Phases 0–5 + polish (v0.0.42):** mic/synthetic → **FFT20** → 20 Sensors + 20 Actuators → band synth → speakers; digital self-mix; **acoustic howl ducking**; contingent IM with **rich state poles**; optional `build_demos.py audio --dir`. See `audio_demo.py` and `symbioid/world/audio.py`.
 
-**Spectral substrate Phase 0–5 + Mode B (v0.0.47):** SpectralBank + FFT mix + HolonomicStore + phase Hebb + **`dynamics_mode`** (`graph` | `hybrid` | **`spectral`** primary). Audio: `--spectral` / `--spectral-primary`.
+**Spectral substrate Phase 0–5 + Mode B (v0.0.47):** SpectralBank + FFT mix + HolonomicStore + phase Hebb + **`dynamics_mode`**. Audio/Tetris: `--spectral` / `--spectral-primary`.
 
 | | |
 |--|--|
@@ -57,6 +57,8 @@ On exit, Tetris/Pong save **agent cognition only** — a **lean** snapshot by de
 .venv/bin/python tetris_demo.py --no-memory
 .venv/bin/python tetris_demo.py --reset-memory
 .venv/bin/python tetris_demo.py --memory /tmp/my_mind.json
+.venv/bin/python tetris_demo.py --spectral           # hybrid FFT residual
+.venv/bin/python tetris_demo.py --spectral-primary   # Mode B (mix only)
 ```
 
 ### Audio demo (Phases 0–5 — sense + babble + contingency)
