@@ -59,6 +59,8 @@ On exit, Tetris/Pong save **agent cognition only** — a **lean** snapshot by de
 .venv/bin/python tetris_demo.py --memory /tmp/my_mind.json
 .venv/bin/python tetris_demo.py --spectral           # hybrid FFT residual
 .venv/bin/python tetris_demo.py --spectral-primary   # Mode B (mix only)
+.venv/bin/python tetris_demo.py --headless --games 3 --no-memory   # multi-game packing metric
+.venv/bin/python tetris_demo.py --headless --games 3 --no-eligibility  # landing-cell credit only
 ```
 
 ### Audio demo (Phases 0–5 — sense + babble + contingency)
@@ -283,7 +285,7 @@ Minted structure is **read for action choice**, not only stored:
 1. **Placement / strategy** — `choose_target` **co-leads** cell-map Thought heat and coach board value (`graph_placement_weight≈0.60`; net-primary floor 0.35).
 2. **Commands** — `graph_preferred_intent` derives micro-intents from the network-scored target (geo), with Mind `recommend_action` as strong-score override; `tick` takes that intent at high `graph_bias` (~0.93).
 3. **Coach retains** — secret-byte discovery, gravity separation, stuck/force-hard survival, cold explore fallback (`last_network_cmd` marks who drove the last byte).
-4. **Lock credit** — coach `board_quality_reward` fans valence onto **landing cells** (`apply_lock_valence_to_landing_cells`) so placement heat can improve with experience.
+4. **Lock credit (P1)** — coach `board_quality_reward` fans valence onto **landing cells** (`apply_lock_valence_to_landing_cells`, v0.0.33) **and** a **trajectory eligibility window** of recent policy poles (`EligibilityWindow` / `apply_lock_credit`, v0.0.48) with linear recency weights.
 5. **Hole + well avoidance** — `pose_hole_features` / edge-aware `well_metrics`: sealed holes (`d_holes`) and open single-width trenches (`d_well`, `max_well`, including col 0/9). HUD shows `holes` / `well` / `maxW`.
 6. **Packing meta sensors (v0.0.36+)** — `holes_n`, `last_d_holes`, `well_n`, `max_well_n` sampled into Mind.
 7. **Foresight free-count (v0.0.37)** — `pred_d_holes`, `holes_freed` (max(0,−Δ)), `holes_fill_n` for the **current target pose** so the network knows how many holes a planned placement will free (via `pose_hole_features` on `coach._target`).

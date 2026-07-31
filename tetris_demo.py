@@ -22,13 +22,16 @@ is loaded from / saved to ~/.local/share/symbioid/tetris_memory.json by default.
   PYTHONPATH=. .venv/bin/python tetris_demo.py --verbose
   PYTHONPATH=. .venv/bin/python tetris_demo.py --spectral
   PYTHONPATH=. .venv/bin/python tetris_demo.py --spectral-primary
+  PYTHONPATH=. .venv/bin/python tetris_demo.py --headless --games 3 --no-memory
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterable
 
 try:
     import pygame
@@ -138,6 +141,40 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--no-spectral",
         action="store_true",
         help="Force spectral substrate off (graph dynamics only).",
+    )
+    p.add_argument(
+        "--headless",
+        action="store_true",
+        help="No GUI; run multi-game placement metric and exit.",
+    )
+    p.add_argument(
+        "--games",
+        type=int,
+        default=3,
+        help="With --headless: number of games to play (default 3).",
+    )
+    p.add_argument(
+        "--max-frames",
+        type=int,
+        default=12000,
+        help="With --headless: max frames per game before force end (default 12000).",
+    )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=1,
+        help="With --headless: RNG seed for world+coach (default 1).",
+    )
+    p.add_argument(
+        "--eligibility-window",
+        type=int,
+        default=24,
+        help="Cmd-tick eligibility depth for lock credit (default 24). 0 disables.",
+    )
+    p.add_argument(
+        "--no-eligibility",
+        action="store_true",
+        help="Disable trajectory eligibility credit (landing-cell only, v0.0.33).",
     )
     return p.parse_args(argv)
 
@@ -511,6 +548,331 @@ def apply_lock_valence_to_landing_cells(
             s.mind.note_valence(content_key=synth, delta=delta * 0.5)
             touched += 1
     return touched
+
+
+@dataclass
+class EligibilityWindow:
+    """
+    Trajectory eligibility for placement credit (P1).
+
+    Each command tick pushes content keys of state poles that influenced
+    placement/policy. On lock, reward fans onto those keys with **linear
+    recency weights** (newest ≈ 1.0, oldest ≈ 1/N) in addition to landing-cell
+    valence (v0.0.33).
+    """
+
+    max_ticks: int = 24
+    frames: list[set[str]] = field(default_factory=list)
+
+    def push(self, keys: Iterable[str]) -> None:
+        if self.max_ticks <= 0:
+            return
+        batch = {str(k) for k in keys if k}
+        if not batch:
+            return
+        self.frames.append(batch)
+        overflow = len(self.frames) - int(self.max_ticks)
+        if overflow > 0:
+            del self.frames[:overflow]
+
+    def clear(self) -> None:
+        self.frames.clear()
+
+    def credited_keys(self) -> dict[str, float]:
+        """Map content_key → recency weight in (0, 1]."""
+        n = len(self.frames)
+        if n == 0:
+            return {}
+        acc: dict[str, float] = {}
+        for i, keys in enumerate(self.frames):
+            w = (i + 1) / float(n)
+            for k in keys:
+                prev = acc.get(k, 0.0)
+                if w > prev:
+                    acc[k] = w
+        return acc
+
+    def __len__(self) -> int:
+        return len(self.frames)
+
+
+def poles_to_content_keys(s: Symbioid, poles: list) -> set[str]:
+    """Map Thought poles → Mind content keys (skip unregistered)."""
+    keys: set[str] = set()
+    with s.mind._lock:
+        t2k = dict(s.mind._thought_to_key)
+        recent = list(s.mind._recent_keys[-24:])
+    for th in poles:
+        if th is None:
+            continue
+        ck = t2k.get(getattr(th, "id", None))
+        if ck:
+            keys.add(str(ck))
+    # Recent packing-meta keys (holes_n, pred_d_holes, …) if freshly sampled
+    for ck in recent:
+        cks = str(ck)
+        if any(m in cks for m in _PACKING_META_LABELS):
+            keys.add(cks)
+    return keys
+
+
+def apply_eligibility_valence(
+    s: Symbioid,
+    window: EligibilityWindow,
+    reward: float,
+    *,
+    scale: float = 50.0,
+    strength: float = 0.55,
+) -> int:
+    """
+    Fan lock reward onto eligibility-window keys with recency decay.
+
+    ``strength`` scales relative to full landing-cell credit (1.0). Returns
+    number of distinct content keys touched.
+    """
+    if window.max_ticks <= 0 or not window.frames:
+        return 0
+    delta = max(-2.0, min(2.0, float(reward) / float(scale)))
+    if abs(delta) < 1e-12:
+        return 0
+    credited = window.credited_keys()
+    if not credited:
+        return 0
+    touched = 0
+    for ck, w in credited.items():
+        s.mind.note_valence(
+            content_key=str(ck),
+            delta=float(delta) * float(strength) * float(w),
+        )
+        touched += 1
+    return touched
+
+
+def apply_lock_credit(
+    s: Symbioid,
+    coach: TetrisCoach,
+    window: EligibilityWindow,
+    *,
+    poles: list | None = None,
+    push_poles: bool = False,
+) -> dict[str, int]:
+    """
+    Full P1 lock credit: landing cells (0.0.33) + eligibility trajectory.
+
+    Callers that already ``window.push`` each cmd tick should leave
+    ``push_poles=False`` (default) to avoid duplicate last-frame entries.
+    Clears the window after apply so the next piece starts fresh.
+    """
+    stats = {"landing": 0, "eligibility": 0, "pushed": 0}
+    reward = float(getattr(coach, "last_reward", 0.0) or 0.0)
+    if push_poles and poles:
+        keys = poles_to_content_keys(s, poles)
+        before = len(window)
+        window.push(keys)
+        stats["pushed"] = 1 if len(window) > before else 0
+    lock_cells = list(getattr(coach, "last_lock_cells", None) or [])
+    if lock_cells:
+        stats["landing"] = apply_lock_valence_to_landing_cells(
+            s, lock_cells, reward
+        )
+    stats["eligibility"] = apply_eligibility_valence(s, window, reward)
+    window.clear()
+    return stats
+
+
+@dataclass
+class GameMetric:
+    """Per-game packing metric snapshot (multi-game harness)."""
+
+    game: int
+    score: int
+    lines: int
+    pieces: int
+    holes: int
+    max_height: int
+    aggregate_height: int
+    frames: int
+    top_out: bool
+
+    def as_dict(self) -> dict:
+        return {
+            "game": self.game,
+            "score": self.score,
+            "lines": self.lines,
+            "pieces": self.pieces,
+            "holes": self.holes,
+            "max_height": self.max_height,
+            "aggregate_height": self.aggregate_height,
+            "frames": self.frames,
+            "top_out": self.top_out,
+        }
+
+
+def summarize_game_metrics(rows: list[GameMetric]) -> dict[str, float]:
+    """Means across games for headless reporting / tests."""
+    if not rows:
+        return {
+            "n": 0.0,
+            "mean_score": 0.0,
+            "mean_lines": 0.0,
+            "mean_holes": 0.0,
+            "mean_max_height": 0.0,
+            "mean_pieces": 0.0,
+        }
+    n = float(len(rows))
+    return {
+        "n": n,
+        "mean_score": sum(r.score for r in rows) / n,
+        "mean_lines": sum(r.lines for r in rows) / n,
+        "mean_holes": sum(r.holes for r in rows) / n,
+        "mean_max_height": sum(r.max_height for r in rows) / n,
+        "mean_pieces": sum(r.pieces for r in rows) / n,
+    }
+
+
+def run_multi_game_metric(
+    *,
+    games: int = 3,
+    max_frames: int = 12000,
+    seed: int = 1,
+    eligibility_window: int = 24,
+    use_eligibility: bool = True,
+    spectral: bool = False,
+    spectral_primary: bool = False,
+    map_threshold: int = 1,
+    verbose: bool = False,
+) -> tuple[list[GameMetric], dict[str, float]]:
+    """
+    Headless multi-game placement metric (no pygame display).
+
+    Plays ``games`` full top-outs (or max_frames each), applying lock credit
+    with optional eligibility. Returns (per-game rows, summary means).
+    """
+    import random as _random
+
+    log = print if verbose else (lambda *a, **k: None)
+    rng = _random.Random(int(seed))
+    cipher = ActionCipher.random(rng)
+    world = TetrisWorld(
+        cols=COLS,
+        rows=ROWS,
+        gravity_interval=GRAVITY_INTERVAL,
+        cipher=cipher,
+        rng=_random.Random(int(seed) + 17),
+    )
+    coach = TetrisCoach(
+        network_primary=True,
+        map_threshold=int(map_threshold),
+        rng=_random.Random(int(seed) + 31),
+    )
+    s = build_symbioid(
+        world, spectral=bool(spectral), spectral_primary=bool(spectral_primary)
+    )
+    coach.graph_placement_weight = 0.60
+    coach.graph_placement_bonus = (
+        lambda w, rot, col, _s=s: cell_thought_placement_score(_s, w, rot, col)
+    )
+    win_n = int(eligibility_window) if use_eligibility else 0
+    elig = EligibilityWindow(max_ticks=win_n)
+    s.start_processes()
+    rows: list[GameMetric] = []
+    try:
+        for g in range(1, int(games) + 1):
+            frame = 0
+            last_cmd_poles: list = []
+            elig.clear()
+            while not world.game_over and frame < int(max_frames):
+                sample_into_symbioid(s, world, tick=frame)
+                if s.mind.dynamics_enabled and frame % PULSE_EVERY == 0:
+                    s.pulse_tick()
+                if s.mind.dynamics_enabled and PULSES_PRE_CMD > 0:
+                    for _ in range(int(PULSES_PRE_CMD)):
+                        s.pulse_tick()
+                prev_pieces = world.pieces_placed
+                preferred, g_bias, poles, _hint = graph_preferred_intent(
+                    s, world, coach
+                )
+                update_pred_pack_for_target(s, world, coach)
+                sample_packing_meta_into_symbioid(
+                    s,
+                    world,
+                    tick=frame,
+                    coach=coach,
+                    labels=_FORESIGHT_META_LABELS,
+                )
+                last_cmd_poles = poles
+                if win_n > 0:
+                    elig.push(poles_to_content_keys(s, poles))
+                coach.tick(
+                    world,
+                    preferred_intent=preferred,
+                    graph_bias=g_bias,
+                )
+                if world.pieces_placed > prev_pieces:
+                    lock_eff = getattr(coach, "last_lock_effect", "") or ""
+                    intent = (
+                        lock_eff
+                        if lock_eff in VALID_ACTIONS
+                        else (
+                            coach.last_intent
+                            if coach.last_intent in VALID_ACTIONS
+                            else None
+                        )
+                    )
+                    if intent is not None:
+                        s.mind.record_outcome(
+                            last_cmd_poles,
+                            intent,
+                            domain="tetris",
+                            host_id=s.id,
+                            reward=float(coach.last_reward),
+                            host=s,
+                        )
+                    s.mind.note_valence(
+                        channel="board",
+                        delta=max(
+                            -2.0, min(2.0, float(coach.last_reward) / 50.0)
+                        ),
+                    )
+                    apply_lock_credit(
+                        s, coach, elig, poles=last_cmd_poles
+                    )
+                    s._last_d_holes = float(  # type: ignore[attr-defined]
+                        getattr(coach, "last_d_holes", 0.0) or 0.0
+                    )
+                    sample_packing_meta_into_symbioid(
+                        s, world, tick=frame, coach=coach
+                    )
+                    if s.mind.dynamics_enabled and PULSES_ON_LOCK > 0:
+                        for _ in range(int(PULSES_ON_LOCK)):
+                            s.pulse_tick()
+                frame += 1
+            # End-of-game packing snapshot (board at top-out or frame cap)
+            rows.append(
+                GameMetric(
+                    game=g,
+                    score=int(world.score),
+                    lines=int(world.lines),
+                    pieces=int(world.pieces_placed),
+                    holes=int(world.hole_count()),
+                    max_height=int(world.max_height()),
+                    aggregate_height=int(world.aggregate_height()),
+                    frames=frame,
+                    top_out=bool(world.game_over),
+                )
+            )
+            log(
+                f"[metric] g={g} score={world.score} lines={world.lines} "
+                f"holes={world.hole_count()} maxH={world.max_height()} "
+                f"pieces={world.pieces_placed} frames={frame}",
+                flush=True,
+            )
+            if g < int(games):
+                coach.on_new_game(world, record=True)
+    finally:
+        s.stop_processes()
+    summary = summarize_game_metrics(rows)
+    return rows, summary
 
 
 def cell_thought_placement_score(
@@ -1307,6 +1669,49 @@ def main(argv: list[str] | None = None) -> None:
     set_console_emit(args.verbose)
     log = print if args.verbose else (lambda *a, **k: None)
 
+    want_primary = bool(args.spectral_primary) and not bool(args.no_spectral)
+    want_spectral = (bool(args.spectral) or want_primary) and not bool(
+        args.no_spectral
+    )
+
+    # --- Headless multi-game placement metric (no GUI) ---
+    if bool(getattr(args, "headless", False)):
+        use_elig = not bool(getattr(args, "no_eligibility", False))
+        win = int(getattr(args, "eligibility_window", 24) or 0)
+        rows, summary = run_multi_game_metric(
+            games=int(args.games),
+            max_frames=int(args.max_frames),
+            seed=int(args.seed),
+            eligibility_window=win,
+            use_eligibility=use_elig,
+            spectral=want_spectral,
+            spectral_primary=want_primary,
+            verbose=True,  # always print metric lines in headless
+        )
+        print(
+            f"\n=== multi-game metric (n={int(summary['n'])}) "
+            f"eligibility={'on' if use_elig and win > 0 else 'off'} "
+            f"window={win} seed={args.seed} ===",
+            flush=True,
+        )
+        for r in rows:
+            print(
+                f"  g{r.game}: score={r.score} lines={r.lines} "
+                f"holes={r.holes} maxH={r.max_height} "
+                f"aggH={r.aggregate_height} pieces={r.pieces} "
+                f"frames={r.frames} top_out={r.top_out}",
+                flush=True,
+            )
+        print(
+            f"  means: score={summary['mean_score']:.1f} "
+            f"lines={summary['mean_lines']:.2f} "
+            f"holes={summary['mean_holes']:.2f} "
+            f"maxH={summary['mean_max_height']:.2f} "
+            f"pieces={summary['mean_pieces']:.1f}",
+            flush=True,
+        )
+        return
+
     # Fresh secret cipher each run (4 live bytes among 256)
     rng_world = __import__("random").Random()
     cipher = ActionCipher.random(rng_world)
@@ -1318,10 +1723,6 @@ def main(argv: list[str] | None = None) -> None:
         rng=rng_world,
     )
     coach = TetrisCoach(network_primary=True)
-    want_primary = bool(args.spectral_primary) and not bool(args.no_spectral)
-    want_spectral = (bool(args.spectral) or want_primary) and not bool(
-        args.no_spectral
-    )
     s = build_symbioid(
         world, spectral=want_spectral, spectral_primary=want_primary
     )
@@ -1392,6 +1793,15 @@ def main(argv: list[str] | None = None) -> None:
     # State poles at last command (for outcome write on lock)
     last_cmd_poles: list = []
     last_cmd_intent: str = "explore"
+    use_elig = not bool(getattr(args, "no_eligibility", False))
+    elig_n = int(getattr(args, "eligibility_window", 24) or 0)
+    if not use_elig:
+        elig_n = 0
+    eligibility = EligibilityWindow(max_ticks=elig_n)
+    log(
+        f"(Lock credit: landing-cell + eligibility window={elig_n})",
+        flush=True,
+    )
 
     def _record_thought_sample() -> None:
         a, i = thought_counts_active_inactive(s)
@@ -1463,6 +1873,9 @@ def main(argv: list[str] | None = None) -> None:
                     graph_bias=g_bias,
                 )
                 last_cmd_intent = coach.last_intent
+                # Trajectory eligibility: poles that steered this cmd tick
+                if eligibility.max_ticks > 0:
+                    eligibility.push(poles_to_content_keys(s, poles))
                 if getattr(coach, "last_network_cmd", False) and preferred:
                     last_graph_hint = f"NET {preferred}@{g_bias:.2f}"
                 elif preferred and coach.last_intent == preferred:
@@ -1498,12 +1911,10 @@ def main(argv: list[str] | None = None) -> None:
                         channel="board",
                         delta=max(-2.0, min(2.0, float(coach.last_reward) / 50.0)),
                     )
-                    # Placement closed loop: credit lock reward onto landing cells
-                    lock_cells = list(getattr(coach, "last_lock_cells", None) or [])
-                    if lock_cells:
-                        apply_lock_valence_to_landing_cells(
-                            s, lock_cells, float(coach.last_reward)
-                        )
+                    # P1: landing-cell (0.0.33) + eligibility-window credit
+                    apply_lock_credit(
+                        s, coach, eligibility, poles=last_cmd_poles
+                    )
                     # Network insight: mint Observations of holes_n / last_d_holes
                     s._last_d_holes = float(  # type: ignore[attr-defined]
                         getattr(coach, "last_d_holes", 0.0) or 0.0

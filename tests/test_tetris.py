@@ -1209,3 +1209,94 @@ def test_twin_seed_thoughts_is_constant_size():
     assert len(twin) == 6
     assert f"{s.id}:system" in twin
     assert f"{s.id}:form:junk0" not in twin
+
+
+def test_eligibility_window_recency_weights():
+    import tetris_demo as mod
+
+    w = mod.EligibilityWindow(max_ticks=4)
+    w.push(["a"])
+    w.push(["b", "a"])
+    w.push(["c"])
+    cred = w.credited_keys()
+    assert cred["c"] == 1.0  # newest
+    assert cred["a"] == 2.0 / 3.0  # last seen mid
+    assert cred["b"] == 2.0 / 3.0
+    w.clear()
+    assert len(w) == 0
+    assert w.credited_keys() == {}
+
+
+def test_apply_eligibility_valence_raises_keys():
+    import tetris_demo as mod
+    from symbioid import Symbioid
+
+    s = Symbioid(install_constitution=False)
+    win = mod.EligibilityWindow(max_ticks=8)
+    win.push(["meta:holes_n:0.1"])
+    win.push(["meta:holes_n:0.1", "cell_r10_c03:place"])
+    n = mod.apply_eligibility_valence(s, win, reward=100.0, strength=1.0)
+    assert n >= 2
+    v = s.mind.valence_of(content_key="meta:holes_n:0.1")
+    assert v > 0.0
+    # Negative reward lowers
+    mod.apply_eligibility_valence(s, win, reward=-100.0, strength=1.0)
+    v2 = s.mind.valence_of(content_key="meta:holes_n:0.1")
+    assert v2 < v
+
+
+def test_apply_lock_credit_landing_and_eligibility():
+    import tetris_demo as mod
+    from symbioid import Symbioid
+    from symbioid.world.tetris_learn import TetrisCoach
+
+    s = Symbioid(install_constitution=False)
+    coach = TetrisCoach(rng=Random(0))
+    coach.last_reward = 80.0
+    coach.last_lock_cells = [(18, 3), (18, 4)]
+    win = mod.EligibilityWindow(max_ticks=8)
+    win.push(["traj:key:1"])
+    stats = mod.apply_lock_credit(s, coach, win, poles=None)
+    assert stats["landing"] >= 2
+    assert stats["eligibility"] >= 1
+    assert len(win) == 0  # cleared after credit
+    assert s.mind.valence_of(content_key="cell_r18_c03:place") > 0.0
+    assert s.mind.valence_of(content_key="traj:key:1") > 0.0
+
+
+def test_summarize_and_multi_game_metric_smoke():
+    """Headless multi-game metric returns N rows + summary keys (short frames)."""
+    import tetris_demo as mod
+
+    rows, summary = mod.run_multi_game_metric(
+        games=1,
+        max_frames=120,
+        seed=7,
+        eligibility_window=8,
+        use_eligibility=True,
+        map_threshold=1,
+        verbose=False,
+    )
+    assert len(rows) == 1
+    assert summary["n"] == 1.0
+    for key in (
+        "mean_score",
+        "mean_lines",
+        "mean_holes",
+        "mean_max_height",
+        "mean_pieces",
+    ):
+        assert key in summary
+    r = rows[0]
+    assert r.game == 1
+    assert r.frames <= 120
+    assert r.pieces >= 0
+    d = r.as_dict()
+    assert "holes" in d and "max_height" in d
+
+
+def test_version_at_least_048():
+    from symbioid import __version__
+
+    parts = [int(x) for x in __version__.split(".")]
+    assert parts >= [0, 0, 48]
