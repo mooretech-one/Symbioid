@@ -712,27 +712,64 @@ class TetrisWorld:
         Soft-clone board, apply placement, return board features after lock
         (before next spawn matters). Does not mutate self.
         """
+        cells, feats = self.landing_cells_and_features(rotation, col)
+        return feats
+
+    def landing_cells_and_features(
+        self, rotation: int, col: int, *, base_board: list[list[str]] | None = None
+    ) -> tuple[list[tuple[int, int]], Optional[dict[str, float]]]:
+        """
+        One hard-drop: return (landing cells, post-lock board features).
+
+        Phase 3B: avoids separate landing_cells + simulate_placement drops.
+        ``base_board`` is an optional pre-cloned locked board (batch path).
+        """
         if self.active is None or self.game_over:
-            return None
-        # clone board
-        board = [row[:] for row in self.board]
+            return [], None
+        # Always clone: either from live board or from batch template
+        src = base_board if base_board is not None else self.board
+        board = [row[:] for row in src]
         kind = self.active.kind
         trial = ActivePiece(kind=kind, row=0, col=col, rotation=rotation % 4)
         if not self._cell_fits(board, trial):
-            return None
+            return [], None
         while True:
-            nxt = ActivePiece(kind=kind, row=trial.row + 1, col=col, rotation=trial.rotation)
+            nxt = ActivePiece(
+                kind=kind, row=trial.row + 1, col=col, rotation=trial.rotation
+            )
             if self._cell_fits(board, nxt):
                 trial = nxt
             else:
                 break
         cells = trial.cells()
         if any(r < 0 for r, _ in cells):
-            return None
+            return [], None
         for r, c in cells:
             board[r][c] = kind
         board, cleared = _clear_rows(board, self.cols, self.rows)
-        return _board_features(board, self.cols, self.rows, lines_cleared=cleared)
+        feats = _board_features(board, self.cols, self.rows, lines_cleared=cleared)
+        return list(cells), feats
+
+    def batch_landing_cells_and_features(
+        self, poses: list[tuple[int, int]]
+    ) -> list[tuple[list[tuple[int, int]], Optional[dict[str, float]]]]:
+        """
+        Phase 3B: score many landings with one base board snapshot template.
+
+        Each pose still clones the template (features need independent locks),
+        but shares the template read and avoids double hard-drop per pose.
+        """
+        if self.active is None or self.game_over:
+            return [([], None) for _ in poses]
+        template = [row[:] for row in self.board]
+        out: list[tuple[list[tuple[int, int]], Optional[dict[str, float]]]] = []
+        for rot, col in poses:
+            out.append(
+                self.landing_cells_and_features(
+                    int(rot), int(col), base_board=template
+                )
+            )
+        return out
 
     @staticmethod
     def _cell_fits(board: list[list[str]], piece: ActivePiece) -> bool:

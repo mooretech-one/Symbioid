@@ -116,9 +116,14 @@ class Mind(System):
     dynamics_mode: str = "hybrid"
     # Phase 2 pulse implementation:
     #   object — pure-Python pulse_partition (default; full feature set)
-    #   vector — numpy dense activation + CSR-style edge walk (full-graph only)
+    #   vector — numpy hot-set decay + adjacency (2A) or CSR dense (2B)
     dynamics_backend: str = "object"
     DYNAMICS_BACKENDS: tuple = ("object", "vector")
+    # Phase 2B: CSR dense pulse when hot/N >= thr AND hot >= min_hot.
+    # Defaults keep CSR off for typical demos (hotset path is faster today);
+    # lower min_hot to experiment (correctness covered by tests).
+    vector_csr_hot_fraction: float = 0.35
+    vector_csr_min_hot: int = 8000
     # Spectral substrate (Phase 2–3 defaults ON for mix + holonomic)
     spectral_mix_enabled: bool = True  # FFT residual mix after innerface/global pulse
     holonomic_store_enabled: bool = True  # Phase 3: interference memory on admit

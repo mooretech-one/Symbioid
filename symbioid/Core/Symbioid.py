@@ -834,6 +834,7 @@ class Symbioid(System):
             return None
         self._unindex_link_unlocked(t)
         self._hot_ids.discard(thought_id)
+        self._csr_cache = None
         return t
 
     def remove_thought(self, thought_id: str) -> Optional[Thought]:
@@ -846,6 +847,7 @@ class Symbioid(System):
         for t in self.thoughts.values():
             self._index_link_unlocked(t)
         self._out_index_dirty = False
+        self._csr_cache = None
 
     def rebuild_out_index(self) -> None:
         """Full adjacency rebuild (after bulk store replace / seed)."""
@@ -855,6 +857,7 @@ class Symbioid(System):
     def mark_out_index_dirty(self) -> None:
         """Call after external bulk mutations of ``thoughts`` without add/remove."""
         self._out_index_dirty = True
+        self._csr_cache = None
 
     def _outgoing_links_unlocked(
         self,
@@ -886,6 +889,7 @@ class Symbioid(System):
         """Register a Thought/Link under graph_lock; maintain Link adjacency."""
         with self.graph_lock:
             self._register_in_store_unlocked(thought)
+            self._csr_cache = None
 
     @property
     def thought_list(self) -> list[Thought]:
@@ -911,6 +915,7 @@ class Symbioid(System):
         else:
             self.env_thoughts = {}
         self._out_index_dirty = True
+        self._csr_cache = None
         return seed
 
     def install_laws(self) -> list[Law]:

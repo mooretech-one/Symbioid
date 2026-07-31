@@ -1295,11 +1295,39 @@ def test_summarize_and_multi_game_metric_smoke():
     assert "holes" in d and "max_height" in d
 
 
-def test_version_at_least_050():
+def test_version_at_least_051():
     from symbioid import __version__
 
     parts = [int(x) for x in __version__.split(".")]
-    assert parts >= [0, 0, 50]
+    assert parts >= [0, 0, 51]
+
+
+def test_landing_cells_and_features_matches_split_apis():
+    w = TetrisWorld(rng=Random(5), gravity_interval=9999)
+    opts = w.legal_placements()
+    assert opts
+    rot, col = opts[0]
+    cells_a = w.landing_cells(rot, col)
+    sim_a = w.simulate_placement(rot, col)
+    cells_b, sim_b = w.landing_cells_and_features(rot, col)
+    assert cells_a == cells_b
+    assert sim_a is not None and sim_b is not None
+    assert abs(float(sim_a["holes"]) - float(sim_b["holes"])) < 1e-9
+
+
+def test_batch_landing_template_independent():
+    w = TetrisWorld(rng=Random(6), gravity_interval=9999)
+    opts = w.legal_placements()[:5]
+    assert opts
+    batch = w.batch_landing_cells_and_features(opts)
+    assert len(batch) == len(opts)
+    for (rot, col), (cells, sim) in zip(opts, batch):
+        cells2, sim2 = w.landing_cells_and_features(rot, col)
+        assert cells == cells2
+        if sim is None:
+            assert sim2 is None
+        else:
+            assert abs(float(sim["holes"]) - float(sim2["holes"])) < 1e-9
 
 
 def test_batch_placement_scores_match_single():

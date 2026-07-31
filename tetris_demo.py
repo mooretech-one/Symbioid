@@ -917,15 +917,29 @@ def build_placement_score_context(s: Symbioid, world: TetrisWorld) -> PlacementS
     )
 
 
-def score_pose_with_context(ctx: PlacementScoreContext, rot: int, col: int) -> float:
+def score_pose_with_context(
+    ctx: PlacementScoreContext,
+    rot: int,
+    col: int,
+    *,
+    cells: list[tuple[int, int]] | None = None,
+    sim: dict | None = None,
+) -> float:
     """
     Phase C score for one landing using a shared context.
 
     Prefers filling holes (0.5), lower d_holes, deeper rows, high Mind valence.
     Illegal landings return a large penalty.
+
+    Phase 3B: pass ``cells`` + ``sim`` from one hard-drop to avoid double drop.
     """
     world = ctx.world
-    cells = world.landing_cells(rot, col)
+    if cells is None or sim is None:
+        cells2, sim2 = world.landing_cells_and_features(rot, col)
+        if cells is None:
+            cells = cells2
+        if sim is None:
+            sim = sim2
     if not cells:
         return -8.0
     field = ctx.field
@@ -937,6 +951,8 @@ def score_pose_with_context(ctx: PlacementScoreContext, rot: int, col: int) -> f
         pre_holes=ctx.pre_holes,
         pre_wm=ctx.pre_wm,
         field=field,
+        cells=cells,
+        sim=sim,
     )
     if float(hf.get("ok", 0.0)) >= 0.5:
         d_h = float(hf.get("d_holes", 0.0))
@@ -1011,18 +1027,31 @@ def batch_cell_thought_placement_scores(
     world: TetrisWorld,
     poses: list[tuple[int, int]],
 ) -> list[float]:
-    """Score many (rot, col) landings with one Mind/field snapshot."""
+    """
+    Score many (rot, col) landings with one Mind/field snapshot.
+
+    Phase 3B: one hard-drop per pose (shared board template) — no second
+    landing_cells + simulate_placement pair.
+    """
     if not poses:
         return []
     ctx = build_placement_score_context(s, world)
-    return [score_pose_with_context(ctx, int(rot), int(col)) for rot, col in poses]
+    landings = world.batch_landing_cells_and_features(list(poses))
+    out: list[float] = []
+    for (rot, col), (cells, sim) in zip(poses, landings):
+        out.append(
+            score_pose_with_context(
+                ctx, int(rot), int(col), cells=cells, sim=sim
+            )
+        )
+    return out
 
 
 class CachedGraphPlacementBonus:
     """
-    Phase 3 graph bonus: ``prepare(world, options)`` then O(1) lookups.
+    Phase 3/3B graph bonus: prepare then O(1) lookups.
 
-    Used as ``coach.graph_placement_bonus``; ``choose_target`` calls prepare.
+    ``prepare_landings`` reuses choose_target's hard-drop batch (no second sim).
     """
 
     def __init__(self, s: Symbioid) -> None:
@@ -1035,15 +1064,28 @@ class CachedGraphPlacementBonus:
             (int(rot), int(col)): float(sc) for (rot, col), sc in zip(options, scores)
         }
 
+    def prepare_landings(
+        self,
+        world: TetrisWorld,
+        options: list[tuple[int, int]],
+        landings: list,
+    ) -> None:
+        """Score from precomputed (cells, sim) pairs — one drop shared with coach."""
+        ctx = build_placement_score_context(self.s, world)
+        self._scores = {}
+        for (rot, col), (cells, sim) in zip(options, landings):
+            sc = score_pose_with_context(
+                ctx, int(rot), int(col), cells=cells, sim=sim
+            )
+            self._scores[(int(rot), int(col))] = float(sc)
+
     def __call__(self, world: TetrisWorld, rot: int, col: int) -> float:
         key = (int(rot) % 4, int(col))
-        # Also try un-normalized rot
         if key in self._scores:
             return self._scores[key]
         k2 = (int(rot), int(col))
         if k2 in self._scores:
             return self._scores[k2]
-        # Fallback single score (should be rare if prepare ran)
         return float(cell_thought_placement_score(self.s, world, rot, col))
 
 

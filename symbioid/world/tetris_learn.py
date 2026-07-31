@@ -114,6 +114,8 @@ def pose_hole_features(
     pre_holes: float | None = None,
     pre_wm: dict[str, float] | None = None,
     field: list | None = None,
+    cells: list[tuple[int, int]] | None = None,
+    sim: dict[str, float] | None = None,
 ) -> dict[str, float]:
     """
     Counterfactual hole signal for a candidate landing (rot, col).
@@ -122,8 +124,8 @@ def pose_hole_features(
     Also counts how many **existing** holes (cell reading 0.5) the landing
     would cover.
 
-    Optional ``pre_holes`` / ``pre_wm`` / ``field`` avoid recomputing board
-    globals when scoring many poses (Phase 3 batch).
+    Optional ``pre_holes`` / ``pre_wm`` / ``field`` / ``cells`` / ``sim`` avoid
+    recomputing board globals or a second hard-drop (Phase 3/3B batch).
 
     Returns keys:
       d_holes      — post.holes − pre.holes (positive = created/net more holes)
@@ -139,7 +141,12 @@ def pose_hole_features(
         pre_wm = well_metrics(world.column_heights())
     pre_well = float(pre_wm["well"])
     pre_max_well = float(pre_wm["max_well"])
-    cells = world.landing_cells(rot, col)
+    if cells is None or sim is None:
+        cells2, sim2 = world.landing_cells_and_features(rot, col)
+        if cells is None:
+            cells = cells2
+        if sim is None:
+            sim = sim2
     if not cells:
         return {
             "d_holes": 0.0,
@@ -161,7 +168,6 @@ def pose_hole_features(
         if 0 <= r < world.rows and 0 <= c < world.cols:
             if abs(float(field[r][c]) - 0.5) < 0.05:
                 holes_filled += 1.0
-    sim = world.simulate_placement(rot, col)
     if sim is None:
         return {
             "d_holes": 0.0,
@@ -750,9 +756,19 @@ class TetrisCoach:
         if not options:
             return self._clamp_pose(kind, world.active.rotation, cur_col, cols)
 
-        # Phase 3: batch graph bonus prepare (shared Mind/field locks)
+        # Phase 3B: one hard-drop batch for coach sim + graph bonus
+        landings = world.batch_landing_cells_and_features(options)
         bonus_fn = self.graph_placement_bonus
-        if bonus_fn is not None and hasattr(bonus_fn, "prepare"):
+        if bonus_fn is not None and hasattr(bonus_fn, "prepare_landings"):
+            try:
+                bonus_fn.prepare_landings(world, options, landings)  # type: ignore[union-attr]
+            except Exception:
+                if hasattr(bonus_fn, "prepare"):
+                    try:
+                        bonus_fn.prepare(world, options)  # type: ignore[union-attr]
+                    except Exception:
+                        pass
+        elif bonus_fn is not None and hasattr(bonus_fn, "prepare"):
             try:
                 bonus_fn.prepare(world, options)  # type: ignore[union-attr]
             except Exception:
@@ -764,8 +780,7 @@ class TetrisCoach:
         if net_primary:
             # Allow coach residual co-lead (was ≥0.55 floor; research 2026-07-26)
             g_w = max(0.35, min(0.98, g_w))
-        for rot, col in options:
-            sim = world.simulate_placement(rot, col)
+        for (rot, col), (_cells, sim) in zip(options, landings):
             if sim is None:
                 continue
             coach_v = self.evaluate_imagined_drop(pre, sim, rows=float(world.rows))

@@ -215,3 +215,58 @@ def test_vector_no_spread_in_spectral_mode():
     st = s.pulse_tick()
     assert st.get("graph_spread") is False
     assert st.get("spread", 0) == 0
+
+
+def test_vector_csr_mode_when_hot_fraction_high():
+    """Phase 2B: dense CSR path engages when hot/N and min_hot thresholds met."""
+    s = _ring_graph(80, links_per=2)
+    s.mind.set_dynamics_backend("vector")
+    s.mind.spectral_mix_enabled = False
+    s.mind.vector_csr_hot_fraction = 0.3
+    s.mind.vector_csr_min_hot = 20
+    # Heat most poles
+    for t in list(s.thoughts.values()):
+        if not isinstance(t, Link):
+            t.receive(1.5)
+            s.mark_hot(t)
+    st = s.pulse_tick()
+    assert st.get("dynamics_backend") == "vector"
+    assert st.get("vector_mode") == "csr"
+    assert st["fired"] >= 0
+
+
+def test_object_vs_vector_csr_activations():
+    """CSR path stays close to object over a few pulses."""
+    n_poles = 60
+    base = _ring_graph(n_poles, links_per=2)
+    for t in list(base.thoughts.values()):
+        if not isinstance(t, Link):
+            t.receive(1.4)
+            base.mark_hot(t)
+
+    so = _clone_state(base)
+    so.mind.set_dynamics_backend("object")
+    so.mind.spectral_mix_enabled = False
+    for _ in range(6):
+        so.pulse_tick()
+    snap_o = {
+        str(t.label): float(t.activation)
+        for t in so.thoughts.values()
+        if not isinstance(t, Link)
+    }
+
+    sv = _clone_state(base)
+    sv.mind.set_dynamics_backend("vector")
+    sv.mind.spectral_mix_enabled = False
+    sv.mind.vector_csr_hot_fraction = 0.2
+    sv.mind.vector_csr_min_hot = 10
+    for _ in range(6):
+        st = sv.pulse_tick()
+        assert st.get("vector_mode") in ("csr", "hotset")
+    snap_v = {
+        str(t.label): float(t.activation)
+        for t in sv.thoughts.values()
+        if not isinstance(t, Link)
+    }
+    for lab in snap_o:
+        assert abs(snap_o[lab] - snap_v[lab]) < 1e-3, lab
