@@ -769,9 +769,7 @@ def run_multi_game_metric(
         world, spectral=bool(spectral), spectral_primary=bool(spectral_primary)
     )
     coach.graph_placement_weight = 0.60
-    coach.graph_placement_bonus = (
-        lambda w, rot, col, _s=s: cell_thought_placement_score(_s, w, rot, col)
-    )
+    coach.graph_placement_bonus = CachedGraphPlacementBonus(s)
     win_n = int(eligibility_window) if use_eligibility else 0
     elig = EligibilityWindow(max_ticks=win_n)
     s.start_processes()
@@ -875,47 +873,27 @@ def run_multi_game_metric(
     return rows, summary
 
 
-def cell_thought_placement_score(
-    s: Symbioid,
-    world: TetrisWorld,
-    rot: int,
-    col: int,
-) -> float:
-    """
-    Phase C: score a landing pose using the cell map + Thought heat +
-    counterfactual hole features (``pose_hole_features``).
+@dataclass
+class PlacementScoreContext:
+    """Shared board/Mind lookups for scoring many poses (Phase 3)."""
 
-    Prefers filling **holes** (0.5), lower ``d_holes`` after sim lock, deeper
-    rows, and cells with high Mind valence. Illegal landings return a large
-    penalty.
-    """
-    cells = world.landing_cells(rot, col)
-    if not cells:
-        return -8.0
+    s: Symbioid
+    world: TetrisWorld
+    field: list
+    valence: dict
+    t2k: dict
+    last_by: dict
+    lab_index: dict
+    rc_to_sid: dict
+    pre_holes: float
+    pre_wm: dict
+
+
+def build_placement_score_context(s: Symbioid, world: TetrisWorld) -> PlacementScoreContext:
+    """One-shot locks + board features for a choose_target batch."""
+    from symbioid.world.tetris import well_metrics
+
     field = world.cell_field_state(with_active=False)
-    score = 0.0
-    # --- Hole + open-well avoidance (edge-aware wells) ---
-    hf = pose_hole_features(world, rot, col)
-    if float(hf.get("ok", 0.0)) >= 0.5:
-        d_h = float(hf.get("d_holes", 0.0))
-        d_w = float(hf.get("d_well", 0.0))
-        d_mw = float(hf.get("d_max_well", 0.0))
-        # Strongly punish poses that create net new holes; reward clearing them
-        score -= 3.0 * max(0.0, d_h)
-        score += 1.5 * max(0.0, -d_h)
-        # Open single-width trenches (left/right edges included)
-        score -= 2.5 * max(0.0, d_w)
-        score += 1.8 * max(0.0, -d_w)
-        score -= 2.0 * max(0.0, d_mw)
-        score += 1.2 * max(0.0, -d_mw)
-        # Prefer not leaving a deep residual well after the drop
-        score -= 0.8 * float(hf.get("post_max_well", 0.0))
-        # Extra nudge for covering existing sealed holes (also per-cell below)
-        score += 0.8 * float(hf.get("holes_filled", 0.0))
-    else:
-        score -= 4.0  # illegal / failed sim
-
-    # sensor_id for each (r,c)
     rc_to_sid = {rc: sid for sid, rc in (getattr(s, "_cell_rc", {}) or {}).items()}
     with s.innerface._local_lock:
         last_by = dict(s.innerface._last_obs_by_sensor)
@@ -923,6 +901,63 @@ def cell_thought_placement_score(
         valence = dict(s.mind._valence)
         t2k = dict(s.mind._thought_to_key)
     lab_index = _cell_obs_index(s)
+    pre_holes = float(world.hole_count())
+    pre_wm = well_metrics(world.column_heights())
+    return PlacementScoreContext(
+        s=s,
+        world=world,
+        field=field,
+        valence=valence,
+        t2k=t2k,
+        last_by=last_by,
+        lab_index=lab_index,
+        rc_to_sid=rc_to_sid,
+        pre_holes=pre_holes,
+        pre_wm=pre_wm,
+    )
+
+
+def score_pose_with_context(ctx: PlacementScoreContext, rot: int, col: int) -> float:
+    """
+    Phase C score for one landing using a shared context.
+
+    Prefers filling holes (0.5), lower d_holes, deeper rows, high Mind valence.
+    Illegal landings return a large penalty.
+    """
+    world = ctx.world
+    cells = world.landing_cells(rot, col)
+    if not cells:
+        return -8.0
+    field = ctx.field
+    score = 0.0
+    hf = pose_hole_features(
+        world,
+        rot,
+        col,
+        pre_holes=ctx.pre_holes,
+        pre_wm=ctx.pre_wm,
+        field=field,
+    )
+    if float(hf.get("ok", 0.0)) >= 0.5:
+        d_h = float(hf.get("d_holes", 0.0))
+        d_w = float(hf.get("d_well", 0.0))
+        d_mw = float(hf.get("d_max_well", 0.0))
+        score -= 3.0 * max(0.0, d_h)
+        score += 1.5 * max(0.0, -d_h)
+        score -= 2.5 * max(0.0, d_w)
+        score += 1.8 * max(0.0, -d_w)
+        score -= 2.0 * max(0.0, d_mw)
+        score += 1.2 * max(0.0, -d_mw)
+        score -= 0.8 * float(hf.get("post_max_well", 0.0))
+        score += 0.8 * float(hf.get("holes_filled", 0.0))
+    else:
+        score -= 4.0
+
+    valence = ctx.valence
+    t2k = ctx.t2k
+    last_by = ctx.last_by
+    lab_index = ctx.lab_index
+    rc_to_sid = ctx.rc_to_sid
 
     for r, c in cells:
         if not (0 <= r < world.rows and 0 <= c < world.cols):
@@ -930,13 +965,13 @@ def cell_thought_placement_score(
             continue
         reading = float(field[r][c])
         if reading >= 0.99:
-            score -= 2.5  # would overlap a locked block (shouldn't if legal)
+            score -= 2.5
             continue
         if abs(reading - 0.5) < 0.05:
-            score += 1.6  # fill a real hole
+            score += 1.6
         else:
-            score += 0.12  # pack open air
-        score += 0.035 * float(r)  # prefer deeper landings
+            score += 0.12
+        score += 0.035 * float(r)
 
         sid = rc_to_sid.get((r, c))
         th = last_by.get(sid) if sid else None
@@ -950,10 +985,66 @@ def cell_thought_placement_score(
             score += 0.12 * float(getattr(oth, "activation", 0.0) or 0.0)
             score += 0.12 * float(valence.get(ck, 0.0))
             break
-        # Synthetic placement-credit key (see apply_lock_valence_to_landing_cells)
         synth = f"{lab}:place"
         score += 0.22 * float(valence.get(synth, 0.0))
     return score
+
+
+def cell_thought_placement_score(
+    s: Symbioid,
+    world: TetrisWorld,
+    rot: int,
+    col: int,
+) -> float:
+    """
+    Phase C: score a landing pose (single-pose API).
+
+    Builds a one-shot context; for many poses prefer
+    ``batch_cell_thought_placement_scores`` or ``CachedGraphPlacementBonus``.
+    """
+    ctx = build_placement_score_context(s, world)
+    return score_pose_with_context(ctx, rot, col)
+
+
+def batch_cell_thought_placement_scores(
+    s: Symbioid,
+    world: TetrisWorld,
+    poses: list[tuple[int, int]],
+) -> list[float]:
+    """Score many (rot, col) landings with one Mind/field snapshot."""
+    if not poses:
+        return []
+    ctx = build_placement_score_context(s, world)
+    return [score_pose_with_context(ctx, int(rot), int(col)) for rot, col in poses]
+
+
+class CachedGraphPlacementBonus:
+    """
+    Phase 3 graph bonus: ``prepare(world, options)`` then O(1) lookups.
+
+    Used as ``coach.graph_placement_bonus``; ``choose_target`` calls prepare.
+    """
+
+    def __init__(self, s: Symbioid) -> None:
+        self.s = s
+        self._scores: dict[tuple[int, int], float] = {}
+
+    def prepare(self, world: TetrisWorld, options: list[tuple[int, int]]) -> None:
+        scores = batch_cell_thought_placement_scores(self.s, world, list(options))
+        self._scores = {
+            (int(rot), int(col)): float(sc) for (rot, col), sc in zip(options, scores)
+        }
+
+    def __call__(self, world: TetrisWorld, rot: int, col: int) -> float:
+        key = (int(rot) % 4, int(col))
+        # Also try un-normalized rot
+        if key in self._scores:
+            return self._scores[key]
+        k2 = (int(rot), int(col))
+        if k2 in self._scores:
+            return self._scores[k2]
+        # Fallback single score (should be rare if prepare ran)
+        return float(cell_thought_placement_score(self.s, world, rot, col))
 
 
 def graph_preferred_intent(
@@ -1728,10 +1819,9 @@ def main(argv: list[str] | None = None) -> None:
     )
     # Co-lead blend: network heat + coach residual (research 2026-07-26).
     # Floor clamp in choose_target is 0.35 so 0.60 is honored.
+    # Phase 3: batch Mind/field locks once per choose_target via prepare().
     coach.graph_placement_weight = 0.60
-    coach.graph_placement_bonus = (
-        lambda w, rot, col, _s=s: cell_thought_placement_score(_s, w, rot, col)
-    )
+    coach.graph_placement_bonus = CachedGraphPlacementBonus(s)
 
     mem_path = Path(args.memory)
     use_memory = not args.no_memory

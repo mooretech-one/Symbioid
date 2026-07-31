@@ -1295,8 +1295,68 @@ def test_summarize_and_multi_game_metric_smoke():
     assert "holes" in d and "max_height" in d
 
 
-def test_version_at_least_048():
+def test_version_at_least_050():
     from symbioid import __version__
 
     parts = [int(x) for x in __version__.split(".")]
-    assert parts >= [0, 0, 48]
+    assert parts >= [0, 0, 50]
+
+
+def test_batch_placement_scores_match_single():
+    """Phase 3: batch API matches single-pose scores (same context semantics)."""
+    mod = _load_tetris_demo()
+    w = TetrisWorld(rng=Random(2), gravity_interval=9999)
+    s = mod.build_symbioid(w)
+    opts = w.legal_placements()
+    assert opts
+    batch = mod.batch_cell_thought_placement_scores(s, w, opts)
+    assert len(batch) == len(opts)
+    ctx = mod.build_placement_score_context(s, w)
+    for (rot, col), sc in zip(opts, batch):
+        single = mod.score_pose_with_context(ctx, rot, col)
+        assert abs(single - sc) < 1e-9
+
+
+def test_cached_graph_bonus_prepare_ranking_stable():
+    """prepare + lookup preserves relative ranking vs single scores."""
+    mod = _load_tetris_demo()
+    w = TetrisWorld(rng=Random(3), gravity_interval=9999)
+    s = mod.build_symbioid(w)
+    opts = w.legal_placements()
+    assert len(opts) >= 2
+    bonus = mod.CachedGraphPlacementBonus(s)
+    bonus.prepare(w, opts)
+    singles = [mod.cell_thought_placement_score(s, w, r, c) for r, c in opts]
+    cached = [bonus(w, r, c) for r, c in opts]
+    # Same argmax (ties broken by first max)
+    assert cached.index(max(cached)) == singles.index(max(singles)) or abs(
+        max(cached) - max(singles)
+    ) < 1e-6
+    for a, b in zip(cached, singles):
+        assert abs(a - b) < 1e-5
+
+
+def test_choose_target_calls_prepare_on_batch_bonus():
+    w = TetrisWorld(rng=Random(4), gravity_interval=9999)
+    coach = TetrisCoach(rng=Random(4), network_primary=True, map_threshold=1)
+    for b, e in ((1, "left"), (2, "right"), (3, "rotate"), (4, "hard")):
+        coach.effect_counts[b][e] = 2
+        coach.bytes_tried.add(b)
+    prepared = {"n": 0}
+
+    class PrepBonus:
+        def prepare(self, world, options):
+            prepared["n"] += 1
+            prepared["opts"] = list(options)
+
+        def __call__(self, world, rot, col):
+            return float(col)
+
+    coach.graph_placement_bonus = PrepBonus()
+    coach.graph_placement_weight = 0.90
+    coach.place_explore = 0.0
+    if w.active is None:
+        return
+    coach.choose_target(w)
+    assert prepared["n"] == 1
+    assert prepared.get("opts")

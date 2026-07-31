@@ -110,6 +110,10 @@ def pose_hole_features(
     world: TetrisWorld,
     rot: int,
     col: int,
+    *,
+    pre_holes: float | None = None,
+    pre_wm: dict[str, float] | None = None,
+    field: list | None = None,
 ) -> dict[str, float]:
     """
     Counterfactual hole signal for a candidate landing (rot, col).
@@ -118,14 +122,21 @@ def pose_hole_features(
     Also counts how many **existing** holes (cell reading 0.5) the landing
     would cover.
 
+    Optional ``pre_holes`` / ``pre_wm`` / ``field`` avoid recomputing board
+    globals when scoring many poses (Phase 3 batch).
+
     Returns keys:
       d_holes      — post.holes − pre.holes (positive = created/net more holes)
       holes_filled — landing cells that are currently holes
       pre_holes, post_holes
       ok           — 1.0 if sim legal, else 0.0
     """
-    pre_holes = float(world.hole_count())
-    pre_wm = well_metrics(world.column_heights())
+    if pre_holes is None:
+        pre_holes = float(world.hole_count())
+    else:
+        pre_holes = float(pre_holes)
+    if pre_wm is None:
+        pre_wm = well_metrics(world.column_heights())
     pre_well = float(pre_wm["well"])
     pre_max_well = float(pre_wm["max_well"])
     cells = world.landing_cells(rot, col)
@@ -143,7 +154,8 @@ def pose_hole_features(
             "post_max_well": pre_max_well,
             "ok": 0.0,
         }
-    field = world.cell_field_state(with_active=False)
+    if field is None:
+        field = world.cell_field_state(with_active=False)
     holes_filled = 0.0
     for r, c in cells:
         if 0 <= r < world.rows and 0 <= c < world.cols:
@@ -342,6 +354,7 @@ class TetrisCoach:
     graph_placement_bonus: Optional[
         Callable[[TetrisWorld, int, int], float]
     ] = field(default=None, repr=False)
+    # Optional Phase 3: prepare(world, options) before per-pose bonus lookups
     placements: int = 0
     lines_total: int = 0
     games: int = 0
@@ -736,6 +749,14 @@ class TetrisCoach:
         options = world.legal_placements()
         if not options:
             return self._clamp_pose(kind, world.active.rotation, cur_col, cols)
+
+        # Phase 3: batch graph bonus prepare (shared Mind/field locks)
+        bonus_fn = self.graph_placement_bonus
+        if bonus_fn is not None and hasattr(bonus_fn, "prepare"):
+            try:
+                bonus_fn.prepare(world, options)  # type: ignore[union-attr]
+            except Exception:
+                pass
 
         scored: list[tuple[float, int, int, float]] = []
         net_primary = bool(self.network_primary) and self.graph_placement_bonus is not None

@@ -114,6 +114,11 @@ class Mind(System):
     #   hybrid   — graph pulse + optional FFT residual (default)
     #   spectral — no Link spread/Hebb; FFT mix is the only associative dynamics
     dynamics_mode: str = "hybrid"
+    # Phase 2 pulse implementation:
+    #   object — pure-Python pulse_partition (default; full feature set)
+    #   vector — numpy dense activation + CSR-style edge walk (full-graph only)
+    dynamics_backend: str = "object"
+    DYNAMICS_BACKENDS: tuple = ("object", "vector")
     # Spectral substrate (Phase 2–3 defaults ON for mix + holonomic)
     spectral_mix_enabled: bool = True  # FFT residual mix after innerface/global pulse
     holonomic_store_enabled: bool = True  # Phase 3: interference memory on admit
@@ -260,6 +265,20 @@ class Mind(System):
     def graph_spread_enabled(self) -> bool:
         """True when one-hop Link spread + Hebb should run in pulse_partition."""
         return self.normalize_dynamics_mode() in ("graph", "hybrid")
+
+    def normalize_dynamics_backend(self, backend: Optional[str] = None) -> str:
+        b = str(
+            backend if backend is not None else self.dynamics_backend or "object"
+        ).strip().lower()
+        if b not in self.DYNAMICS_BACKENDS:
+            b = "object"
+        return b
+
+    def set_dynamics_backend(self, backend: str) -> str:
+        """Set pulse backend: object | vector (CPU). Returns normalized value."""
+        b = self.normalize_dynamics_backend(backend)
+        self.dynamics_backend = b
+        return b
 
     def spectral_mix_wanted(self) -> bool:
         """True when FFT residual mix should run after innerface/global pulse."""

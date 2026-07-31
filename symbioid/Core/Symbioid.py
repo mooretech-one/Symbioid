@@ -441,6 +441,53 @@ class Symbioid(System):
                 "dynamics_mode": getattr(mind, "dynamics_mode", "hybrid"),
             }
 
+        # Phase 2: vector CPU pulse (full-graph unrestricted only)
+        backend = (
+            mind.normalize_dynamics_backend()
+            if mind is not None and hasattr(mind, "normalize_dynamics_backend")
+            else "object"
+        )
+        if backend == "vector":
+            from symbioid.Core.vector_pulse import (
+                can_use_vector_pulse,
+                pulse_partition_vector,
+            )
+
+            if can_use_vector_pulse(
+                membership=membership,
+                synapse_filter=synapse_filter,
+                owner_only=owner_only,
+                energy_budget=energy_budget,
+            ):
+                with self.graph_lock:
+                    stats_v = pulse_partition_vector(
+                        self, engine_name=engine_name, hebb=hebb
+                    )
+                # Spectral residual mix (same as object path tail)
+                want_mix = (
+                    mind.spectral_mix_wanted()
+                    if mind is not None and hasattr(mind, "spectral_mix_wanted")
+                    else bool(
+                        getattr(mind, "spectral_mix_enabled", False) if mind else False
+                    )
+                )
+                if mind is not None and want_mix and engine_name in ("innerface", "global"):
+                    dyn_mode_v = (
+                        mind.normalize_dynamics_mode()
+                        if hasattr(mind, "normalize_dynamics_mode")
+                        else "hybrid"
+                    )
+                    cands = list(self._hot_ids)
+                    if dyn_mode_v == "spectral" and float(
+                        getattr(mind, "spectral_mix_gain", 0.0) or 0.0
+                    ) == 0.0:
+                        mind.spectral_mix_gain = 0.15
+                    mix = mind.spectral_mix_step(self, candidate_ids=cands or None)
+                    stats_v = dict(stats_v)
+                    stats_v["spectral"] = mix
+                return stats_v
+            # else fall through to object path (masked / energy / filter)
+
         dyn_mode = (
             mind.normalize_dynamics_mode()
             if mind is not None and hasattr(mind, "normalize_dynamics_mode")
