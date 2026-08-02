@@ -94,7 +94,9 @@ SAMPLE_EVERY = 2  # was 1 — fewer cell admits per second
 PULSE_EVERY = 4  # was 1 — full-graph pulse less often
 PULSES_PRE_CMD = 0  # was 1 — main settle optional
 PULSES_ON_LOCK = 1  # was 2
-PLACE_EVERY = 3  # recompute network placement every N cmd frames
+PLACE_EVERY = 1  # recompute geo intent every cmd frame (was 3 — caused overshoot)
+# Expensive choose_target re-score only when piece is new / stuck / interval
+TARGET_RESCORE_EVERY = 12  # frames while same piece; 0 = only on new piece / stuck
 MID_GAME_GC_EVERY = 80  # frames; hard-cap GC while playing
 GRAVITY_INTERVAL = 30  # ~1.0 s/row at 30 FPS with cmd every frame
 # Top-out: half second for Innerface queue (was 1.0 s)
@@ -222,6 +224,21 @@ def thought_counts_active_inactive(s: Symbioid) -> tuple[int, int]:
     return n_active, n_inactive
 
 
+def _geo_intent_for_target(world: TetrisWorld, coach: TetrisCoach) -> str | None:
+    """Cheap micro-intent from current piece vs coach._target (no scoring)."""
+    if world.active is None or coach._target is None:
+        return None
+    tgt_rot, tgt_col = coach._target
+    cur = world.active
+    if cur.rotation % 4 != int(tgt_rot) % 4:
+        return "rotate"
+    if cur.col < int(tgt_col):
+        return "right"
+    if cur.col > int(tgt_col):
+        return "left"
+    return "hard"
+
+
 def cached_graph_intent(
     s: Symbioid,
     world: TetrisWorld,
@@ -231,24 +248,70 @@ def cached_graph_intent(
     place_every: int = PLACE_EVERY,
 ) -> tuple[str | None, float, list, str]:
     """
-    Throttle expensive network placement scoring (v0.0.57).
+    Placement control (v0.0.58): **always** refresh left/right/hard from current
+    col vs target (fixes overshoot from caching "right" for N frames).
 
-    Reuses last preferred intent / poles for ``place_every - 1`` frames unless
-    a piece just locked (options board changes).
+    Expensive ``choose_target`` only on new piece, stuck lateral, or
+    ``TARGET_RESCORE_EVERY`` interval — not every frame.
     """
-    pe = max(1, int(place_every))
-    last_lock = int(getattr(coach, "last_lock_frame", -999) or -999)
-    force = (frame - last_lock) <= 1
-    cache = getattr(coach, "_intent_cache", None)
-    if (
-        not force
-        and isinstance(cache, tuple)
-        and len(cache) == 5
-        and (frame - int(cache[0])) < pe
+    _ = place_every  # kept for API compatibility; geo is always fresh
+    net = bool(getattr(coach, "network_primary", True))
+    play = coach.play_ready() or coach.map_complete()
+    poles = policy_state_poles(s, world)
+
+    # New piece (after a prior piece) → force re-score; first touch only stamps key
+    piece_key = None
+    if world.active is not None:
+        a = world.active
+        piece_key = (a.kind, world.pieces_placed, a.rotation % 4)
+    last_piece = getattr(coach, "_intent_piece_key", None)
+    if piece_key is not None and last_piece is None:
+        coach._intent_piece_key = piece_key  # type: ignore[attr-defined]
+        new_piece = False
+    elif piece_key is not None and piece_key != last_piece:
+        coach._intent_piece_key = piece_key  # type: ignore[attr-defined]
+        coach._target = None  # force re-score for new piece
+        coach._target_score_frame = -999  # type: ignore[attr-defined]
+        new_piece = True
+    else:
+        new_piece = False
+
+    stuck = int(getattr(coach, "_stuck_lateral", 0) or 0) >= 2
+    last_score_f = int(getattr(coach, "_target_score_frame", -999) or -999)
+    rescore_iv = int(TARGET_RESCORE_EVERY)
+    need_rescore = (
+        coach._target is None
+        or new_piece
+        or stuck
+        or (rescore_iv > 0 and (frame - last_score_f) >= rescore_iv)
+    )
+
+    if need_rescore and world.active is not None and (
+        play or (net and coach.graph_placement_bonus is not None)
     ):
-        return cache[1], float(cache[2]), list(cache[3]), str(cache[4])
-    preferred, g_bias, poles, hint = graph_preferred_intent(s, world, coach)
-    coach._intent_cache = (frame, preferred, g_bias, poles, hint or "")  # type: ignore[attr-defined]
+        # Full path: choose_target + mind + bias
+        preferred, g_bias, poles, hint = graph_preferred_intent(s, world, coach)
+        coach._target_score_frame = frame  # type: ignore[attr-defined]
+        return preferred, float(g_bias), poles, str(hint or "")
+
+    # Fast path: target already set — only update geo from *current* col/rot
+    geo = _geo_intent_for_target(world, coach)
+    preferred = geo
+    hint = f"geo:{geo}" if geo else ""
+    if coach.wants_hard_now(world):
+        preferred = "hard"
+        hint = "hard@stuck" if stuck else "hard@align"
+    # Soft Mind peek only when rescoring is rare (optional, cheapish)
+    if preferred is not None and play:
+        g_bias = 0.98 if preferred == "hard" else 0.93
+    elif preferred is not None:
+        g_bias = 0.50
+    else:
+        g_bias = 0.0
+    if preferred is not None:
+        th = s.mind.ensure_action_thought("tetris", preferred, host_id=s.id)
+        s.add_thought(th)
+        s.stimulate(th, 1.35 if net else 0.9)
     return preferred, float(g_bias), poles, str(hint or "")
 
 

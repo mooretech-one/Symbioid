@@ -363,7 +363,7 @@ def test_demo_timing_sense_not_slower_than_command():
     assert mod.SAMPLE_EVERY >= 1 and mod.CMD_EVERY == 1
     assert mod.SAMPLE_EVERY <= 4
     assert mod.PULSE_EVERY >= 2
-    assert mod.PLACE_EVERY >= 2
+    assert mod.PLACE_EVERY >= 1
     assert 0.0 < mod.FACE_TICK_INTERVAL <= 0.15
     assert mod.GRAVITY_INTERVAL >= mod.FPS // 2  # not free-fall every frame
     w = TetrisWorld(rng=Random(0))
@@ -733,6 +733,36 @@ def test_phase_b_wants_hard_when_aligned():
     # Not aligned and not stuck
     if coach._target[1] != w.active.col:
         assert coach.wants_hard_now(w) is False
+
+
+def test_geo_intent_stops_when_aligned_not_cached_overshoot():
+    """v0.0.58: never keep 'right' after col reaches target (PLACE_EVERY overshoot)."""
+    import tetris_demo as mod
+
+    w = TetrisWorld(rng=Random(5), gravity_interval=9999)
+    coach = TetrisCoach(rng=Random(5), map_threshold=1, network_primary=True)
+    for b, e in ((1, "left"), (2, "right"), (3, "rotate"), (4, "hard")):
+        coach.effect_counts[b][e] = 2
+        coach.bytes_tried.add(b)
+    coach._begin_piece(w)
+    assert w.active is not None
+    # Target two columns to the right of current
+    start = int(w.active.col)
+    tgt = min(w.cols - 1, start + 2)
+    if tgt == start:
+        tgt = max(0, start - 2)
+    coach._target = (w.active.rotation % 4, tgt)
+    coach._target_score_frame = 0  # pretend target already scored
+    s = mod.build_symbioid(w)
+    pref, _, _, _ = mod.cached_graph_intent(s, w, coach, frame=10, place_every=99)
+    if tgt > start:
+        assert pref == "right", pref
+    else:
+        assert pref == "left", pref
+    # Teleport to target col → must switch to hard (not keep lateral)
+    w.active.col = tgt
+    pref2, _, _, _ = mod.cached_graph_intent(s, w, coach, frame=11, place_every=99)
+    assert pref2 == "hard", pref2
 
 
 def test_last_lock_effect_hard_on_hard_drop():
