@@ -67,25 +67,11 @@ CELL = 28
 COLS, ROWS = 10, 20
 BOARD_W, BOARD_H = COLS * CELL, ROWS * CELL
 SIDE = 280
-# Plots under the board: Active / Inactive / Minted Thoughts vs game turns
-PLOT_H = 88  # height per plot panel
-PLOT_GAP = 6
-PLOT_MARGIN = 10
-PLOT_HISTORY = 1024  # game turns (piece locks) on the x-axis window
-N_PLOTS = 3
 MARGIN_X = 20
 MARGIN_Y = 20
-FOOTER_H = 28
 W = BOARD_W + SIDE + MARGIN_X * 2 + 24
-H = (
-    MARGIN_Y
-    + BOARD_H
-    + PLOT_MARGIN
-    + N_PLOTS * PLOT_H
-    + (N_PLOTS - 1) * PLOT_GAP
-    + FOOTER_H
-    + MARGIN_Y
-)
+# Gameplay HUD only (no thought plots / debug chrome)
+H = MARGIN_Y + BOARD_H + MARGIN_Y
 FPS = 30
 # Multi-game survival (v0.0.57): throttle dynamics/placement so N growth does not
 # peg CPU by game ~6. Order: sample → sparse pulse → decide (optional settle).
@@ -1815,99 +1801,14 @@ def sample_into_symbioid(s: Symbioid, world: TetrisWorld, tick: int) -> None:
         s.innerface.post(handoffs[0])
 
 
-def draw_thought_plot(
-    screen: pygame.Surface,
-    history: list[int],
-    font_sm: pygame.font.Font,
-    *,
-    ox: int,
-    oy: int,
-    width: int,
-    height: int,
-    title: str,
-    line_color: tuple[int, int, int],
-    marker_color: tuple[int, int, int],
-    show_x_labels: bool = True,
-) -> None:
-    """One line plot of a Thought-count series over the last PLOT_HISTORY turns."""
-    pygame.draw.rect(
-        screen, (20, 24, 40), (ox - 2, oy - 2, width + 4, height + 4), border_radius=4
-    )
-    pygame.draw.rect(screen, (8, 10, 18), (ox, oy, width, height))
-
-    pad_l, pad_r, pad_t, pad_b = 36, 8, 14, 20 if show_x_labels else 8
-    plot_x = ox + pad_l
-    plot_y = oy + pad_t
-    plot_w = max(1, width - pad_l - pad_r)
-    plot_h = max(1, height - pad_t - pad_b)
-
-    pygame.draw.rect(screen, (40, 48, 70), (plot_x, plot_y, plot_w, plot_h), width=1)
-
-    # Title + live value
-    cur = history[-1] if history else 0
-    screen.blit(
-        font_sm.render(f"{title}: {cur} ", True, line_color),
-        (ox + 80, oy + 1),
-    )
-
-    if len(history) < 2:
-        screen.blit(
-            font_sm.render("waiting for turns…", True, (100, 110, 130)),
-            (plot_x + 8, plot_y + max(0, plot_h // 2 - 6)),
-        )
-        return
-
-    data = history[-PLOT_HISTORY:]
-    n = len(data)
-    y_min = min(data)
-    y_max = max(data)
-    if y_max <= y_min:
-        y_max = y_min + 1
-    span = y_max - y_min
-    y_min = max(0, y_min - max(1, span // 10))
-    y_max = y_max + max(1, span // 10)
-
-    def sx(i: int) -> int:
-        return plot_x + int(i * (plot_w - 1) / max(1, PLOT_HISTORY - 1))
-
-    def sy(v: int) -> int:
-        t = (v - y_min) / (y_max - y_min)
-        return plot_y + plot_h - 1 - int(t * (plot_h - 1))
-
-    for tick in (0, 256, 512, 768, 1024):
-        tx = plot_x + int(tick * (plot_w - 1) / max(1, PLOT_HISTORY - 1))
-        pygame.draw.line(
-            screen, (30, 36, 55), (tx, plot_y), (tx, plot_y + plot_h - 1), 1
-        )
-        if show_x_labels:
-            label = font_sm.render(str(tick), True, (90, 100, 120))
-            screen.blit(label, (tx - label.get_width() // 2, plot_y + plot_h + 2))
-
-    for v, label_s in ((y_min, str(y_min)), (y_max, str(y_max))):
-        ly = sy(v)
-        lab = font_sm.render(label_s, True, (90, 100, 120))
-        screen.blit(lab, (ox + 2, ly - lab.get_height() // 2))
-
-    offset = PLOT_HISTORY - n
-    points = [(sx(offset + i), sy(v)) for i, v in enumerate(data)]
-    if len(points) >= 2:
-        pygame.draw.lines(screen, line_color, False, points, 2)
-    pygame.draw.circle(screen, marker_color, points[-1], 3)
-
-
 def draw(
     screen: pygame.Surface,
     world: TetrisWorld,
     coach: TetrisCoach,
-    s: Symbioid,
-    active_history: list[int],
-    inactive_history: list[int],
-    mint_history: list[int],
     font: pygame.font.Font,
     font_sm: pygame.font.Font,
     *,
     pause_seconds_left: float | None = None,
-    graph_hint: str | None = None,
 ) -> None:
     screen.fill((12, 14, 28))
     ox, oy = MARGIN_X, MARGIN_Y
@@ -1963,11 +1864,9 @@ def draw(
                     border_radius=3,
                 )
 
-    # Right panel: game / score / lines / pieces / next / highscores only
+    # Right panel: gameplay only — game, score, lines, pieces, next, highscores
     sx = ox + BOARD_W + 24
     y = oy
-    screen.blit(font.render("Symbioid Tetris", True, (200, 210, 230)), (sx, y))
-    y += 32
     for line, color in (
         (f"game  #{coach.game_number}", (180, 190, 210)),
         (f"score  {world.score}", (180, 190, 210)),
@@ -1976,128 +1875,6 @@ def draw(
     ):
         screen.blit(font_sm.render(line, True, color), (sx, y))
         y += 20
-
-    # Board packing sensors (holes = sealed; well = open trenches, edge-aware)
-    try:
-        from symbioid.world.tetris_learn import observe_board as _obs_board
-
-        _bo = _obs_board(world)
-        n_holes = int(_bo.get("holes", world.hole_count()))
-        n_well = float(_bo.get("well", 0.0))
-        n_mw = float(_bo.get("max_well", 0.0))
-    except Exception:
-        n_holes = int(world.hole_count())
-        n_well = float(getattr(world, "well_depth", lambda: 0.0)())
-        n_mw = float(getattr(world, "max_well_depth", lambda: 0.0)())
-    y += 6
-    screen.blit(
-        font_sm.render(
-            f"pack  holes={n_holes}  well={n_well:.0f}  maxW={n_mw:.0f}",
-            True,
-            (220, 160, 140) if (n_holes > 0 or n_mw >= 2) else (140, 170, 150),
-        ),
-        (sx, y),
-    )
-    y += 16
-    d_h = float(getattr(s, "_last_d_holes", 0.0) or 0.0)
-    screen.blit(
-        font_sm.render(
-            f"Δh    last={d_h:+.0f}  (past lock)",
-            True,
-            (220, 150, 130) if d_h > 0 else (130, 190, 150) if d_h < 0 else (120, 140, 160),
-        ),
-        (sx, y),
-    )
-    y += 16
-    pred_d = float(getattr(s, "_pred_d_holes", 0.0) or 0.0)
-    freed = float(getattr(s, "_holes_freed", 0.0) or 0.0)
-    fill_n = float(getattr(s, "_holes_fill_n", 0.0) or 0.0)
-    screen.blit(
-        font_sm.render(
-            f"free  predΔ={pred_d:+.0f}  frees={freed:.0f}  fill={fill_n:.0f}",
-            True,
-            (130, 200, 150) if freed > 0 else (200, 160, 130) if pred_d > 0 else (120, 140, 160),
-        ),
-        (sx, y),
-    )
-    y += 16
-    # TFT / iterated twin (v0.0.53+)
-    try:
-        snap = s.mind.tft_snapshot()
-        cnt = snap.get("counts") or {}
-        tft_line = (
-            f"tft   {snap.get('tft_state', 'open')}  "
-            f"C={cnt.get('C', 0)} D={cnt.get('D', 0)} U={cnt.get('U', 0)}  "
-            f"stk={snap.get('c_streak', 0)} fg={snap.get('forgives', 0)}"
-        )
-        st = str(snap.get("tft_state", "open"))
-        tft_color = (
-            (200, 140, 120)
-            if st == "retaliate"
-            else (140, 190, 160)
-            if st == "open"
-            else (160, 170, 200)
-        )
-    except Exception:
-        tft_line = "tft   (n/a)"
-        tft_color = (120, 130, 150)
-    screen.blit(font_sm.render(tft_line, True, tft_color), (sx, y))
-    y += 16
-    # Clocks: sense / command / pulse periods (frames @ FPS)
-    screen.blit(
-        font_sm.render(
-            f"clk   se/{SAMPLE_EVERY} cmd/{CMD_EVERY} p/{PULSE_EVERY}"
-            f"+{PULSES_PRE_CMD}pre +{PULSES_ON_LOCK}lk pl/{PLACE_EVERY}",
-            True,
-            (110, 130, 150),
-        ),
-        (sx, y),
-    )
-    y += 16
-
-    # Active six-set breakdown (Band A caps; sense/sync/integrate)
-    n_act, n_inact = thought_counts_active_inactive(s)
-    summary = s.innerface.active_set_summary()
-    n_sense = int(summary.get("sense", 0))
-    n_sync = int(summary.get("sync", 0))
-    n_int = int(summary.get("integrate", 0))
-    cap_s = int(s.innerface.max_active_senses)
-    cap_y = int(s.innerface.max_active_syncs)
-    cap_i = int(s.innerface.max_active_integrates)
-    y += 8
-    screen.blit(
-        font_sm.render(f"Thoughts  A={n_act}  I={n_inact}", True, (140, 200, 160)),
-        (sx, y),
-    )
-    y += 16
-    screen.blit(
-        font_sm.render(
-            f"sets  se {n_sense}/{cap_s}  sy {n_sync}/{cap_y}  in {n_int}/{cap_i}",
-            True,
-            (130, 170, 200),
-        ),
-        (sx, y),
-    )
-    y += 16
-    n_fl = len(s.mind._follows)
-    n_ig = len(s.mind._integrates)
-    cap_fl = int(s.mind.max_follows_registry)
-    cap_ig = int(s.mind.max_integrates_registry)
-    screen.blit(
-        font_sm.render(
-            f"reg   fl {n_fl}/{cap_fl}  ig {n_ig}/{cap_ig}",
-            True,
-            (120, 150, 180),
-        ),
-        (sx, y),
-    )
-    y += 16
-    if graph_hint:
-        screen.blit(
-            font_sm.render(str(graph_hint)[:36], True, (200, 180, 120)),
-            (sx, y),
-        )
-        y += 16
 
     y += 12
     screen.blit(font_sm.render("next", True, (140, 150, 170)), (sx, y))
@@ -2133,57 +1910,6 @@ def draw(
             ),
             (sx, oy + BOARD_H - 24),
         )
-
-    # Plots under the board: Active / Inactive / Minted Thoughts over turns
-    plot_oy = oy + BOARD_H + PLOT_MARGIN
-    draw_thought_plot(
-        screen,
-        active_history,
-        font_sm,
-        ox=ox,
-        oy=plot_oy,
-        width=BOARD_W,
-        height=PLOT_H,
-        title="Active Thoughts",
-        line_color=(100, 220, 140),
-        marker_color=(180, 255, 160),
-        show_x_labels=False,
-    )
-    draw_thought_plot(
-        screen,
-        inactive_history,
-        font_sm,
-        ox=ox,
-        oy=plot_oy + PLOT_H + PLOT_GAP,
-        width=BOARD_W,
-        height=PLOT_H,
-        title="Inactive Thoughts",
-        line_color=(120, 170, 255),
-        marker_color=(180, 210, 255),
-        show_x_labels=False,
-    )
-    draw_thought_plot(
-        screen,
-        mint_history,
-        font_sm,
-        ox=ox,
-        oy=plot_oy + 2 * (PLOT_H + PLOT_GAP),
-        width=BOARD_W,
-        height=PLOT_H,
-        title="Minted Thoughts",
-        line_color=(240, 180, 80),
-        marker_color=(255, 210, 120),
-        show_x_labels=True,
-    )
-
-    screen.blit(
-        font_sm.render(
-            "Secret bytes → play. Esc quit.  --verbose for console dumps.",
-            True,
-            (120, 130, 160),
-        ),
-        (MARGIN_X, H - FOOTER_H + 4),
-    )
 
 
 def _wrap(text: str, width: int) -> list[str]:
@@ -2329,12 +2055,6 @@ def main(argv: list[str] | None = None) -> None:
     log_every = 90
     game_over_at: int | None = None
     was_mapped = False
-    # Thought counts once per game turn (piece lock)
-    active_history: list[int] = []
-    inactive_history: list[int] = []
-    mint_history: list[int] = []
-    last_pieces_for_plot = world.pieces_placed
-    last_graph_hint: str | None = None
     # State poles at last command (for outcome write on lock)
     last_cmd_poles: list = []
     last_cmd_intent: str = "explore"
@@ -2347,18 +2067,6 @@ def main(argv: list[str] | None = None) -> None:
         f"(Lock credit: landing-cell + eligibility window={elig_n})",
         flush=True,
     )
-
-    def _record_thought_sample() -> None:
-        a, i = thought_counts_active_inactive(s)
-        active_history.append(a)
-        inactive_history.append(i)
-        mint_history.append(int(s.mind.admits_mint))
-        if len(active_history) > PLOT_HISTORY:
-            del active_history[: len(active_history) - PLOT_HISTORY]
-        if len(inactive_history) > PLOT_HISTORY:
-            del inactive_history[: len(inactive_history) - PLOT_HISTORY]
-        if len(mint_history) > PLOT_HISTORY:
-            del mint_history[: len(mint_history) - PLOT_HISTORY]
 
     try:
         running = True
@@ -2373,7 +2081,6 @@ def main(argv: list[str] | None = None) -> None:
                         gc_stats = game_boundary_gc(s)
                         entry = coach.on_new_game(world, record=True)
                         game_over_at = None
-                        last_pieces_for_plot = world.pieces_placed
                         log(
                             f"[restart] {entry} | map {coach.map_progress()} "
                             f"| gc th→{gc_stats.get('thoughts_after')} "
@@ -2401,7 +2108,7 @@ def main(argv: list[str] | None = None) -> None:
                 prev_event = world.last_event
                 prev_pieces = world.pieces_placed
                 # Symbioid-primary control: throttled network placement
-                preferred, g_bias, poles, g_hint = cached_graph_intent(
+                preferred, g_bias, poles, _g_hint = cached_graph_intent(
                     s, world, coach, frame, place_every=PLACE_EVERY
                 )
                 # Foresight: how many holes the current target placement frees
@@ -2413,7 +2120,6 @@ def main(argv: list[str] | None = None) -> None:
                     coach=coach,
                     labels=_FORESIGHT_META_LABELS,
                 )
-                last_graph_hint = g_hint
                 last_cmd_poles = poles
                 code = coach.tick(
                     world,
@@ -2424,14 +2130,6 @@ def main(argv: list[str] | None = None) -> None:
                 # Trajectory eligibility: poles that steered this cmd tick
                 if eligibility.max_ticks > 0:
                     eligibility.push(poles_to_content_keys(s, poles))
-                if getattr(coach, "last_network_cmd", False) and preferred:
-                    last_graph_hint = f"NET {preferred}@{g_bias:.2f}"
-                elif preferred and coach.last_intent == preferred:
-                    last_graph_hint = f"NET {preferred}@{g_bias:.2f}"
-                elif coach.last_intent:
-                    last_graph_hint = f"fb {coach.last_intent}" + (
-                        f" (want {preferred})" if preferred else ""
-                    )
                 s.actuators[0].output = code / 255.0
                 # One sample per game turn (piece lock)
                 if world.pieces_placed > prev_pieces:
@@ -2475,8 +2173,6 @@ def main(argv: list[str] | None = None) -> None:
                     if s.mind.dynamics_enabled and PULSES_ON_LOCK > 0:
                         for _ in range(int(PULSES_ON_LOCK)):
                             s.pulse_tick()
-                    _record_thought_sample()
-                    last_pieces_for_plot = world.pieces_placed
                 if coach.map_complete() and not was_mapped:
                     was_mapped = True
                     log(
@@ -2500,8 +2196,6 @@ def main(argv: list[str] | None = None) -> None:
             if world.game_over:
                 if game_over_at is None:
                     game_over_at = frame
-                    # Final sample at game end
-                    _record_thought_sample()
                     log(
                         f"[top_out] game #{coach.game_number} "
                         f"final_score={world.score} "
@@ -2517,7 +2211,6 @@ def main(argv: list[str] | None = None) -> None:
                     gc_stats = game_boundary_gc(s)
                     entry = coach.on_new_game(world, record=True)
                     game_over_at = None
-                    last_pieces_for_plot = world.pieces_placed
                     log(
                         f"[auto-restart] {entry} best={coach.best_score()} "
                         f"highscores={coach.highscores[-6:]} "
@@ -2540,14 +2233,9 @@ def main(argv: list[str] | None = None) -> None:
                 screen,
                 world,
                 coach,
-                s,
-                active_history,
-                inactive_history,
-                mint_history,
                 font,
                 font_sm,
                 pause_seconds_left=pause_left,
-                graph_hint=last_graph_hint,
             )
             pygame.display.flip()
             clock.tick(FPS)
