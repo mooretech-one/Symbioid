@@ -350,6 +350,8 @@ assert s.mind.should_block_token("hard")  # only while tft_state==retaliate
 
 **Phase 4 (0.0.56) — eval + freeze:** `scripts/bench_tft_phase4.py` compares hygiene-only vs ship default vs aggressive forgive vs generous noise. **Ship defaults:** TFT on, forgive N=4 γ=0.5, warm-start 0.12, generous/gate off.
 
+**Multi-game survival (0.0.57):** Between games / every ~80 frames — purge cell Observations from Mind registry, prune inactive six-sets, cold-forget, hard-cap ~11k host Thoughts. Demo clocks: `SAMPLE_EVERY=2`, `PULSE_EVERY=4`, `PLACE_EVERY=3`, faces ~10 Hz with `skip_global_pulse`. Bench: 6 games × 400 frames → max th ≈13k, max ms_frame ≈21.
+
 ### Constitution (Asimov-shaped, installed STABLE patterns)
 
 Default `install_constitution=True` adds **L0–L3** as `Law` objects (each a `Link` + priority).

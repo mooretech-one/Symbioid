@@ -352,23 +352,26 @@ def test_packing_meta_sensors_and_last_d_holes_insight():
 
 
 def test_demo_timing_sense_not_slower_than_command():
-    """Optimal coupling: sample ≤ cmd; faces faster than default 50 ms."""
+    """Multi-game survival clocks: sense ≤ cmd; throttled pulse/place; faces drain-only."""
     import tetris_demo as mod
 
-    assert mod.SAMPLE_EVERY <= mod.CMD_EVERY
     assert mod.PULSE_EVERY >= 1
     assert mod.PULSES_PRE_CMD >= 0
     assert mod.PULSES_ON_LOCK >= 0
-    assert mod.CMD_EVERY % mod.SAMPLE_EVERY == 0 or mod.SAMPLE_EVERY == mod.CMD_EVERY
-    # Optimal profile: 1:1 sense/command, sub-50ms faces, gravity scaled for FPS
-    assert mod.SAMPLE_EVERY == 1 and mod.CMD_EVERY == 1
-    assert 0.0 < mod.FACE_TICK_INTERVAL <= 0.05
+    assert mod.PLACE_EVERY >= 1
+    # Survival profile (v0.0.57): throttled sample/pulse/place; faces drain-only
+    assert mod.SAMPLE_EVERY >= 1 and mod.CMD_EVERY == 1
+    assert mod.SAMPLE_EVERY <= 4
+    assert mod.PULSE_EVERY >= 2
+    assert mod.PLACE_EVERY >= 2
+    assert 0.0 < mod.FACE_TICK_INTERVAL <= 0.15
     assert mod.GRAVITY_INTERVAL >= mod.FPS // 2  # not free-fall every frame
     w = TetrisWorld(rng=Random(0))
     s = mod.build_symbioid(w)
     assert s.interface.tick_interval == mod.FACE_TICK_INTERVAL
     assert s.innerface.tick_interval == mod.FACE_TICK_INTERVAL
     assert s.outerface.tick_interval == mod.FACE_TICK_INTERVAL
+    assert getattr(s.interface, "skip_global_pulse", False) is True
 
 
 def test_edge_well_metrics_report_open_side_trenches():

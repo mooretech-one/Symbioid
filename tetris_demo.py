@@ -87,19 +87,20 @@ H = (
     + MARGIN_Y
 )
 FPS = 30
-# Optimal coupling (v0.0.38): sense = command = every paint frame; faces ~50 Hz.
-# Order: sample → pulse → pre-cmd settle → decide. Gravity slowed so fall rate
-# stays ~1 row/s when gravity ticks every frame (was every 2 frames).
+# Multi-game survival (v0.0.57): throttle dynamics/placement so N growth does not
+# peg CPU by game ~6. Order: sample → sparse pulse → decide (optional settle).
 CMD_EVERY = 1
-SAMPLE_EVERY = 1
-PULSE_EVERY = 1
-PULSES_PRE_CMD = 1  # settle activation before intent
-PULSES_ON_LOCK = 2  # outcome spread (shorter; more cmd frames overall)
+SAMPLE_EVERY = 2  # was 1 — fewer cell admits per second
+PULSE_EVERY = 4  # was 1 — full-graph pulse less often
+PULSES_PRE_CMD = 0  # was 1 — main settle optional
+PULSES_ON_LOCK = 1  # was 2
+PLACE_EVERY = 3  # recompute network placement every N cmd frames
+MID_GAME_GC_EVERY = 80  # frames; hard-cap GC while playing
 GRAVITY_INTERVAL = 30  # ~1.0 s/row at 30 FPS with cmd every frame
 # Top-out: half second for Innerface queue (was 1.0 s)
 RESTART_DELAY_FRAMES = max(12, FPS // 2)
-# Face worker sleep (default Process 0.05 → 20 Hz); 0.02 → 50 Hz formation drain
-FACE_TICK_INTERVAL = 0.02
+# Face workers: formation drain only; main loop owns pulse (skip_global_pulse)
+FACE_TICK_INTERVAL = 0.1  # was 0.02 (~50 Hz) → ~10 Hz
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -199,23 +200,133 @@ def thought_counts_active_inactive(s: Symbioid) -> tuple[int, int]:
     Active = Thoughts currently in an Innerface *active* six-set.
     Inactive = other Thoughts still on the host graph (seeds, laws, awareness,
     superseded scaffolding not yet pruned, etc.).
+
+    Snapshots under locks so concurrent face threads cannot mutate during count.
     """
     active_tids: set[str] = set()
     inner = s.innerface
     with inner._local_lock:
-        for sid in inner.active_ids:
+        active_ids = list(inner.active_ids.keys())
+        for sid in active_ids:
             store = (
                 inner.completed_formations.get(sid)
                 or inner.completed_syncs.get(sid)
                 or inner.completed_integrates.get(sid)
             )
             if store:
-                active_tids.update(store.keys())
+                active_tids.update(list(store.keys()))
     with s.graph_lock:
         host_ids = set(s.thoughts.keys())
     n_active = len(active_tids & host_ids)
     n_inactive = max(0, len(host_ids) - n_active)
     return n_active, n_inactive
+
+
+def cached_graph_intent(
+    s: Symbioid,
+    world: TetrisWorld,
+    coach: TetrisCoach,
+    frame: int,
+    *,
+    place_every: int = PLACE_EVERY,
+) -> tuple[str | None, float, list, str]:
+    """
+    Throttle expensive network placement scoring (v0.0.57).
+
+    Reuses last preferred intent / poles for ``place_every - 1`` frames unless
+    a piece just locked (options board changes).
+    """
+    pe = max(1, int(place_every))
+    last_lock = int(getattr(coach, "last_lock_frame", -999) or -999)
+    force = (frame - last_lock) <= 1
+    cache = getattr(coach, "_intent_cache", None)
+    if (
+        not force
+        and isinstance(cache, tuple)
+        and len(cache) == 5
+        and (frame - int(cache[0])) < pe
+    ):
+        return cache[1], float(cache[2]), list(cache[3]), str(cache[4])
+    preferred, g_bias, poles, hint = graph_preferred_intent(s, world, coach)
+    coach._intent_cache = (frame, preferred, g_bias, poles, hint or "")  # type: ignore[attr-defined]
+    return preferred, float(g_bias), poles, str(hint or "")
+
+
+def game_boundary_gc(
+    s: Symbioid,
+    *,
+    max_forget_passes: int = 16,
+    hard_cap: int = 11000,
+) -> dict[str, int]:
+    """
+    Multi-game survival GC (v0.0.57): unprotect cell-map registry, prune scaffolds,
+    cold-forget, then hard-cap host graph if still above ``hard_cap``.
+
+    Call on top-out / between headless games. Returns removal stats.
+    """
+    with s.graph_lock:
+        before = len(s.thoughts)
+    mind = s.mind
+    old_need = int(getattr(mind, "forget_cold_cycles", 64) or 64)
+    old_max = int(getattr(mind, "forget_max_per_pass", 64) or 64)
+    mind.forget_cold_cycles = 4
+    mind.forget_max_per_pass = max(old_max, 4096)
+    purged = 0
+    pruned = 0
+    forgotten = 0
+    hard = 0
+    try:
+        if hasattr(mind, "purge_ephemeral_registry"):
+            purged = int(mind.purge_ephemeral_registry() or 0)
+        # Drop inactive six-set membership so prune can free poles
+        with s.innerface._local_lock:
+            # Keep only a small active window; clear archived inactive stores' poles via prune
+            pass
+        if hasattr(s.innerface, "prune_inactive_thoughts"):
+            pruned = int(s.innerface.prune_inactive_thoughts() or 0)
+        for _ in range(max(1, int(max_forget_passes))):
+            n = int(s.innerface.forget_cold_thoughts() or 0)
+            forgotten += n
+            if n == 0:
+                break
+        if hasattr(s.innerface, "prune_inactive_thoughts"):
+            pruned += int(s.innerface.prune_inactive_thoughts() or 0)
+        # Hard cap: remove oldest cold unprotected Thoughts
+        with s.graph_lock:
+            n_now = len(s.thoughts)
+        if n_now > int(hard_cap):
+            protected = s.innerface._protected_thought_ids()
+            # Always keep actions / twin-ish ids
+            with mind._lock:
+                for t in mind._actions.values():
+                    if t is not None:
+                        protected.add(t.id)
+            victims: list[tuple[int, str]] = []
+            with s.graph_lock:
+                for tid, th in list(s.thoughts.items()):
+                    if tid in protected:
+                        continue
+                    last = int(getattr(th, "last_hot_cycle", -1) or -1)
+                    victims.append((last, tid))
+                victims.sort(key=lambda x: x[0])  # oldest hot first (-1 first)
+                need = n_now - int(hard_cap)
+                for _, tid in victims[: max(0, need)]:
+                    if s._remove_thought_unlocked(tid) is not None:
+                        hard += 1
+    finally:
+        mind.forget_cold_cycles = old_need
+        mind.forget_max_per_pass = old_max
+    with s.graph_lock:
+        after = len(s.thoughts)
+    return {
+        "thoughts_before": before,
+        "thoughts_after": after,
+        "pruned": pruned,
+        "forgotten": forgotten,
+        "purged_registry": purged,
+        "hard_cap": hard,
+        "removed": max(0, before - after),
+    }
 
 
 def build_symbioid(
@@ -250,10 +361,14 @@ def build_symbioid(
         s.mind.holonomic_store_enabled = False
         s.mind.hebb_phase_enabled = False
 
-    # Faster face workers so sample→formation is not stuck on 50 ms sleeps
+    # Face workers: formation drain only; main loop owns full-graph pulse
     s.interface.tick_interval = float(FACE_TICK_INTERVAL)
     s.innerface.tick_interval = float(FACE_TICK_INTERVAL)
     s.outerface.tick_interval = float(FACE_TICK_INTERVAL)
+    s.interface.skip_global_pulse = True  # type: ignore[attr-defined]
+    # Multi-game survival: forget sooner + larger batches when GC runs
+    s.mind.forget_cold_cycles = 24
+    s.mind.forget_max_per_pass = 256
     # Learning structure (P0): avoid cell co-fire storms / zombie syncs.
     # Band B (research active-thoughts theory): serious network-primary WM +
     # larger policy registries with act:-preferring hard eviction.
@@ -945,15 +1060,18 @@ def run_multi_game_metric(
             elig.clear()
             s.mind.tft.reset_episode(clear_counts=True)
             while not world.game_over and frame < int(max_frames):
-                sample_into_symbioid(s, world, tick=frame)
+                if frame % SAMPLE_EVERY == 0:
+                    sample_into_symbioid(s, world, tick=frame)
                 if s.mind.dynamics_enabled and frame % PULSE_EVERY == 0:
                     s.pulse_tick()
                 if s.mind.dynamics_enabled and PULSES_PRE_CMD > 0:
                     for _ in range(int(PULSES_PRE_CMD)):
                         s.pulse_tick()
+                if MID_GAME_GC_EVERY > 0 and frame > 0 and frame % MID_GAME_GC_EVERY == 0:
+                    game_boundary_gc(s, max_forget_passes=4, hard_cap=11000)
                 prev_pieces = world.pieces_placed
-                preferred, g_bias, poles, _hint = graph_preferred_intent(
-                    s, world, coach
+                preferred, g_bias, poles, _hint = cached_graph_intent(
+                    s, world, coach, frame, place_every=PLACE_EVERY
                 )
                 update_pred_pack_for_target(s, world, coach)
                 sample_packing_meta_into_symbioid(
@@ -972,6 +1090,7 @@ def run_multi_game_metric(
                     graph_bias=g_bias,
                 )
                 if world.pieces_placed > prev_pieces:
+                    coach.last_lock_frame = frame  # type: ignore[attr-defined]
                     lock_eff = getattr(coach, "last_lock_effect", "") or ""
                     intent = (
                         lock_eff
@@ -1013,6 +1132,8 @@ def run_multi_game_metric(
             # End-of-game packing snapshot (board at top-out or frame cap)
             snap = s.mind.tft_snapshot()
             cnt = snap.get("counts") or {}
+            with s.graph_lock:
+                n_th = len(s.thoughts)
             rows.append(
                 GameMetric(
                     game=g,
@@ -1035,8 +1156,18 @@ def run_multi_game_metric(
                 f"[metric] g={g} score={world.score} lines={world.lines} "
                 f"holes={world.hole_count()} maxH={world.max_height()} "
                 f"pieces={world.pieces_placed} frames={frame} "
+                f"th={n_th} "
                 f"C={cnt.get('C', 0)} D={cnt.get('D', 0)} "
                 f"tft={snap.get('tft_state')} forgives={snap.get('forgives', 0)}",
+                flush=True,
+            )
+            # Multi-game survival: GC before next game
+            gc_stats = game_boundary_gc(s)
+            log(
+                f"[gc] g={g} th={gc_stats.get('thoughts_before')}→"
+                f"{gc_stats.get('thoughts_after')} "
+                f"rm={gc_stats.get('removed')} prune={gc_stats.get('pruned')} "
+                f"forget={gc_stats.get('forgotten')}",
                 flush=True,
             )
             if g < int(games):
@@ -1853,7 +1984,7 @@ def draw(
     screen.blit(
         font_sm.render(
             f"clk   se/{SAMPLE_EVERY} cmd/{CMD_EVERY} p/{PULSE_EVERY}"
-            f"+{PULSES_PRE_CMD}pre +{PULSES_ON_LOCK}lk",
+            f"+{PULSES_PRE_CMD}pre +{PULSES_ON_LOCK}lk pl/{PLACE_EVERY}",
             True,
             (110, 130, 150),
         ),
@@ -2176,11 +2307,14 @@ def main(argv: list[str] | None = None) -> None:
                     if event.key == pygame.K_ESCAPE:
                         running = False
                     elif event.key == pygame.K_r and world.game_over:
+                        gc_stats = game_boundary_gc(s)
                         entry = coach.on_new_game(world, record=True)
                         game_over_at = None
                         last_pieces_for_plot = world.pieces_placed
                         log(
-                            f"[restart] {entry} | map {coach.map_progress()}",
+                            f"[restart] {entry} | map {coach.map_progress()} "
+                            f"| gc th→{gc_stats.get('thoughts_after')} "
+                            f"rm={gc_stats.get('removed')}",
                             flush=True,
                         )
 
@@ -2203,9 +2337,9 @@ def main(argv: list[str] | None = None) -> None:
                         s.pulse_tick()
                 prev_event = world.last_event
                 prev_pieces = world.pieces_placed
-                # Symbioid-primary control: intent + placement from network
-                preferred, g_bias, poles, g_hint = graph_preferred_intent(
-                    s, world, coach
+                # Symbioid-primary control: throttled network placement
+                preferred, g_bias, poles, g_hint = cached_graph_intent(
+                    s, world, coach, frame, place_every=PLACE_EVERY
                 )
                 # Foresight: how many holes the current target placement frees
                 update_pred_pack_for_target(s, world, coach)
@@ -2238,6 +2372,7 @@ def main(argv: list[str] | None = None) -> None:
                 s.actuators[0].output = code / 255.0
                 # One sample per game turn (piece lock)
                 if world.pieces_placed > prev_pieces:
+                    coach.last_lock_frame = frame  # type: ignore[attr-defined]
                     # Phase A: label outcomes with true lock effect when known
                     # (e.g. hard), not coach last_intent=="explore"
                     lock_eff = getattr(coach, "last_lock_effect", "") or ""
@@ -2316,12 +2451,15 @@ def main(argv: list[str] | None = None) -> None:
                 # Sensors still sample above each frame%sample_every so Innerface
                 # can drain the formation queue during the pause.
                 if elapsed >= RESTART_DELAY_FRAMES:
+                    gc_stats = game_boundary_gc(s)
                     entry = coach.on_new_game(world, record=True)
                     game_over_at = None
                     last_pieces_for_plot = world.pieces_placed
                     log(
                         f"[auto-restart] {entry} best={coach.best_score()} "
-                        f"highscores={coach.highscores[-6:]}",
+                        f"highscores={coach.highscores[-6:]} "
+                        f"| gc th→{gc_stats.get('thoughts_after')} "
+                        f"rm={gc_stats.get('removed')}",
                         flush=True,
                     )
 

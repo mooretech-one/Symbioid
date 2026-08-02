@@ -422,6 +422,9 @@ class Interface(SpikingEngine):
                     continue
                 host.innerface.post({"from": "interface", "payload": msg})
 
+        # When True, demo main loop owns pulse_tick (avoid double full-graph work).
+        if getattr(self, "skip_global_pulse", False):
+            return
         if getattr(host.mind, "dynamics_enabled", True):
             host.pulse_tick()
 
@@ -433,5 +436,6 @@ class Interface(SpikingEngine):
         # Engine: pre_ports (sample+stimulate) → membership pulse → post (sparse handoff)
         self.use_membership = True
         self.pre_ports()
-        self.pulse()
+        if not getattr(self, "skip_global_pulse", False):
+            self.pulse()
         self.post_ports()

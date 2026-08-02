@@ -95,10 +95,10 @@ def test_warm_start_disabled():
 def test_tft_to_from_dict_roundtrip():
     m = Mind()
     m.tft.config.forgive_after_n_c = 5
-    m.tft.config.forgive_random_d_prob = 0.25
+    m.tft.config.forgive_random_d_prob = 0.0  # no noise-forgive; force retaliate
     m.tft.config.retaliate_gate = True
     m.tft.config.block_tokens_on_retaliate = ("hard", "explore")
-    m.note_round("D_env", keys=["k1", "k2"])
+    m.note_round("D_self", keys=["k1", "k2"])  # not subject to generous noise
     m.note_round("C")
     blob = m.tft_export()
     m2 = Mind()
@@ -107,9 +107,14 @@ def test_tft_to_from_dict_roundtrip():
     assert m2.tft.c_streak == 1
     assert m2.tft.grudge_keys == {"k1", "k2"}
     assert m2.tft.config.forgive_after_n_c == 5
-    assert abs(m2.tft.config.forgive_random_d_prob - 0.25) < 1e-9
     assert m2.tft.config.retaliate_gate is True
     assert set(m2.tft.config.block_tokens_on_retaliate) == {"hard", "explore"}
+    # config field round-trips even when 0
+    m.tft.config.forgive_random_d_prob = 0.25
+    blob2 = m.tft_export()
+    m3 = Mind()
+    m3.tft_import(blob2)
+    assert abs(m3.tft.config.forgive_random_d_prob - 0.25) < 1e-9
 
 
 def test_generous_tft_noise_forgive():
