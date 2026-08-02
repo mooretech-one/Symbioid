@@ -495,23 +495,78 @@ def _cell_obs_index(s: Symbioid) -> dict[str, list[tuple[str, object]]]:
     return idx
 
 
+# Credit hygiene (research 2026-07-31 score regression):
+# board_quality_reward is usually negative → sticky valence_floor kills :place map.
+CREDIT_SCALE = 50.0
+CREDIT_NEG_SCALE = 0.35  # multiply |delta| when reward < 0
+CREDIT_SKIP_PLACE_ON_TOPOUT = True
+PLACE_VALENCE_LEAK = 0.06  # each lock: place_v *= (1 - leak) → pull toward 0
+
+
+def credit_delta(
+    reward: float,
+    *,
+    scale: float = CREDIT_SCALE,
+    neg_scale: float = CREDIT_NEG_SCALE,
+) -> float:
+    """
+    Scale coach reward into valence delta with **asymmetric** negatives.
+
+    Positive rewards use full scale; negatives are attenuated so place heat
+    does not floor permanently under height/hole-shaped rewards.
+    """
+    raw = float(reward) / float(scale)
+    if raw < 0.0:
+        raw *= float(neg_scale)
+    return max(-2.0, min(2.0, raw))
+
+
+def leak_place_valence(s: Symbioid, *, rate: float = PLACE_VALENCE_LEAK) -> int:
+    """
+    Soft mean-reversion for ``*:place`` keys toward 0.
+
+    Returns number of keys adjusted. Rate 0 disables.
+    """
+    r = float(rate)
+    if r <= 0.0:
+        return 0
+    r = min(1.0, r)
+    touched = 0
+    with s.mind._lock:
+        keys = [k for k in s.mind._valence if str(k).endswith(":place") or ":place" in str(k)]
+        for ck in keys:
+            v = float(s.mind._valence.get(ck, 0.0))
+            if abs(v) < 1e-12:
+                continue
+            nv = v * (1.0 - r)
+            if abs(nv) < 1e-6:
+                nv = 0.0
+            s.mind._valence[ck] = max(
+                s.mind.valence_floor, min(s.mind.valence_ceil, nv)
+            )
+            touched += 1
+    return touched
+
+
 def apply_lock_valence_to_landing_cells(
     s: Symbioid,
     cells: list[tuple[int, int]],
     reward: float,
     *,
-    scale: float = 50.0,
+    scale: float = CREDIT_SCALE,
+    neg_scale: float = CREDIT_NEG_SCALE,
+    apply_place_keys: bool = True,
 ) -> int:
     """
     Closed-loop placement credit: fan coach board reward onto Observation
     valence for cells occupied by the piece at lock.
 
-    Enables ``cell_thought_placement_score`` to improve with experience (not
-    only fixed hole/depth heuristics). Returns number of content keys touched.
+    Credit hygiene: asymmetric negatives; optional skip of synthetic ``:place``
+    keys (e.g. on top-out). Returns number of content keys touched.
     """
     if not cells:
         return 0
-    delta = max(-2.0, min(2.0, float(reward) / float(scale)))
+    delta = credit_delta(reward, scale=scale, neg_scale=neg_scale)
     if abs(delta) < 1e-12:
         return 0
     lab_index = _cell_obs_index(s)
@@ -542,11 +597,12 @@ def apply_lock_valence_to_landing_cells(
                 s.mind.note_valence(thought_id=th.id, delta=delta)
                 touched += 1
         # Stable synthetic key so cold cells still accumulate placement signal
-        synth = f"{lab}:place"
-        if synth not in seen_ck:
-            seen_ck.add(synth)
-            s.mind.note_valence(content_key=synth, delta=delta * 0.5)
-            touched += 1
+        if apply_place_keys:
+            synth = f"{lab}:place"
+            if synth not in seen_ck:
+                seen_ck.add(synth)
+                s.mind.note_valence(content_key=synth, delta=delta * 0.5)
+                touched += 1
     return touched
 
 
@@ -621,18 +677,20 @@ def apply_eligibility_valence(
     window: EligibilityWindow,
     reward: float,
     *,
-    scale: float = 50.0,
+    scale: float = CREDIT_SCALE,
     strength: float = 0.55,
+    neg_scale: float = CREDIT_NEG_SCALE,
 ) -> int:
     """
     Fan lock reward onto eligibility-window keys with recency decay.
 
+    Uses the same asymmetric ``credit_delta`` as landing-cell credit.
     ``strength`` scales relative to full landing-cell credit (1.0). Returns
     number of distinct content keys touched.
     """
     if window.max_ticks <= 0 or not window.frames:
         return 0
-    delta = max(-2.0, min(2.0, float(reward) / float(scale)))
+    delta = credit_delta(reward, scale=scale, neg_scale=neg_scale)
     if abs(delta) < 1e-12:
         return 0
     credited = window.credited_keys()
@@ -655,16 +713,33 @@ def apply_lock_credit(
     *,
     poles: list | None = None,
     push_poles: bool = False,
+    skip_place_on_topout: bool = CREDIT_SKIP_PLACE_ON_TOPOUT,
+    place_leak: float = PLACE_VALENCE_LEAK,
+    neg_scale: float = CREDIT_NEG_SCALE,
 ) -> dict[str, int]:
     """
-    Full P1 lock credit: landing cells (0.0.33) + eligibility trajectory.
+    Full P1 lock credit + P0 hygiene: asymmetric negatives, optional skip of
+    ``:place`` keys on top-out, and soft ``:place`` valence leak toward 0.
 
     Callers that already ``window.push`` each cmd tick should leave
     ``push_poles=False`` (default) to avoid duplicate last-frame entries.
     Clears the window after apply so the next piece starts fresh.
     """
-    stats = {"landing": 0, "eligibility": 0, "pushed": 0}
+    stats = {
+        "landing": 0,
+        "eligibility": 0,
+        "pushed": 0,
+        "place_leak": 0,
+        "skipped_place": 0,
+        "topped_out": 0,
+    }
     reward = float(getattr(coach, "last_reward", 0.0) or 0.0)
+    topped = bool(getattr(coach, "last_topped_out", False))
+    if topped:
+        stats["topped_out"] = 1
+    apply_place = not (skip_place_on_topout and topped)
+    if not apply_place:
+        stats["skipped_place"] = 1
     if push_poles and poles:
         keys = poles_to_content_keys(s, poles)
         before = len(window)
@@ -673,9 +748,20 @@ def apply_lock_credit(
     lock_cells = list(getattr(coach, "last_lock_cells", None) or [])
     if lock_cells:
         stats["landing"] = apply_lock_valence_to_landing_cells(
-            s, lock_cells, reward
+            s,
+            lock_cells,
+            reward,
+            neg_scale=neg_scale,
+            apply_place_keys=apply_place,
         )
-    stats["eligibility"] = apply_eligibility_valence(s, window, reward)
+    # Eligibility: on top-out skip entirely (same death-spiral as place keys)
+    if not topped:
+        stats["eligibility"] = apply_eligibility_valence(
+            s, window, reward, neg_scale=neg_scale
+        )
+    else:
+        stats["eligibility"] = 0
+    stats["place_leak"] = leak_place_valence(s, rate=place_leak)
     window.clear()
     return stats
 
@@ -750,6 +836,8 @@ def run_multi_game_metric(
     """
     import random as _random
 
+    # Headless must stay quiet — six-set console dumps destroy FPS
+    set_console_emit(False)
     log = print if verbose else (lambda *a, **k: None)
     rng = _random.Random(int(seed))
     cipher = ActionCipher.random(rng)

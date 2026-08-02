@@ -382,6 +382,8 @@ class TetrisCoach:
     last_intent: str = "explore"
     last_network_cmd: bool = False  # True when last tick used preferred_intent
     last_reward: float = 0.0
+    # Last lock was a top-out (for place-credit hygiene: skip / shrink negative credit)
+    last_topped_out: bool = False
     # byte → effect → count
     effect_counts: dict[int, dict[str, int]] = field(
         default_factory=lambda: defaultdict(lambda: defaultdict(int))
@@ -884,6 +886,7 @@ class TetrisCoach:
         )
 
         self.last_reward = reward
+        self.last_topped_out = topped
         self.last_features = post
         self.lines_total += lines_cleared
         # Explicit packing outcome for Symbioid meta sensors

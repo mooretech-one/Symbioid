@@ -1295,11 +1295,71 @@ def test_summarize_and_multi_game_metric_smoke():
     assert "holes" in d and "max_height" in d
 
 
-def test_version_at_least_051():
+def test_version_at_least_052():
     from symbioid import __version__
 
     parts = [int(x) for x in __version__.split(".")]
-    assert parts >= [0, 0, 51]
+    assert parts >= [0, 0, 52]
+
+
+def test_credit_delta_asymmetric():
+    import tetris_demo as mod
+
+    pos = mod.credit_delta(100.0)
+    neg = mod.credit_delta(-100.0)
+    assert pos == 2.0  # clamped
+    assert neg == -100.0 / 50.0 * mod.CREDIT_NEG_SCALE
+    assert abs(neg) < abs(-2.0)  # attenuated vs full clamp
+    assert abs(neg) < abs(mod.credit_delta(-100.0, neg_scale=1.0))
+
+
+def test_skip_place_on_topout_and_leak():
+    import tetris_demo as mod
+    from symbioid import Symbioid
+    from symbioid.world.tetris_learn import TetrisCoach
+
+    s = Symbioid(install_constitution=False)
+    # Seed a floored place key
+    s.mind.note_valence(content_key="cell_r10_c03:place", delta=-5.0)
+    v0 = s.mind.valence_of(content_key="cell_r10_c03:place")
+    assert v0 <= -4.9
+
+    coach = TetrisCoach(rng=Random(0))
+    coach.last_reward = -100.0
+    coach.last_topped_out = True
+    coach.last_lock_cells = [(10, 3), (10, 4)]
+    win = mod.EligibilityWindow(max_ticks=8)
+    win.push(["traj:meta"])
+    stats = mod.apply_lock_credit(
+        s, coach, win, place_leak=0.1, skip_place_on_topout=True
+    )
+    assert stats["topped_out"] == 1
+    assert stats["skipped_place"] == 1
+    assert stats["eligibility"] == 0
+    # place key should leak toward 0, not get more negative from :place credit
+    v1 = s.mind.valence_of(content_key="cell_r10_c03:place")
+    assert v1 > v0  # leak recovered (less negative)
+    assert stats["place_leak"] >= 1
+
+
+def test_positive_lock_can_raise_place_after_negatives():
+    import tetris_demo as mod
+    from symbioid import Symbioid
+    from symbioid.world.tetris_learn import TetrisCoach
+
+    s = Symbioid(install_constitution=False)
+    coach = TetrisCoach(rng=Random(1))
+    coach.last_topped_out = False
+    coach.last_lock_cells = [(18, 5)]
+    win = mod.EligibilityWindow(max_ticks=4)
+    # Several mild negatives then a strong positive
+    for r in (-40.0, -30.0, -20.0, 100.0, 80.0, 90.0):
+        coach.last_reward = r
+        win.push(["state:meta"])
+        mod.apply_lock_credit(s, coach, win, place_leak=0.05)
+        win = mod.EligibilityWindow(max_ticks=4)
+    v = s.mind.valence_of(content_key="cell_r18_c05:place")
+    assert v > 0.0, f"expected positive place valence after recovery, got {v}"
 
 
 def test_landing_cells_and_features_matches_split_apis():
