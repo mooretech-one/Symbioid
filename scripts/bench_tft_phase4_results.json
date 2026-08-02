@@ -1,0 +1,271 @@
+{
+  "games": 2,
+  "max_frames": 200,
+  "seeds": [
+    1
+  ],
+  "aggregate": {
+    "A_hygiene_only": {
+      "mean_score": 1362.0,
+      "mean_lines": 7.0,
+      "mean_holes": 2.0,
+      "mean_pieces": 21.0,
+      "mean_frames": 200.0,
+      "c_rate": 0.0,
+      "top_out_rate": 0.0,
+      "mean_C": 0.0,
+      "mean_D": 0.0
+    },
+    "B_ship_default": {
+      "mean_score": 1362.0,
+      "mean_lines": 7.0,
+      "mean_holes": 2.0,
+      "mean_pieces": 21.0,
+      "mean_frames": 200.0,
+      "c_rate": 1.0,
+      "top_out_rate": 0.0,
+      "mean_C": 21.0,
+      "mean_D": 0.0
+    },
+    "C_aggressive_forgive": {
+      "mean_score": 1362.0,
+      "mean_lines": 7.0,
+      "mean_holes": 2.0,
+      "mean_pieces": 21.0,
+      "mean_frames": 200.0,
+      "c_rate": 1.0,
+      "top_out_rate": 0.0,
+      "mean_C": 21.0,
+      "mean_D": 0.0
+    },
+    "D_generous_noise": {
+      "mean_score": 1362.0,
+      "mean_lines": 7.0,
+      "mean_holes": 2.0,
+      "mean_pieces": 21.0,
+      "mean_frames": 200.0,
+      "c_rate": 1.0,
+      "top_out_rate": 0.0,
+      "mean_C": 21.0,
+      "mean_D": 0.0
+    }
+  },
+  "rank": [
+    "B_ship_default",
+    "C_aggressive_forgive",
+    "D_generous_noise",
+    "A_hygiene_only"
+  ],
+  "runs": [
+    {
+      "config": "A_hygiene_only",
+      "seed": 1,
+      "elapsed_s": 94.02,
+      "summary": {
+        "n": 2.0,
+        "mean_score": 1362.0,
+        "mean_lines": 7.0,
+        "mean_holes": 2.0,
+        "mean_max_height": 3.0,
+        "mean_pieces": 21.0,
+        "mean_frames": 200.0,
+        "mean_C": 0.0,
+        "mean_D": 0.0,
+        "c_rate": 0.0,
+        "top_out_rate": 0.0
+      },
+      "games": [
+        {
+          "game": 1,
+          "score": 28,
+          "lines": 0,
+          "pieces": 1,
+          "holes": 0,
+          "max_height": 2,
+          "aggregate_height": 4,
+          "frames": 200,
+          "top_out": false,
+          "n_C": 0,
+          "n_D": 0,
+          "n_U": 0,
+          "tft_state": "open",
+          "forgives": 0
+        },
+        {
+          "game": 2,
+          "score": 2696,
+          "lines": 14,
+          "pieces": 41,
+          "holes": 4,
+          "max_height": 4,
+          "aggregate_height": 28,
+          "frames": 200,
+          "top_out": false,
+          "n_C": 0,
+          "n_D": 0,
+          "n_U": 0,
+          "tft_state": "open",
+          "forgives": 0
+        }
+      ]
+    },
+    {
+      "config": "B_ship_default",
+      "seed": 1,
+      "elapsed_s": 101.55,
+      "summary": {
+        "n": 2.0,
+        "mean_score": 1362.0,
+        "mean_lines": 7.0,
+        "mean_holes": 2.0,
+        "mean_max_height": 3.0,
+        "mean_pieces": 21.0,
+        "mean_frames": 200.0,
+        "mean_C": 21.0,
+        "mean_D": 0.0,
+        "c_rate": 1.0,
+        "top_out_rate": 0.0
+      },
+      "games": [
+        {
+          "game": 1,
+          "score": 28,
+          "lines": 0,
+          "pieces": 1,
+          "holes": 0,
+          "max_height": 2,
+          "aggregate_height": 4,
+          "frames": 200,
+          "top_out": false,
+          "n_C": 1,
+          "n_D": 0,
+          "n_U": 0,
+          "tft_state": "open",
+          "forgives": 0
+        },
+        {
+          "game": 2,
+          "score": 2696,
+          "lines": 14,
+          "pieces": 41,
+          "holes": 4,
+          "max_height": 4,
+          "aggregate_height": 28,
+          "frames": 200,
+          "top_out": false,
+          "n_C": 41,
+          "n_D": 0,
+          "n_U": 0,
+          "tft_state": "open",
+          "forgives": 0
+        }
+      ]
+    },
+    {
+      "config": "C_aggressive_forgive",
+      "seed": 1,
+      "elapsed_s": 109.64,
+      "summary": {
+        "n": 2.0,
+        "mean_score": 1362.0,
+        "mean_lines": 7.0,
+        "mean_holes": 2.0,
+        "mean_max_height": 3.0,
+        "mean_pieces": 21.0,
+        "mean_frames": 200.0,
+        "mean_C": 21.0,
+        "mean_D": 0.0,
+        "c_rate": 1.0,
+        "top_out_rate": 0.0
+      },
+      "games": [
+        {
+          "game": 1,
+          "score": 28,
+          "lines": 0,
+          "pieces": 1,
+          "holes": 0,
+          "max_height": 2,
+          "aggregate_height": 4,
+          "frames": 200,
+          "top_out": false,
+          "n_C": 1,
+          "n_D": 0,
+          "n_U": 0,
+          "tft_state": "open",
+          "forgives": 0
+        },
+        {
+          "game": 2,
+          "score": 2696,
+          "lines": 14,
+          "pieces": 41,
+          "holes": 4,
+          "max_height": 4,
+          "aggregate_height": 28,
+          "frames": 200,
+          "top_out": false,
+          "n_C": 41,
+          "n_D": 0,
+          "n_U": 0,
+          "tft_state": "open",
+          "forgives": 0
+        }
+      ]
+    },
+    {
+      "config": "D_generous_noise",
+      "seed": 1,
+      "elapsed_s": 74.97,
+      "summary": {
+        "n": 2.0,
+        "mean_score": 1362.0,
+        "mean_lines": 7.0,
+        "mean_holes": 2.0,
+        "mean_max_height": 3.0,
+        "mean_pieces": 21.0,
+        "mean_frames": 200.0,
+        "mean_C": 21.0,
+        "mean_D": 0.0,
+        "c_rate": 1.0,
+        "top_out_rate": 0.0
+      },
+      "games": [
+        {
+          "game": 1,
+          "score": 28,
+          "lines": 0,
+          "pieces": 1,
+          "holes": 0,
+          "max_height": 2,
+          "aggregate_height": 4,
+          "frames": 200,
+          "top_out": false,
+          "n_C": 1,
+          "n_D": 0,
+          "n_U": 0,
+          "tft_state": "open",
+          "forgives": 0
+        },
+        {
+          "game": 2,
+          "score": 2696,
+          "lines": 14,
+          "pieces": 41,
+          "holes": 4,
+          "max_height": 4,
+          "aggregate_height": 28,
+          "frames": 200,
+          "top_out": false,
+          "n_C": 41,
+          "n_D": 0,
+          "n_U": 0,
+          "tft_state": "open",
+          "forgives": 0
+        }
+      ]
+    }
+  ],
+  "wall_s": 380.17,
+  "version": "0.0.55+"
+}

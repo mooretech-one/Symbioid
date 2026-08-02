@@ -898,12 +898,15 @@ def run_multi_game_metric(
     spectral_primary: bool = False,
     map_threshold: int = 1,
     verbose: bool = False,
+    mind_setup: Any = None,
 ) -> tuple[list[GameMetric], dict[str, float]]:
     """
     Headless multi-game placement metric (no pygame display).
 
     Plays ``games`` full top-outs (or max_frames each), applying lock credit
     with optional eligibility. Returns (per-game rows, summary means).
+
+    ``mind_setup`` optional callable(s) after ``build_symbioid`` (Phase 4 A/B).
     """
     import random as _random
 
@@ -927,6 +930,8 @@ def run_multi_game_metric(
     s = build_symbioid(
         world, spectral=bool(spectral), spectral_primary=bool(spectral_primary)
     )
+    if callable(mind_setup):
+        mind_setup(s)
     coach.graph_placement_weight = 0.60
     coach.graph_placement_bonus = CachedGraphPlacementBonus(s)
     win_n = int(eligibility_window) if use_eligibility else 0

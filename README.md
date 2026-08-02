@@ -348,6 +348,8 @@ assert s.mind.should_block_token("hard")  # only while tft_state==retaliate
 # save_memory(s, path)  # includes mind.tft
 ```
 
+**Phase 4 (0.0.56) — eval + freeze:** `scripts/bench_tft_phase4.py` compares hygiene-only vs ship default vs aggressive forgive vs generous noise. **Ship defaults:** TFT on, forgive N=4 γ=0.5, warm-start 0.12, generous/gate off.
+
 ### Constitution (Asimov-shaped, installed STABLE patterns)
 
 Default `install_constitution=True` adds **L0–L3** as `Law` objects (each a `Link` + priority).

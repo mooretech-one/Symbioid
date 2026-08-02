@@ -195,6 +195,8 @@ class TitForTatPolicy:
     def note_round(self, event: RoundEvent | object, **kwargs: Any) -> RoundEvent:
         if not isinstance(event, RoundEvent):
             event = RoundEvent.make(event, **kwargs)
+        if not self.config.enabled:
+            return event
         lab = event.label
         self.last_label = lab.value
         if lab == RoundLabel.C:
