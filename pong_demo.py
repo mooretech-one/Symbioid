@@ -187,6 +187,16 @@ def draw(
     screen.blit(tc, (W - tc.get_width() - 20, 8))
     screen.blit(font_sm.render(coach.left.summary(), True, (120, 200, 140)), (20, 32))
     screen.blit(font_sm.render(coach.right.summary(), True, (120, 170, 220)), (20, 52))
+    try:
+        snap = s.mind.tft_snapshot()
+        cnt = snap.get("counts") or {}
+        tft_s = (
+            f"tft {snap.get('tft_state', 'open')} "
+            f"C={cnt.get('C', 0)} D={cnt.get('D', 0)} stk={snap.get('c_streak', 0)}"
+        )
+        screen.blit(font_sm.render(tft_s, True, (160, 180, 140)), (20, 72))
+    except Exception:
+        pass
     screen.blit(
         font_sm.render(
             "LEARN paddles. Esc quit.  --verbose for console dumps.",
@@ -264,14 +274,26 @@ def main(argv: list[str] | None = None) -> None:
             world.step()
             if world.last_event != prev_event:
                 coach.observe_event(world)
-                if world.last_event in (
+                ev = world.last_event
+                # TFT Phase 2: hit = cooperate (rally continues); score = defect (miss)
+                if ev in ("hit_left", "hit_right"):
+                    s.mind.note_round("C", source="env", channel="pong")
+                    s.mind.maybe_forgive()
+                elif ev in ("score_left", "score_right"):
+                    s.mind.note_round(
+                        "D_env",
+                        source="env",
+                        channel="pong",
+                        keys=(f"pong:{ev}",),
+                    )
+                if ev in (
                     "hit_left",
                     "hit_right",
                     "score_left",
                     "score_right",
                 ):
                     log(
-                        f"[{world.last_event}] {coach.left.summary()} | {coach.right.summary()}",
+                        f"[{ev}] {coach.left.summary()} | {coach.right.summary()}",
                         flush=True,
                     )
 

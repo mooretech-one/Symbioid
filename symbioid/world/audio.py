@@ -917,6 +917,29 @@ class BabbleCoach:
                 mind.note_valence(content_key=ck, delta=float(r) * 0.5)
             except Exception:  # noqa: BLE001
                 pass
+
+        # TFT Phase 2: howl / runaway → D_env; quiet stable match → C + forgive
+        try:
+            howl = float(getattr(getattr(world, "duck", None), "last_howl_score", 0.0) or 0.0)
+            err = float(getattr(world, "last_pred_err", 1.0) or 1.0)
+            act_ck = mind.action_content_key("audio", token)
+            if howl >= 0.35:
+                mind.note_round(
+                    "D_env",
+                    source="env",
+                    channel="audio",
+                    keys=(act_ck, "audio:howl"),
+                )
+            elif self.mode == "contingent" and err < 0.12 and howl < 0.08:
+                mind.note_round("C", source="env", channel="audio")
+                mind.maybe_forgive()
+            elif self.mode == "explore" and howl < 0.08 and err < 0.2:
+                mind.note_round("C", source="env", channel="audio")
+                mind.maybe_forgive()
+            else:
+                mind.note_round("U", source="unknown", channel="audio")
+        except Exception:  # noqa: BLE001
+            pass
         return r
 
     def summary(self) -> str:

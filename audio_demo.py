@@ -294,6 +294,16 @@ def draw_hud(
             screen.blit(lab, (x + 2, top2 + bar_max_h + 2))
 
     coach_s = coach.summary() if coach else "coach=off"
+    try:
+        snap = s.mind.tft_snapshot()
+        cnt = snap.get("counts") or {}
+        tft = (
+            f"tft={snap.get('tft_state')} C={cnt.get('C', 0)} D={cnt.get('D', 0)} "
+            f"stk={snap.get('c_streak', 0)} howl={world.duck.last_howl_score:.2f}"
+        )
+        screen.blit(font_sm.render(tft, True, (150, 180, 140)), (16, H - 70))
+    except Exception:
+        pass
     stats = font_sm.render(
         f"blocks={world.blocks} rms={world.last_rms:.3f} synth={world.last_synth_rms:.3f} "
         f"err={world.last_pred_err:.3f} thoughts={len(s.thoughts)} form={s.innerface.formation_ticks}",

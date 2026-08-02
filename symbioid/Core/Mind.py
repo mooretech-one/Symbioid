@@ -104,6 +104,9 @@ class Mind(System):
     valence_ceil: float = 20.0
     # Behavior: minimum score to emit a recommendation (fail open if colder)
     recommend_min_valence: float = 0.2
+    # TFT Phase 2: small positive prior on newly minted Action poles (nice / cooperate-first)
+    warm_start_actions: bool = True
+    warm_start_prior: float = 0.12
     # Activation-based forgetting (structural GC of long-cold unprotected Thoughts)
     forget_cold_enabled: bool = True  # structural GC of long-cold unprotected Thoughts
     forget_cold_cycles: int = 64  # host pulse cycles since last_hot_cycle
@@ -621,6 +624,12 @@ class Mind(System):
             self._actions[ck] = thought
             self._action_tokens[ck] = token
             self._thought_to_key[thought.id] = ck
+            # Nice prior: only on first mint (new memory), not reload overwrite
+            if self.warm_start_actions and abs(float(self.warm_start_prior)) > 1e-12:
+                self._valence[ck] = max(
+                    self.valence_floor,
+                    min(self.valence_ceil, float(self.warm_start_prior)),
+                )
             self.actions_mint += 1
             self.admits_mint += 1
             return thought

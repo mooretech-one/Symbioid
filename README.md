@@ -289,7 +289,7 @@ Minted structure is **read for action choice**, not only stored:
 5. **Hole + well avoidance** — `pose_hole_features` / edge-aware `well_metrics`: sealed holes (`d_holes`) and open single-width trenches (`d_well`, `max_well`, including col 0/9). HUD shows `holes` / `well` / `maxW`.
 6. **Packing meta sensors (v0.0.36+)** — `holes_n`, `last_d_holes`, `well_n`, `max_well_n` sampled into Mind.
 7. **Foresight free-count (v0.0.37)** — `pred_d_holes`, `holes_freed` (max(0,−Δ)), `holes_fill_n` for the **current target pose** so the network knows how many holes a planned placement will free (via `pose_hole_features` on `coach._target`).
-8. **Iterated twin / TFT (v0.0.53)** — each lock is a System ⋈ Environment **round** (`C` / `D_env` / `D_self` / `U`). Mind `note_round` + `maybe_forgive` implement Tit-for-Tat-shaped recovery: after `forgive_after_n_c` cooperative locks, **episode grudge** valence is scaled by `forgive_gamma` (no full `--reset-memory`). Headless metrics include `C`/`D` counts and `c_rate`. Module: `symbioid.Core.strategy`.
+8. **Iterated twin / TFT (v0.0.53–0.0.54)** — System ⋈ Environment **rounds** (`C` / `D_env` / `D_self` / `U`). Mind `note_round` + `maybe_forgive`. Tetris locks, Pong hit/miss, Audio howl/quiet. HUD `tft` + C/D. Headless: `c_rate`, `top_out_rate`, `mean_frames`. **Warm-start (nice):** new Action poles get `warm_start_prior` (default 0.12; `--no-warm-start`). Optional `--c-streak-bonus` (default 0).
 
 Content keys quantize float `reading` (`quantize_decimals=3` default). Registry Observations + Actions are protected from prune. Coach lock reward also fans into valence via `mind.note_valence(channel="board", delta=…)`.
 
@@ -303,26 +303,34 @@ s.mind.habituate_after = 2
 # s.mind.recognition_enabled = False
 ```
 
-### Iterated twin strategy (Tit for Tat–shaped, v0.0.53)
+### Iterated twin strategy (Tit for Tat–shaped, v0.0.53–0.0.54)
 
-The six-seed poles **System** / **Environment** are an **infinite game**, not a one-shot exploit. Credit hygiene (0.0.52) stops perpetual self-malice; TFT adds **forgiveness**:
+The six-seed poles **System** / **Environment** are an **infinite game**, not a one-shot exploit. Credit hygiene (0.0.52) stops perpetual self-malice; TFT adds **forgiveness** + demo C/D:
 
 | Trait | Mechanism |
 |-------|-----------|
-| Nice | Open with cooperation (`C` on good locks) |
-| Retaliatory | Bounded tax via existing lock credit + `D_env` on top-out |
+| Nice | Open with cooperation; warm-start prior on new Action poles |
+| Retaliatory | Bounded tax + `D_env` (top-out / miss / howl) |
 | Forgiving | `mind.maybe_forgive()` after N×`C` shrinks grudge keys |
-| Clear | `mind.tft_snapshot()` / headless `C=` `D=` `tft=` |
+| Clear | HUD `tft` line; headless `c_rate` / `top_out_rate` |
+
+| Demo | C | D |
+|------|---|---|
+| Tetris | good lock | top-out |
+| Pong | paddle hit | score (miss) |
+| Audio | low err + low howl | howl ≥ 0.35 |
 
 ```python
 s.mind.tft.config.forgive_after_n_c = 4   # default
 s.mind.tft.config.forgive_gamma = 0.5     # halve residual grudge valence
+s.mind.warm_start_actions = True
+s.mind.warm_start_prior = 0.12
 s.mind.note_round("C")                   # or D_env / D_self / U
 s.mind.maybe_forgive()
 print(s.mind.tft_snapshot())
 ```
 
-Phase 2 will wire Pong/Audio; Phase 3 may persist TFT state (see vault research plan).
+Phase 3 may persist TFT state (see vault plan).
 
 ### Constitution (Asimov-shaped, installed STABLE patterns)
 

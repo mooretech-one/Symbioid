@@ -176,6 +176,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Disable trajectory eligibility credit (landing-cell only, v0.0.33).",
     )
+    p.add_argument(
+        "--c-streak-bonus",
+        type=float,
+        default=0.0,
+        help="Phase 2: soft board valence bonus while on C-streak (default 0=off).",
+    )
+    p.add_argument(
+        "--no-warm-start",
+        action="store_true",
+        help="Disable positive prior on newly minted Action poles (TFT nice).",
+    )
     return p.parse_args(argv)
 
 
@@ -501,6 +512,8 @@ CREDIT_SCALE = 50.0
 CREDIT_NEG_SCALE = 0.35  # multiply |delta| when reward < 0
 CREDIT_SKIP_PLACE_ON_TOPOUT = True
 PLACE_VALENCE_LEAK = 0.06  # each lock: place_v *= (1 - leak) → pull toward 0
+# Phase 2: optional soft reward for cooperative streak (default off)
+C_STREAK_BONUS = 0.0
 
 
 def credit_delta(
@@ -785,6 +798,16 @@ def apply_lock_credit(
     else:
         stats["round"] = "C"
         s.mind.note_round("C", source="env", channel="tetris")
+        # Optional soft shaping: tiny positive board valence while on a C-streak
+        bonus = float(C_STREAK_BONUS)
+        if bonus > 0.0:
+            streak = int(getattr(s.mind.tft, "c_streak", 0) or 0)
+            if streak >= 2:
+                s.mind.note_valence(
+                    channel="board",
+                    delta=bonus * min(1.0, streak / 10.0),
+                    recent=6,
+                )
         fg = s.mind.maybe_forgive()
         stats["forgiven"] = int(fg.get("forgiven", 0) or 0)
     return stats
@@ -838,14 +861,17 @@ def summarize_game_metrics(rows: list[GameMetric]) -> dict[str, float]:
             "mean_holes": 0.0,
             "mean_max_height": 0.0,
             "mean_pieces": 0.0,
+            "mean_frames": 0.0,
             "mean_C": 0.0,
             "mean_D": 0.0,
             "c_rate": 0.0,
+            "top_out_rate": 0.0,
         }
     n = float(len(rows))
     sum_c = sum(r.n_C for r in rows)
     sum_d = sum(r.n_D for r in rows)
     rounds = float(sum_c + sum_d) or 1.0
+    top_outs = sum(1 for r in rows if r.top_out)
     return {
         "n": n,
         "mean_score": sum(r.score for r in rows) / n,
@@ -853,9 +879,11 @@ def summarize_game_metrics(rows: list[GameMetric]) -> dict[str, float]:
         "mean_holes": sum(r.holes for r in rows) / n,
         "mean_max_height": sum(r.max_height for r in rows) / n,
         "mean_pieces": sum(r.pieces for r in rows) / n,
+        "mean_frames": sum(r.frames for r in rows) / n,
         "mean_C": sum_c / n,
         "mean_D": sum_d / n,
         "c_rate": sum_c / rounds,
+        "top_out_rate": top_outs / n,
     }
 
 
@@ -1013,6 +1041,8 @@ def run_multi_game_metric(
     summary = summarize_game_metrics(rows)
     log(
         f"[summary] n={summary.get('n')} mean_score={summary.get('mean_score'):.1f} "
+        f"mean_frames={summary.get('mean_frames', 0):.0f} "
+        f"top_out_rate={summary.get('top_out_rate', 0):.2f} "
         f"mean_C={summary.get('mean_C', 0):.1f} mean_D={summary.get('mean_D', 0):.1f} "
         f"c_rate={summary.get('c_rate', 0):.3f}",
         flush=True,
@@ -1785,6 +1815,28 @@ def draw(
         (sx, y),
     )
     y += 16
+    # TFT / iterated twin (v0.0.53+)
+    try:
+        snap = s.mind.tft_snapshot()
+        cnt = snap.get("counts") or {}
+        tft_line = (
+            f"tft   {snap.get('tft_state', 'open')}  "
+            f"C={cnt.get('C', 0)} D={cnt.get('D', 0)} U={cnt.get('U', 0)}  "
+            f"stk={snap.get('c_streak', 0)} fg={snap.get('forgives', 0)}"
+        )
+        st = str(snap.get("tft_state", "open"))
+        tft_color = (
+            (200, 140, 120)
+            if st == "retaliate"
+            else (140, 190, 160)
+            if st == "open"
+            else (160, 170, 200)
+        )
+    except Exception:
+        tft_line = "tft   (n/a)"
+        tft_color = (120, 130, 150)
+    screen.blit(font_sm.render(tft_line, True, tft_color), (sx, y))
+    y += 16
     # Clocks: sense / command / pulse periods (frames @ FPS)
     screen.blit(
         font_sm.render(
@@ -1945,9 +1997,11 @@ def _wrap(text: str, width: int) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> None:
+    global C_STREAK_BONUS
     args = parse_args(argv)
     set_console_emit(args.verbose)
     log = print if args.verbose else (lambda *a, **k: None)
+    C_STREAK_BONUS = float(getattr(args, "c_streak_bonus", 0.0) or 0.0)
 
     want_primary = bool(args.spectral_primary) and not bool(args.no_spectral)
     want_spectral = (bool(args.spectral) or want_primary) and not bool(
@@ -1979,7 +2033,8 @@ def main(argv: list[str] | None = None) -> None:
                 f"  g{r.game}: score={r.score} lines={r.lines} "
                 f"holes={r.holes} maxH={r.max_height} "
                 f"aggH={r.aggregate_height} pieces={r.pieces} "
-                f"frames={r.frames} top_out={r.top_out}",
+                f"frames={r.frames} top_out={r.top_out} "
+                f"C={r.n_C} D={r.n_D} tft={r.tft_state}",
                 flush=True,
             )
         print(
@@ -1987,7 +2042,10 @@ def main(argv: list[str] | None = None) -> None:
             f"lines={summary['mean_lines']:.2f} "
             f"holes={summary['mean_holes']:.2f} "
             f"maxH={summary['mean_max_height']:.2f} "
-            f"pieces={summary['mean_pieces']:.1f}",
+            f"pieces={summary['mean_pieces']:.1f} "
+            f"frames={summary.get('mean_frames', 0):.0f} "
+            f"top_out_rate={summary.get('top_out_rate', 0):.2f} "
+            f"c_rate={summary.get('c_rate', 0):.3f}",
             flush=True,
         )
         return
@@ -2006,6 +2064,8 @@ def main(argv: list[str] | None = None) -> None:
     s = build_symbioid(
         world, spectral=want_spectral, spectral_primary=want_primary
     )
+    if bool(getattr(args, "no_warm_start", False)):
+        s.mind.warm_start_actions = False
     # Co-lead blend: network heat + coach residual (research 2026-07-26).
     # Floor clamp in choose_target is 0.35 so 0.60 is honored.
     # Phase 3: batch Mind/field locks once per choose_target via prepare().

@@ -71,3 +71,22 @@ def test_policy_standalone():
     r = p.maybe_forgive(val)
     assert r["forgiven"] == 1
     assert val["x"] == 0.0
+
+
+def test_warm_start_action_prior():
+    m = Mind(warm_start_actions=True, warm_start_prior=0.12)
+    th = m.ensure_action_thought("tetris", "hard", host_id="h")
+    ck = m.action_content_key("tetris", "hard")
+    assert m._valence.get(ck, 0.0) == 0.12
+    # second ensure does not re-mint or clobber
+    m._valence[ck] = 1.5
+    th2 = m.ensure_action_thought("tetris", "hard", host_id="h")
+    assert th2 is th
+    assert m._valence[ck] == 1.5
+
+
+def test_warm_start_disabled():
+    m = Mind(warm_start_actions=False, warm_start_prior=0.12)
+    m.ensure_action_thought("pong", "up", host_id="h")
+    ck = m.action_content_key("pong", "up")
+    assert ck not in m._valence or m._valence.get(ck, 0.0) == 0.0
