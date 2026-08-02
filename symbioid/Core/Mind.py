@@ -977,6 +977,23 @@ class Mind(System):
         with self._lock:
             return self.tft.snapshot()
 
+    def tft_export(self) -> dict[str, Any]:
+        """Persistable TFT episode + config (Phase 3)."""
+        with self._lock:
+            return self.tft.to_dict()
+
+    def tft_import(self, data: Optional[dict[str, Any]]) -> None:
+        """Restore TFT from memory JSON."""
+        from symbioid.Core.strategy import TitForTatPolicy
+
+        with self._lock:
+            self.tft = TitForTatPolicy.from_dict(data)
+
+    def should_block_token(self, token: str) -> bool:
+        """True if Outerface/demo should suppress this act while retaliating."""
+        with self._lock:
+            return self.tft.should_block_token(token)
+
     def _touch_channel(self, sensor_id: str, content_key: str) -> None:
         keys = self._channel_keys.setdefault(sensor_id, [])
         if content_key in keys:

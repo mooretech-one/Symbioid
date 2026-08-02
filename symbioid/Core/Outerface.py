@@ -620,6 +620,13 @@ class Outerface(SpikingEngine):
             rec = host.mind.recommend_action(state, domain="default")
         if rec is None:
             return []
+        # Phase 3 TFT: optional suppress high-risk tokens while retaliating
+        if hasattr(host.mind, "should_block_token") and host.mind.should_block_token(
+            rec.token
+        ):
+            with self._local_lock:
+                self.last_gate = f"graph:{rec.token}:tft_retaliate_block"
+            return []
         with host.graph_lock:
             actuators = list(host.actuators)
         if not actuators:

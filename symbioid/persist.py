@@ -132,6 +132,13 @@ def _export_mind(mind: Any) -> dict[str, Any]:
             "follows": dict(mind._follows),
             "integrates": dict(mind._integrates),
             "holonomic": holo,
+            "tft": (
+                mind.tft_export()
+                if hasattr(mind, "tft_export")
+                else None
+            ),
+            "warm_start_actions": bool(getattr(mind, "warm_start_actions", True)),
+            "warm_start_prior": float(getattr(mind, "warm_start_prior", 0.12) or 0.0),
             "stats": {
                 "admits_mint": int(mind.admits_mint),
                 "admits_reuse": int(mind.admits_reuse),
@@ -443,6 +450,15 @@ def apply_memory(
             mind.spectral_mix_enabled = bool(md["spectral_mix_enabled"])
         if "holonomic_store_enabled" in md:
             mind.holonomic_store_enabled = bool(md["holonomic_store_enabled"])
+        if "warm_start_actions" in md:
+            mind.warm_start_actions = bool(md["warm_start_actions"])
+        if "warm_start_prior" in md:
+            try:
+                mind.warm_start_prior = float(md["warm_start_prior"])
+            except (TypeError, ValueError):
+                pass
+        if "tft" in md and hasattr(mind, "tft_import"):
+            mind.tft_import(md.get("tft"))
 
         mind._observations.clear()
         mind._actions.clear()

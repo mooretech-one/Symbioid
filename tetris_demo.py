@@ -1294,6 +1294,13 @@ def graph_preferred_intent(
         s.add_thought(th)
 
     rec = s.mind.recommend_action(poles, domain="tetris", min_score=0.05)
+    # Phase 3: optional TFT retaliate gate (default off; set block_tokens to enable)
+    if (
+        rec is not None
+        and hasattr(s.mind, "should_block_token")
+        and s.mind.should_block_token(rec.token)
+    ):
+        rec = None
     mind_tok: str | None = None
     mind_score = 0.0
     if rec is not None and rec.token in VALID_ACTIONS:

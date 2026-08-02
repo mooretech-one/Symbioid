@@ -90,3 +90,45 @@ def test_warm_start_disabled():
     m.ensure_action_thought("pong", "up", host_id="h")
     ck = m.action_content_key("pong", "up")
     assert ck not in m._valence or m._valence.get(ck, 0.0) == 0.0
+
+
+def test_tft_to_from_dict_roundtrip():
+    m = Mind()
+    m.tft.config.forgive_after_n_c = 5
+    m.tft.config.forgive_random_d_prob = 0.25
+    m.tft.config.retaliate_gate = True
+    m.tft.config.block_tokens_on_retaliate = ("hard", "explore")
+    m.note_round("D_env", keys=["k1", "k2"])
+    m.note_round("C")
+    blob = m.tft_export()
+    m2 = Mind()
+    m2.tft_import(blob)
+    assert m2.tft.state == "retaliate"
+    assert m2.tft.c_streak == 1
+    assert m2.tft.grudge_keys == {"k1", "k2"}
+    assert m2.tft.config.forgive_after_n_c == 5
+    assert abs(m2.tft.config.forgive_random_d_prob - 0.25) < 1e-9
+    assert m2.tft.config.retaliate_gate is True
+    assert set(m2.tft.config.block_tokens_on_retaliate) == {"hard", "explore"}
+
+
+def test_generous_tft_noise_forgive():
+    p = TitForTatPolicy(
+        config=TitForTatConfig(forgive_random_d_prob=1.0)  # always ignore D_env
+    )
+    p.note_round("D_env", keys=["x"])
+    assert p.state == "open"
+    assert not p.grudge_keys
+    assert p.counts.get("noise_forgive", 0) == 1
+    assert p.counts.get("D", 0) == 0
+
+
+def test_retaliate_gate_blocks_token():
+    m = Mind()
+    m.tft.config.retaliate_gate = True
+    m.tft.config.block_tokens_on_retaliate = ("hard",)
+    assert m.should_block_token("hard") is False  # open
+    m.note_round("D_env", keys=["g"])
+    assert m.tft.state == "retaliate"
+    assert m.should_block_token("hard") is True
+    assert m.should_block_token("left") is False

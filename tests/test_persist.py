@@ -206,3 +206,23 @@ def test_v1_payload_still_loads():
     data.pop("snapshot", None)
     s2 = _host()
     apply_memory(s2, data)
+
+
+def test_tft_persists_across_memory():
+    """Phase 3: TFT episode state survives export/apply."""
+    s = _host()
+    s.mind.tft.config.forgive_after_n_c = 7
+    s.mind.tft.config.forgive_random_d_prob = 0.1
+    s.mind.tft.config.retaliate_gate = True
+    s.mind.tft.config.block_tokens_on_retaliate = ("hard",)
+    s.mind.note_round("D_env", keys=["cell:place"])
+    s.mind.note_round("C")
+    data = export_memory(s, mode="lean")
+    assert "tft" in (data.get("mind") or {})
+    s2 = _host()
+    apply_memory(s2, data)
+    assert s2.mind.tft.state == "retaliate"
+    assert s2.mind.tft.c_streak == 1
+    assert "cell:place" in s2.mind.tft.grudge_keys
+    assert s2.mind.tft.config.forgive_after_n_c == 7
+    assert s2.mind.should_block_token("hard") is True

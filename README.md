@@ -330,7 +330,23 @@ s.mind.maybe_forgive()
 print(s.mind.tft_snapshot())
 ```
 
-Phase 3 may persist TFT state (see vault plan).
+**Phase 3 (0.0.55) — persist + gate + generous TFT:**
+
+| Knob | Default | Role |
+|------|---------|------|
+| `tft.config.forgive_random_d_prob` | `0.0` | Ignore D_env as noise (generous TFT) |
+| `tft.config.retaliate_gate` | `False` | When True, block listed tokens while retaliating |
+| `tft.config.block_tokens_on_retaliate` | `()` | e.g. `("hard",)` — domain-specific |
+| Memory JSON `mind.tft` | — | state, c_streak, grudge_keys, config |
+
+```python
+s.mind.tft.config.retaliate_gate = True
+s.mind.tft.config.block_tokens_on_retaliate = ("hard",)
+# after D: Outerface / Tetris recommend skip blocked tokens
+assert s.mind.should_block_token("hard")  # only while tft_state==retaliate
+# persist
+# save_memory(s, path)  # includes mind.tft
+```
 
 ### Constitution (Asimov-shaped, installed STABLE patterns)
 

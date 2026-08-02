@@ -10,6 +10,7 @@ See vault: Work-Log/2026-08-02-research-loop-symbioid-game-theory-tit-for-tat.md
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Iterable, Mapping, MutableMapping, Optional, Sequence
@@ -79,8 +80,12 @@ class TitForTatConfig:
     enabled: bool = True
     forgive_after_n_c: int = 4
     forgive_gamma: float = 0.5  # multiply grudge valence by gamma (pull toward 0 if |v| shrinks)
-    # If True, move valence toward 0 by: v * gamma (gamma in (0,1) shrinks |v|)
-    # gamma=0.5 halves residual grudge each forgiveness.
+    # Generous TFT: ignore D_env as noise with this probability (default 0).
+    forgive_random_d_prob: float = 0.0
+    # When True, Outerface/Mind may block listed tokens while state==retaliate.
+    retaliate_gate: bool = False
+    # Tokens blocked only while retaliating (domain-specific; empty = gate no-ops).
+    block_tokens_on_retaliate: tuple[str, ...] = ()
 
 
 @dataclass
@@ -104,23 +109,88 @@ class TitForTatPolicy:
             "D_self": 0,
             "U": 0,
             "D": 0,  # any defect
+            "noise_forgive": 0,  # generous-TFT ignored D_env
         }
     )
     last_label: str = ""
     forgives: int = 0
+    _rng: random.Random = field(default_factory=random.Random, repr=False)
 
     def snapshot(self) -> dict[str, Any]:
         return {
             "tft_state": self.state,
             "c_streak": int(self.c_streak),
             "grudge_n": len(self.grudge_keys),
+            "grudge_keys": sorted(self.grudge_keys),
             "counts": dict(self.counts),
             "last_label": self.last_label,
             "forgives": int(self.forgives),
             "enabled": bool(self.config.enabled),
             "forgive_after_n_c": int(self.config.forgive_after_n_c),
             "forgive_gamma": float(self.config.forgive_gamma),
+            "forgive_random_d_prob": float(self.config.forgive_random_d_prob),
+            "retaliate_gate": bool(self.config.retaliate_gate),
+            "block_tokens_on_retaliate": list(self.config.block_tokens_on_retaliate),
         }
+
+    def to_dict(self) -> dict[str, Any]:
+        """Persistable episode + config (Phase 3)."""
+        return {
+            "state": self.state,
+            "c_streak": int(self.c_streak),
+            "grudge_keys": sorted(self.grudge_keys),
+            "counts": dict(self.counts),
+            "last_label": self.last_label,
+            "forgives": int(self.forgives),
+            "config": {
+                "enabled": bool(self.config.enabled),
+                "forgive_after_n_c": int(self.config.forgive_after_n_c),
+                "forgive_gamma": float(self.config.forgive_gamma),
+                "forgive_random_d_prob": float(self.config.forgive_random_d_prob),
+                "retaliate_gate": bool(self.config.retaliate_gate),
+                "block_tokens_on_retaliate": list(self.config.block_tokens_on_retaliate),
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, data: Optional[Mapping[str, Any]]) -> "TitForTatPolicy":
+        p = cls()
+        if not data:
+            return p
+        cfg = data.get("config") or {}
+        p.config = TitForTatConfig(
+            enabled=bool(cfg.get("enabled", True)),
+            forgive_after_n_c=int(cfg.get("forgive_after_n_c", 4) or 4),
+            forgive_gamma=float(cfg.get("forgive_gamma", 0.5) or 0.5),
+            forgive_random_d_prob=float(cfg.get("forgive_random_d_prob", 0.0) or 0.0),
+            retaliate_gate=bool(cfg.get("retaliate_gate", False)),
+            block_tokens_on_retaliate=tuple(
+                str(t) for t in (cfg.get("block_tokens_on_retaliate") or ())
+            ),
+        )
+        p.state = str(data.get("state") or TftState.open.value)
+        p.c_streak = int(data.get("c_streak", 0) or 0)
+        p.grudge_keys = {str(k) for k in (data.get("grudge_keys") or [])}
+        raw_counts = data.get("counts") or {}
+        for k, v in raw_counts.items():
+            try:
+                p.counts[str(k)] = int(v)
+            except (TypeError, ValueError):
+                continue
+        p.last_label = str(data.get("last_label") or "")
+        p.forgives = int(data.get("forgives", 0) or 0)
+        return p
+
+    def should_block_token(self, token: str) -> bool:
+        """Outerface/demo gate: block high-risk tokens only while retaliating."""
+        if not self.config.enabled or not self.config.retaliate_gate:
+            return False
+        if self.state != TftState.retaliate.value:
+            return False
+        blocked = {str(t) for t in self.config.block_tokens_on_retaliate}
+        if not blocked:
+            return False
+        return str(token).strip() in blocked
 
     def note_round(self, event: RoundEvent | object, **kwargs: Any) -> RoundEvent:
         if not isinstance(event, RoundEvent):
@@ -134,6 +204,17 @@ class TitForTatPolicy:
                 pass
             # stay open or move toward forgive opportunity
         elif lab in (RoundLabel.D_env, RoundLabel.D_self):
+            # Generous TFT: sometimes treat D_env as noise (no retaliate / grudge)
+            p_noise = float(self.config.forgive_random_d_prob)
+            if (
+                lab == RoundLabel.D_env
+                and p_noise > 0.0
+                and self._rng.random() < min(1.0, p_noise)
+            ):
+                self.counts["noise_forgive"] = int(self.counts.get("noise_forgive", 0)) + 1
+                self.counts["U"] = int(self.counts.get("U", 0)) + 1
+                self.last_label = "U_noise"
+                return event
             self.counts["D"] = int(self.counts.get("D", 0)) + 1
             self.counts[lab.value] = int(self.counts.get(lab.value, 0)) + 1
             self.c_streak = 0
