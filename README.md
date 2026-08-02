@@ -285,10 +285,11 @@ Minted structure is **read for action choice**, not only stored:
 1. **Placement / strategy** — `choose_target` **co-leads** cell-map Thought heat and coach board value (`graph_placement_weight≈0.60`; net-primary floor 0.35).
 2. **Commands** — `graph_preferred_intent` derives micro-intents from the network-scored target (geo), with Mind `recommend_action` as strong-score override; `tick` takes that intent at high `graph_bias` (~0.93).
 3. **Coach retains** — secret-byte discovery, gravity separation, stuck/force-hard survival, cold explore fallback (`last_network_cmd` marks who drove the last byte).
-4. **Lock credit (P1)** — coach `board_quality_reward` fans valence onto **landing cells** (`apply_lock_valence_to_landing_cells`, v0.0.33) **and** a **trajectory eligibility window** of recent policy poles (`EligibilityWindow` / `apply_lock_credit`, v0.0.48) with linear recency weights.
+4. **Lock credit (P1)** — coach `board_quality_reward` fans valence onto **landing cells** (`apply_lock_valence_to_landing_cells`, v0.0.33) **and** a **trajectory eligibility window** of recent policy poles (`EligibilityWindow` / `apply_lock_credit`, v0.0.48) with linear recency weights. **Hygiene (0.0.52):** asymmetric negatives, skip `:place` on top-out, place-valence leak.
 5. **Hole + well avoidance** — `pose_hole_features` / edge-aware `well_metrics`: sealed holes (`d_holes`) and open single-width trenches (`d_well`, `max_well`, including col 0/9). HUD shows `holes` / `well` / `maxW`.
 6. **Packing meta sensors (v0.0.36+)** — `holes_n`, `last_d_holes`, `well_n`, `max_well_n` sampled into Mind.
 7. **Foresight free-count (v0.0.37)** — `pred_d_holes`, `holes_freed` (max(0,−Δ)), `holes_fill_n` for the **current target pose** so the network knows how many holes a planned placement will free (via `pose_hole_features` on `coach._target`).
+8. **Iterated twin / TFT (v0.0.53)** — each lock is a System ⋈ Environment **round** (`C` / `D_env` / `D_self` / `U`). Mind `note_round` + `maybe_forgive` implement Tit-for-Tat-shaped recovery: after `forgive_after_n_c` cooperative locks, **episode grudge** valence is scaled by `forgive_gamma` (no full `--reset-memory`). Headless metrics include `C`/`D` counts and `c_rate`. Module: `symbioid.Core.strategy`.
 
 Content keys quantize float `reading` (`quantize_decimals=3` default). Registry Observations + Actions are protected from prune. Coach lock reward also fans into valence via `mind.note_valence(channel="board", delta=…)`.
 
@@ -301,6 +302,27 @@ s.mind.habituate_after = 2
 # Legacy always-mint growth (Observations + Follows):
 # s.mind.recognition_enabled = False
 ```
+
+### Iterated twin strategy (Tit for Tat–shaped, v0.0.53)
+
+The six-seed poles **System** / **Environment** are an **infinite game**, not a one-shot exploit. Credit hygiene (0.0.52) stops perpetual self-malice; TFT adds **forgiveness**:
+
+| Trait | Mechanism |
+|-------|-----------|
+| Nice | Open with cooperation (`C` on good locks) |
+| Retaliatory | Bounded tax via existing lock credit + `D_env` on top-out |
+| Forgiving | `mind.maybe_forgive()` after N×`C` shrinks grudge keys |
+| Clear | `mind.tft_snapshot()` / headless `C=` `D=` `tft=` |
+
+```python
+s.mind.tft.config.forgive_after_n_c = 4   # default
+s.mind.tft.config.forgive_gamma = 0.5     # halve residual grudge valence
+s.mind.note_round("C")                   # or D_env / D_self / U
+s.mind.maybe_forgive()
+print(s.mind.tft_snapshot())
+```
+
+Phase 2 will wire Pong/Audio; Phase 3 may persist TFT state (see vault research plan).
 
 ### Constitution (Asimov-shaped, installed STABLE patterns)
 

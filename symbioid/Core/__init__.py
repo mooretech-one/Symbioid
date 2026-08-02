@@ -72,6 +72,13 @@ from symbioid.Core.formation import (
     six_set_poles,
 )
 from symbioid.Core.seed import is_minimal_symbioid_shape, minimal_seed
+from symbioid.Core.strategy import (
+    RoundEvent,
+    RoundLabel,
+    TftState,
+    TitForTatConfig,
+    TitForTatPolicy,
+)
 from symbioid.Core.spectral import (
     HolonomicStore,
     SpectralBank,
@@ -143,4 +150,9 @@ __all__ = [
     "ceil_pow2",
     "key_to_vector",
     "abs_phase_diff",
+    "RoundLabel",
+    "RoundEvent",
+    "TftState",
+    "TitForTatConfig",
+    "TitForTatPolicy",
 ]

@@ -23,12 +23,17 @@ from symbioid.Core import (
     Process,
     Sensor,
     HolonomicStore,
+    RoundEvent,
+    RoundLabel,
     SpectralBank,
     SpikingEngine,
     Symbioid,
     System,
+    TftState,
     Thought,
     ThoughtLayer,
+    TitForTatConfig,
+    TitForTatPolicy,
     abs_phase_diff,
     ceil_pow2,
     key_to_vector,
@@ -128,6 +133,11 @@ __all__ = [
     "load_memory",
     "try_load_into",
     "default_memory_path",
+    "RoundLabel",
+    "RoundEvent",
+    "TftState",
+    "TitForTatConfig",
+    "TitForTatPolicy",
 ]
 
-__version__ = "0.0.52"
+__version__ = "0.0.53"

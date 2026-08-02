@@ -5,10 +5,11 @@ from __future__ import annotations
 import hashlib
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from symbioid.Core.System import System
 from symbioid.Core.Thought import Thought
+from symbioid.Core.strategy import RoundEvent, TitForTatPolicy
 from symbioid.Core.thought_layers import ThoughtLayer, assert_mind_not_thought
 
 
@@ -197,6 +198,8 @@ class Mind(System):
     # action content_key → token string
     _action_tokens: dict[str, str] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+    # Iterated twin / TFT strategy (v0.0.53) — runtime episode controller
+    tft: TitForTatPolicy = field(default_factory=TitForTatPolicy, repr=False)
 
     def ensure_spectral_bank(self) -> Any:
         """Lazy-create SpectralBank sized to ``spectral_bank_size`` (Phase 1)."""
@@ -922,6 +925,48 @@ class Mind(System):
                 seen.add(ck)
                 v = self._valence.get(ck, 0.0) + d
                 self._valence[ck] = max(self.valence_floor, min(self.valence_ceil, v))
+
+    def note_round(
+        self,
+        label: object,
+        *,
+        source: str = "unknown",
+        channel: str = "",
+        keys: Optional[Iterable[str]] = None,
+    ) -> RoundEvent:
+        """
+        Label a System ⋈ Environment round (C / D_env / D_self / U).
+
+        On defect, optional ``keys`` are added to the episode grudge set for
+        later forgiveness. Does not itself apply valence tax (credit paths do).
+        """
+        ks: list[str] = []
+        if keys is not None:
+            if isinstance(keys, (str, bytes)):
+                ks = [str(keys)]
+            else:
+                ks = [str(k) for k in keys if k]
+        ev = RoundEvent.make(label, source=source, channel=channel, keys=ks)
+        with self._lock:
+            return self.tft.note_round(ev)
+
+    def maybe_forgive(self) -> dict[str, Any]:
+        """
+        If cooperative streak is long enough, shrink valence on episode grudge keys.
+
+        Complements credit hygiene: retaliate once (credit), then re-open (forgive).
+        """
+        with self._lock:
+            return self.tft.maybe_forgive(
+                self._valence,
+                floor=float(self.valence_floor),
+                ceil=float(self.valence_ceil),
+            )
+
+    def tft_snapshot(self) -> dict[str, Any]:
+        """HUD / headless: TFT state + C/D counts."""
+        with self._lock:
+            return self.tft.snapshot()
 
     def _touch_channel(self, sensor_id: str, content_key: str) -> None:
         keys = self._channel_keys.setdefault(sensor_id, [])

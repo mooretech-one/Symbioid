@@ -31,7 +31,7 @@ import argparse
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 try:
     import pygame
@@ -725,13 +725,16 @@ def apply_lock_credit(
     ``push_poles=False`` (default) to avoid duplicate last-frame entries.
     Clears the window after apply so the next piece starts fresh.
     """
-    stats = {
+    stats: dict[str, Any] = {
         "landing": 0,
         "eligibility": 0,
         "pushed": 0,
         "place_leak": 0,
         "skipped_place": 0,
         "topped_out": 0,
+        "grudge_keys": [],
+        "forgiven": 0,
+        "round": "",
     }
     reward = float(getattr(coach, "last_reward", 0.0) or 0.0)
     topped = bool(getattr(coach, "last_topped_out", False))
@@ -746,6 +749,11 @@ def apply_lock_credit(
         window.push(keys)
         stats["pushed"] = 1 if len(window) > before else 0
     lock_cells = list(getattr(coach, "last_lock_cells", None) or [])
+    # Candidate grudge keys (place synth + eligibility) before window clear
+    grudge: set[str] = set()
+    for r, c in lock_cells:
+        grudge.add(f"cell_r{int(r):02d}_c{int(c):02d}:place")
+    grudge.update(window.credited_keys().keys())
     if lock_cells:
         stats["landing"] = apply_lock_valence_to_landing_cells(
             s,
@@ -763,6 +771,22 @@ def apply_lock_credit(
         stats["eligibility"] = 0
     stats["place_leak"] = leak_place_valence(s, rate=place_leak)
     window.clear()
+    # v0.0.53 iterated twin: C/D round labels + forgiveness
+    if topped:
+        stats["round"] = "D_env"
+        stats["grudge_keys"] = sorted(grudge)
+        # Physics end-of-game; System also participated via last place (grudge keys).
+        s.mind.note_round(
+            "D_env",
+            source="self",
+            channel="tetris",
+            keys=grudge,
+        )
+    else:
+        stats["round"] = "C"
+        s.mind.note_round("C", source="env", channel="tetris")
+        fg = s.mind.maybe_forgive()
+        stats["forgiven"] = int(fg.get("forgiven", 0) or 0)
     return stats
 
 
@@ -779,6 +803,11 @@ class GameMetric:
     aggregate_height: int
     frames: int
     top_out: bool
+    n_C: int = 0
+    n_D: int = 0
+    n_U: int = 0
+    tft_state: str = "open"
+    forgives: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -791,6 +820,11 @@ class GameMetric:
             "aggregate_height": self.aggregate_height,
             "frames": self.frames,
             "top_out": self.top_out,
+            "n_C": self.n_C,
+            "n_D": self.n_D,
+            "n_U": self.n_U,
+            "tft_state": self.tft_state,
+            "forgives": self.forgives,
         }
 
 
@@ -804,8 +838,14 @@ def summarize_game_metrics(rows: list[GameMetric]) -> dict[str, float]:
             "mean_holes": 0.0,
             "mean_max_height": 0.0,
             "mean_pieces": 0.0,
+            "mean_C": 0.0,
+            "mean_D": 0.0,
+            "c_rate": 0.0,
         }
     n = float(len(rows))
+    sum_c = sum(r.n_C for r in rows)
+    sum_d = sum(r.n_D for r in rows)
+    rounds = float(sum_c + sum_d) or 1.0
     return {
         "n": n,
         "mean_score": sum(r.score for r in rows) / n,
@@ -813,6 +853,9 @@ def summarize_game_metrics(rows: list[GameMetric]) -> dict[str, float]:
         "mean_holes": sum(r.holes for r in rows) / n,
         "mean_max_height": sum(r.max_height for r in rows) / n,
         "mean_pieces": sum(r.pieces for r in rows) / n,
+        "mean_C": sum_c / n,
+        "mean_D": sum_d / n,
+        "c_rate": sum_c / rounds,
     }
 
 
@@ -867,6 +910,7 @@ def run_multi_game_metric(
             frame = 0
             last_cmd_poles: list = []
             elig.clear()
+            s.mind.tft.reset_episode(clear_counts=True)
             while not world.game_over and frame < int(max_frames):
                 sample_into_symbioid(s, world, tick=frame)
                 if s.mind.dynamics_enabled and frame % PULSE_EVERY == 0:
@@ -934,6 +978,8 @@ def run_multi_game_metric(
                             s.pulse_tick()
                 frame += 1
             # End-of-game packing snapshot (board at top-out or frame cap)
+            snap = s.mind.tft_snapshot()
+            cnt = snap.get("counts") or {}
             rows.append(
                 GameMetric(
                     game=g,
@@ -945,12 +991,19 @@ def run_multi_game_metric(
                     aggregate_height=int(world.aggregate_height()),
                     frames=frame,
                     top_out=bool(world.game_over),
+                    n_C=int(cnt.get("C", 0) or 0),
+                    n_D=int(cnt.get("D", 0) or 0),
+                    n_U=int(cnt.get("U", 0) or 0),
+                    tft_state=str(snap.get("tft_state", "open")),
+                    forgives=int(snap.get("forgives", 0) or 0),
                 )
             )
             log(
                 f"[metric] g={g} score={world.score} lines={world.lines} "
                 f"holes={world.hole_count()} maxH={world.max_height()} "
-                f"pieces={world.pieces_placed} frames={frame}",
+                f"pieces={world.pieces_placed} frames={frame} "
+                f"C={cnt.get('C', 0)} D={cnt.get('D', 0)} "
+                f"tft={snap.get('tft_state')} forgives={snap.get('forgives', 0)}",
                 flush=True,
             )
             if g < int(games):
@@ -958,6 +1011,12 @@ def run_multi_game_metric(
     finally:
         s.stop_processes()
     summary = summarize_game_metrics(rows)
+    log(
+        f"[summary] n={summary.get('n')} mean_score={summary.get('mean_score'):.1f} "
+        f"mean_C={summary.get('mean_C', 0):.1f} mean_D={summary.get('mean_D', 0):.1f} "
+        f"c_rate={summary.get('c_rate', 0):.3f}",
+        flush=True,
+    )
     return rows, summary
 
 
