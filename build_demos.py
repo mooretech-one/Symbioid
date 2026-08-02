@@ -88,6 +88,24 @@ def build_one(demo_key: str, *, onefile: bool, console: bool, clean: bool) -> Pa
     DIST.mkdir(parents=True, exist_ok=True)
     BUILD.mkdir(parents=True, exist_ok=True)
 
+    suffix = ".exe" if platform.system() == "Windows" else ""
+    # PyInstaller onefile writes dist/Name; onedir writes dist/Name/ (dir).
+    # Mixing modes leaves a file/dir clash so the next build looks "empty" or fails.
+    primary = DIST / f"{name}{suffix}"
+    primary_dir = DIST / name
+    if onefile:
+        if primary_dir.is_dir():
+            print(f"Removing prior onedir {primary_dir} (onefile needs this path as a file)", flush=True)
+            shutil.rmtree(primary_dir)
+        if primary.is_file():
+            primary.unlink()
+    else:
+        if primary.is_file():
+            print(f"Removing prior onefile {primary} (onedir needs this path as a folder)", flush=True)
+            primary.unlink()
+        if primary_dir.is_dir():
+            shutil.rmtree(primary_dir)
+
     args = [
         sys.executable,
         "-m",
@@ -140,7 +158,6 @@ def build_one(demo_key: str, *, onefile: bool, console: bool, clean: bool) -> Pa
     print(" ", " ".join(args), flush=True)
     subprocess.check_call(args, cwd=ROOT)
 
-    suffix = ".exe" if platform.system() == "Windows" else ""
     if onefile:
         out = DIST / f"{name}{suffix}"
     else:
@@ -153,11 +170,31 @@ def build_one(demo_key: str, *, onefile: bool, console: bool, clean: bool) -> Pa
             raise FileNotFoundError(f"Expected output missing: {out}")
 
     tag = _platform_tag()
-    if out.is_file():
+    # Tag a portable artifact next to dist/:
+    # - onefile → single SymbioidTetris-linux-x64 binary
+    # - onedir  → full folder SymbioidTetris-linux-x64-onedir/ (exe + _internal)
+    if out.is_file() and onefile:
         tagged = DIST / f"{name}-{tag}{suffix}"
+        if tagged.is_dir():
+            shutil.rmtree(tagged)
         shutil.copy2(out, tagged)
-        print(f"OK  {out}")
+        size_mb = out.stat().st_size / (1024 * 1024)
+        print(f"OK  {out}  ({size_mb:.1f} MiB onefile)")
         print(f"    (+ tagged copy {tagged.name})")
+        return out
+    if out.is_file() and not onefile:
+        # onedir: dist/Name/Name + _internal → tag as dist/Name-tag-onedir/
+        # (avoid clashing with onefile dist/Name-tag binary)
+        src_dir = out.parent
+        tagged_dir = DIST / f"{name}-{tag}-onedir"
+        if tagged_dir.is_dir():
+            shutil.rmtree(tagged_dir)
+        elif tagged_dir.is_file():
+            tagged_dir.unlink()
+        shutil.copytree(src_dir, tagged_dir)
+        tagged_exe = tagged_dir / out.name
+        print(f"OK  {out}")
+        print(f"    (+ tagged onedir {tagged_dir.name}/ → run {tagged_exe.relative_to(DIST)})")
         return out
     print(f"OK  {out}")
     return out
