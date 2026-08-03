@@ -30,9 +30,10 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Generator, Iterable
 
 try:
     import pygame
@@ -116,6 +117,11 @@ RESTART_DELAY_FRAMES = max(12, FPS // 2)
 FACE_TICK_INTERVAL = 0.1  # was 0.05 (~10 Hz; 0.0.64 20 Hz overloaded machine)
 # Frame budget shedder (ms): if last frame exceeded this, skip GC / rescore / extra pulse
 FRAME_BUDGET_MS = 25.0
+# Network CPU governor (v0.0.66): keep Symbioid network work ≤ this fraction of
+# wall time by sleeping / shedding (pulse, placement, faces, mid-GC, sampling).
+NETWORK_CPU_FRACTION = 0.50
+NETWORK_CPU_WINDOW_S = 0.50  # sliding accounting window (seconds)
+NETWORK_CPU_MAX_SLEEP_S = 0.05  # cap per yield so UI stays responsive
 PERF_LOG_EVERY = 30  # frames; log ms_frame + shed flags
 
 
@@ -288,6 +294,106 @@ def _geo_intent_for_target(world: TetrisWorld, coach: TetrisCoach) -> str | None
 def frame_over_budget(last_frame_ms: float, *, budget_ms: float = FRAME_BUDGET_MS) -> bool:
     """True when the previous frame exceeded the soft wall-clock budget."""
     return float(last_frame_ms) > float(budget_ms) > 0.0
+
+
+@dataclass
+class NetworkCpuGovernor:
+    """
+    Cap Symbioid *network* work to a fraction of wall-clock CPU (default 50%).
+
+    Charges time spent in sample / pulse / placement / GC. When charged network
+    time exceeds ``fraction * wall``, sleeps until the ratio is restored (bounded
+    sleep). ``over_cap()`` drives shedder + face throttle.
+    """
+
+    fraction: float = NETWORK_CPU_FRACTION
+    window_s: float = NETWORK_CPU_WINDOW_S
+    max_sleep_s: float = NETWORK_CPU_MAX_SLEEP_S
+    network_s: float = 0.0
+    wall_start: float = field(default_factory=time.perf_counter)
+    sleep_s_total: float = 0.0
+    charge_count: int = 0
+
+    def reset(self) -> None:
+        self.network_s = 0.0
+        self.wall_start = time.perf_counter()
+        self.sleep_s_total = 0.0
+        self.charge_count = 0
+
+    def wall_s(self) -> float:
+        return max(1e-9, time.perf_counter() - self.wall_start)
+
+    def ratio(self) -> float:
+        return self.network_s / self.wall_s()
+
+    def over_cap(self) -> bool:
+        # Need a little wall time before judging
+        if self.wall_s() < 0.02:
+            return False
+        return self.network_s > float(self.fraction) * self.wall_s()
+
+    def charge(self, dt_s: float) -> float:
+        """Account network work ``dt_s`` seconds; sleep if over cap. Returns sleep s."""
+        if dt_s <= 0:
+            return 0.0
+        self.network_s += float(dt_s)
+        self.charge_count += 1
+        return self.yield_if_needed()
+
+    def yield_if_needed(self) -> float:
+        """Sleep so network_s <= fraction * wall. Returns seconds slept."""
+        wall = self.wall_s()
+        frac = max(0.05, min(0.95, float(self.fraction)))
+        if self.network_s <= frac * wall:
+            self._maybe_slide_window(wall)
+            return 0.0
+        # network <= frac * (wall + sleep)  =>  sleep >= network/frac - wall
+        need = self.network_s / frac - wall
+        if need <= 0:
+            return 0.0
+        sleep_s = min(float(self.max_sleep_s), need)
+        time.sleep(sleep_s)
+        self.sleep_s_total += sleep_s
+        self._maybe_slide_window(self.wall_s())
+        return sleep_s
+
+    def _maybe_slide_window(self, wall: float) -> None:
+        win = max(0.1, float(self.window_s))
+        if wall <= win:
+            return
+        # Keep half of history so ratio tracks recent load
+        scale = 0.5
+        self.network_s *= scale
+        self.wall_start = time.perf_counter() - wall * scale
+
+    @contextmanager
+    def work(self) -> Generator[None, None, None]:
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.charge(time.perf_counter() - t0)
+
+
+def apply_face_cpu_throttle(s: Symbioid, *, over_cap: bool) -> None:
+    """
+    When network is over CPU cap, slow face workers (~4× tick) and skip ticks
+    when severely over; restore base interval when under cap.
+    """
+    base = float(FACE_TICK_INTERVAL)
+    slow = base * 4.0
+    for face in (s.interface, s.innerface, s.outerface):
+        if face is None:
+            continue
+        if over_cap:
+            face.tick_interval = slow
+            # If still over after sleep, disable for a stretch (re-enabled next frame)
+            if getattr(face, "enabled", True) and over_cap:
+                # Keep enabled but slow; hard-disable only when heavily over
+                pass
+        else:
+            face.tick_interval = base
+            face.enabled = True
 
 
 def cached_graph_intent(
@@ -1412,6 +1518,7 @@ def run_multi_game_metric(
     elig = EligibilityWindow(max_ticks=win_n)
     s.start_processes()
     rows: list[GameMetric] = []
+    net_gov = NetworkCpuGovernor(fraction=float(NETWORK_CPU_FRACTION))
     try:
         for g in range(1, int(games) + 1):
             frame = 0
@@ -1419,18 +1526,39 @@ def run_multi_game_metric(
             elig.clear()
             s.mind.tft.reset_episode(clear_counts=True)
             while not world.game_over and frame < int(max_frames):
+                shed = net_gov.over_cap()
+                apply_face_cpu_throttle(s, over_cap=shed)
                 if frame % SAMPLE_EVERY == 0:
-                    sample_into_symbioid(s, world, tick=frame)
-                if s.mind.dynamics_enabled and frame % PULSE_EVERY == 0:
-                    s.pulse_tick()
-                if s.mind.dynamics_enabled and PULSES_PRE_CMD > 0:
-                    for _ in range(int(PULSES_PRE_CMD)):
+                    with net_gov.work():
+                        sample_into_symbioid(s, world, tick=frame)
+                if (
+                    not shed
+                    and s.mind.dynamics_enabled
+                    and frame % PULSE_EVERY == 0
+                ):
+                    with net_gov.work():
                         s.pulse_tick()
-                maybe_mid_game_gc(s, frame)
+                if (
+                    not shed
+                    and s.mind.dynamics_enabled
+                    and PULSES_PRE_CMD > 0
+                ):
+                    for _ in range(int(PULSES_PRE_CMD)):
+                        with net_gov.work():
+                            s.pulse_tick()
+                if not shed:
+                    with net_gov.work():
+                        maybe_mid_game_gc(s, frame)
                 prev_pieces = world.pieces_placed
-                preferred, g_bias, poles, _hint = cached_graph_intent(
-                    s, world, coach, frame, place_every=PLACE_EVERY
-                )
+                with net_gov.work():
+                    preferred, g_bias, poles, _hint = cached_graph_intent(
+                        s,
+                        world,
+                        coach,
+                        frame,
+                        place_every=PLACE_EVERY,
+                        force_geo_only=shed,
+                    )
                 update_pred_pack_for_target(s, world, coach)
                 sample_packing_meta_into_symbioid(
                     s,
@@ -2553,13 +2681,25 @@ def main(argv: list[str] | None = None) -> None:
 
     last_frame_ms = 0.0
     shed_count = 0
+    net_gov = NetworkCpuGovernor(
+        fraction=float(NETWORK_CPU_FRACTION),
+        window_s=float(NETWORK_CPU_WINDOW_S),
+        max_sleep_s=float(NETWORK_CPU_MAX_SLEEP_S),
+    )
+    log(
+        f"(Network CPU cap: {NETWORK_CPU_FRACTION * 100:.0f}% wall — "
+        f"sleep/shed pulse·place·GC·faces)",
+        flush=True,
+    )
     try:
         running = True
         while running:
             frame_t0 = time.perf_counter()
-            shed = frame_over_budget(last_frame_ms)
+            # Shed when last frame was slow OR network CPU ratio over cap
+            shed = frame_over_budget(last_frame_ms) or net_gov.over_cap()
             if shed:
                 shed_count += 1
+            apply_face_cpu_throttle(s, over_cap=net_gov.over_cap())
 
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -2568,7 +2708,8 @@ def main(argv: list[str] | None = None) -> None:
                     if event.key == pygame.K_ESCAPE:
                         running = False
                     elif event.key == pygame.K_r and world.game_over:
-                        gc_stats = game_boundary_gc(s)
+                        with net_gov.work():
+                            gc_stats = game_boundary_gc(s)
                         entry = coach.on_new_game(world, record=True)
                         game_over_at = None
                         log(
@@ -2587,7 +2728,8 @@ def main(argv: list[str] | None = None) -> None:
 
             # 1) Sense: refresh cell map + meta before any command on this frame
             if is_sample:
-                sample_into_symbioid(s, world, tick=frame)
+                with net_gov.work():
+                    sample_into_symbioid(s, world, tick=frame)
 
             # 2) Baseline dynamics (skip entire pulse when shedding)
             if (
@@ -2595,11 +2737,15 @@ def main(argv: list[str] | None = None) -> None:
                 and s.mind.dynamics_enabled
                 and frame % PULSE_EVERY == 0
             ):
-                s.pulse_tick()
+                with net_gov.work():
+                    s.pulse_tick()
 
-            # 2b) Mid-game GC — skipped when previous frame over budget
+            # 2b) Mid-game GC — skipped when previous frame over budget / CPU cap
             if not world.game_over:
-                gc_stats = maybe_mid_game_gc_budgeted(s, frame, last_frame_ms=last_frame_ms)
+                with net_gov.work():
+                    gc_stats = maybe_mid_game_gc_budgeted(
+                        s, frame, last_frame_ms=last_frame_ms
+                    )
                 if gc_stats and int(gc_stats.get("removed", 0) or 0) > 50:
                     log(
                         f"[mid-gc] t={frame} th={gc_stats.get('thoughts_before')}→"
@@ -2617,28 +2763,31 @@ def main(argv: list[str] | None = None) -> None:
                     and PULSES_PRE_CMD > 0
                 ):
                     for _ in range(int(PULSES_PRE_CMD)):
-                        s.pulse_tick()
+                        with net_gov.work():
+                            s.pulse_tick()
                 prev_event = world.last_event
                 prev_pieces = world.pieces_placed
                 # Symbioid-primary control; force_geo_only when shedding
-                preferred, g_bias, poles, _g_hint = cached_graph_intent(
-                    s,
-                    world,
-                    coach,
-                    frame,
-                    place_every=PLACE_EVERY,
-                    force_geo_only=shed,
-                )
-                # Foresight / packing meta: skip when shedding (geo still works)
-                if not shed:
-                    update_pred_pack_for_target(s, world, coach)
-                    sample_packing_meta_into_symbioid(
+                with net_gov.work():
+                    preferred, g_bias, poles, _g_hint = cached_graph_intent(
                         s,
                         world,
-                        tick=frame,
-                        coach=coach,
-                        labels=_FORESIGHT_META_LABELS,
+                        coach,
+                        frame,
+                        place_every=PLACE_EVERY,
+                        force_geo_only=shed,
                     )
+                # Foresight / packing meta: skip when shedding (geo still works)
+                if not shed:
+                    with net_gov.work():
+                        update_pred_pack_for_target(s, world, coach)
+                        sample_packing_meta_into_symbioid(
+                            s,
+                            world,
+                            tick=frame,
+                            coach=coach,
+                            labels=_FORESIGHT_META_LABELS,
+                        )
                 last_cmd_poles = poles
                 code = coach.tick(
                     world,
@@ -2662,28 +2811,33 @@ def main(argv: list[str] | None = None) -> None:
                         else None
                     )
                     if intent is not None:
-                        s.mind.record_outcome(
-                            last_cmd_poles,
-                            intent,
-                            domain="tetris",
-                            host_id=s.id,
-                            reward=float(coach.last_reward),
-                            host=s,
+                        with net_gov.work():
+                            s.mind.record_outcome(
+                                last_cmd_poles,
+                                intent,
+                                domain="tetris",
+                                host_id=s.id,
+                                reward=float(coach.last_reward),
+                                host=s,
+                            )
+                    with net_gov.work():
+                        s.mind.note_valence(
+                            channel="board",
+                            delta=max(
+                                -2.0, min(2.0, float(coach.last_reward) / 50.0)
+                            ),
                         )
-                    s.mind.note_valence(
-                        channel="board",
-                        delta=max(-2.0, min(2.0, float(coach.last_reward) / 50.0)),
-                    )
-                    apply_lock_credit(
-                        s, coach, eligibility, poles=last_cmd_poles
-                    )
+                        apply_lock_credit(
+                            s, coach, eligibility, poles=last_cmd_poles
+                        )
                     s._last_d_holes = float(  # type: ignore[attr-defined]
                         getattr(coach, "last_d_holes", 0.0) or 0.0
                     )
                     if not shed:
-                        sample_packing_meta_into_symbioid(
-                            s, world, tick=frame, coach=coach
-                        )
+                        with net_gov.work():
+                            sample_packing_meta_into_symbioid(
+                                s, world, tick=frame, coach=coach
+                            )
                     # Lock pulse only when not shedding
                     if (
                         not shed
@@ -2691,19 +2845,21 @@ def main(argv: list[str] | None = None) -> None:
                         and PULSES_ON_LOCK > 0
                     ):
                         for _ in range(int(PULSES_ON_LOCK)):
-                            s.pulse_tick()
+                            with net_gov.work():
+                                s.pulse_tick()
                     _record_thought_sample()
                     if (
                         inactive_history
                         and inactive_history[-1] >= MID_GAME_INACTIVE_TRIGGER
                     ):
-                        gc_stats = maybe_mid_game_gc_budgeted(
-                            s,
-                            frame,
-                            last_frame_ms=last_frame_ms,
-                            inactive_count=inactive_history[-1],
-                            force=True,
-                        )
+                        with net_gov.work():
+                            gc_stats = maybe_mid_game_gc_budgeted(
+                                s,
+                                frame,
+                                last_frame_ms=last_frame_ms,
+                                inactive_count=inactive_history[-1],
+                                force=True,
+                            )
                         if gc_stats and int(gc_stats.get("removed", 0) or 0) > 0:
                             log(
                                 f"[mid-gc/lock] th={gc_stats.get('thoughts_before')}→"
@@ -2748,7 +2904,8 @@ def main(argv: list[str] | None = None) -> None:
                 elapsed = frame - game_over_at
                 pause_left = max(0.0, (RESTART_DELAY_FRAMES - elapsed) / FPS)
                 if elapsed >= RESTART_DELAY_FRAMES:
-                    gc_stats = game_boundary_gc(s)
+                    with net_gov.work():
+                        gc_stats = game_boundary_gc(s)
                     entry = coach.on_new_game(world, record=True)
                     game_over_at = None
                     log(
@@ -2777,6 +2934,8 @@ def main(argv: list[str] | None = None) -> None:
                 log(
                     f"[perf] t={frame} ms_frame={last_frame_ms:.1f} "
                     f"shed={int(shed)} shed_n={shed_count} "
+                    f"net_cpu={net_gov.ratio() * 100:.0f}% "
+                    f"net_sleep_ms={net_gov.sleep_s_total * 1000:.0f} "
                     f"th={thought_count(s)} score={world.score}",
                     flush=True,
                 )
@@ -2795,6 +2954,8 @@ def main(argv: list[str] | None = None) -> None:
             )
             pygame.display.flip()
             clock.tick(FPS)
+            # Final yield so network never ends a frame above cap
+            net_gov.yield_if_needed()
             last_frame_ms = (time.perf_counter() - frame_t0) * 1000.0
             frame += 1
     finally:

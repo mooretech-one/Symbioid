@@ -1,14 +1,19 @@
-"""v0.0.65 frame-budget shed + anti-remint mid-GC helpers."""
+"""v0.0.65+ frame-budget shed + network CPU governor helpers."""
 
 from __future__ import annotations
+
+import time
 
 from tetris_demo import (
     FRAME_BUDGET_MS,
     FACE_TICK_INTERVAL,
+    NETWORK_CPU_FRACTION,
     PULSE_EVERY,
     PULSES_PRE_CMD,
     SAMPLE_EVERY,
     TARGET_RESCORE_EVERY,
+    NetworkCpuGovernor,
+    apply_face_cpu_throttle,
     build_symbioid,
     cached_graph_intent,
     frame_over_budget,
@@ -88,3 +93,33 @@ def test_hang_harden_density_not_worse_than_064():
     assert PULSES_PRE_CMD == 0
     assert TARGET_RESCORE_EVERY >= 10
     assert FACE_TICK_INTERVAL >= 0.1
+
+
+def test_network_cpu_governor_sleeps_when_over_fraction():
+    """Charging more network time than fraction*wall forces a sleep yield."""
+    gov = NetworkCpuGovernor(fraction=0.5, window_s=2.0, max_sleep_s=0.05)
+    # Fake: charge 40ms network with almost no wall → must sleep
+    t0 = time.perf_counter()
+    slept = gov.charge(0.04)
+    elapsed = time.perf_counter() - t0
+    assert slept > 0.0
+    assert elapsed >= slept * 0.5  # actually slept
+    assert NETWORK_CPU_FRACTION == 0.50
+
+
+def test_network_cpu_governor_work_context():
+    gov = NetworkCpuGovernor(fraction=0.5, window_s=2.0, max_sleep_s=0.02)
+    with gov.work():
+        time.sleep(0.005)
+    assert gov.network_s >= 0.004
+    assert gov.charge_count >= 1
+
+
+def test_face_cpu_throttle_slows_interval():
+    w = TetrisWorld()
+    s = build_symbioid(w)
+    base = float(FACE_TICK_INTERVAL)
+    apply_face_cpu_throttle(s, over_cap=True)
+    assert s.interface.tick_interval >= base * 3.9
+    apply_face_cpu_throttle(s, over_cap=False)
+    assert abs(s.interface.tick_interval - base) < 1e-9
