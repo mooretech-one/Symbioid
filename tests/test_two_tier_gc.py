@@ -26,6 +26,8 @@ def test_light_gc_does_not_full_purge_packing_valence():
     admits = int(s.mind.admits_mint)
     light = game_boundary_gc(s, tier="light", hard_cap=50000)
     assert light.get("tier_name") == "light"
+    # v0.0.65: light tier never purges registry (anti-remint)
+    assert int(light.get("purged_registry", 0) or 0) == 0
     # place / packing valence must survive light tier
     assert float(s.mind._valence.get("cell_r05_c03:place", 0.0) or 0.0) >= 1.0
     assert float(s.mind._valence.get("holes_n:demo", 0.0) or 0.0) >= 1.0

@@ -352,7 +352,7 @@ def test_packing_meta_sensors_and_last_d_holes_insight():
 
 
 def test_demo_timing_sense_not_slower_than_command():
-    """Memory-first clocks (v0.0.64): sense ≤ cmd; denser pulse; slower gravity."""
+    """Hang-harden clocks (v0.0.65): slower gravity, eased density + frame budget."""
     import tetris_demo as mod
 
     assert mod.PULSE_EVERY >= 1
@@ -369,6 +369,11 @@ def test_demo_timing_sense_not_slower_than_command():
     assert mod.GRAVITY_INTERVAL >= 2 * (mod.FPS // 2)
     assert mod.GRAPH_PLACEMENT_WEIGHT >= 0.60
     assert mod.DEFAULT_ELIGIBILITY_WINDOW >= 24
+    assert mod.FRAME_BUDGET_MS > 0
+    # 0.0.65: not denser than hang-prone 0.0.64 profile
+    assert mod.SAMPLE_EVERY >= 2
+    assert mod.PULSES_PRE_CMD == 0
+    assert mod.FACE_TICK_INTERVAL >= 0.1
     w = TetrisWorld(rng=Random(0))
     s = mod.build_symbioid(w)
     assert s.interface.tick_interval == mod.FACE_TICK_INTERVAL

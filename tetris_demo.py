@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -89,34 +90,33 @@ H = (
     + MARGIN_Y
 )
 FPS = 30
-# v0.0.64 memory-first profile: pieces fall ~2× slower than v0.0.57 survival
-# clocks so sample/pulse/placement credit get more wall-time per lock.
-# Order: sample → pulse → decide (optional settle). Still below free-fall.
+# v0.0.65 hang-harden: keep slower gravity (memory time) but ease concurrent
+# density + shed expensive work when last frame over budget (research 2026-08-03).
+# Order: sample → pulse → decide. Still below free-fall.
 CMD_EVERY = 1
-SAMPLE_EVERY = 1  # full board refresh (was 2)
-PULSE_EVERY = 2  # denser dynamics (was 4)
-PULSES_PRE_CMD = 1  # settle before intent (was 0)
-PULSES_ON_LOCK = 2  # more credit spread after lock (was 1)
+SAMPLE_EVERY = 2  # was 1 (0.0.64) — less remint pressure with mid-GC
+PULSE_EVERY = 3  # was 2 — less stack with pre/on-lock
+PULSES_PRE_CMD = 0  # was 1 — avoid multi-pulse stacking on cmd frames
+PULSES_ON_LOCK = 1  # was 2
 PLACE_EVERY = 1  # geo always fresh; rescore interval below
-# Expensive choose_target re-score while same piece (more often = better packing)
-TARGET_RESCORE_EVERY = 6  # was 12 — re-score ~2× with slower gravity budget
-# Two-tier GC (v0.0.63+): light mid-game keeps packing; full purge at boundary.
-MID_GAME_GC_EVERY = 90  # was 60 — fewer light GC passes per second of play
-MID_GAME_HARD_CAP = 12000  # was 10k
-END_GAME_HARD_CAP = 14000  # was 11k — full boundary retains more than mid light
-MID_GAME_INACTIVE_TRIGGER = 5000  # was 4k
-# Protect landing / eligibility content keys for this many *locks* after credit
-CREDIT_PROTECT_LOCKS = 24  # was 12 — remember credit longer
-CREDIT_PROTECT_MIN_VALENCE = 0.25  # was 0.35 — protect slightly colder packing heat
-GRAVITY_INTERVAL = 60  # ~2.0 s/row at 30 FPS (was 30 / ~1 s) — ~2× slower drop
-# Network vs coach blend (higher → packing score leans on Mind heat more)
-GRAPH_PLACEMENT_WEIGHT = 0.70  # was 0.60
-# Default trajectory eligibility depth (cmd ticks before lock)
-DEFAULT_ELIGIBILITY_WINDOW = 36  # was 24
-# Top-out: half second for Innerface queue (was 1.0 s)
+# Expensive choose_target re-score while same piece
+TARGET_RESCORE_EVERY = 10  # was 6 — shedder can skip further when overloaded
+# Two-tier GC (v0.0.63+): light mid-game = prune/forget only (no cell purge 0.0.65)
+MID_GAME_GC_EVERY = 90
+MID_GAME_HARD_CAP = 12000
+END_GAME_HARD_CAP = 14000
+MID_GAME_INACTIVE_TRIGGER = 5000
+CREDIT_PROTECT_LOCKS = 24
+CREDIT_PROTECT_MIN_VALENCE = 0.25
+GRAVITY_INTERVAL = 60  # ~2.0 s/row — keep slower play for learning wall-time
+GRAPH_PLACEMENT_WEIGHT = 0.70
+DEFAULT_ELIGIBILITY_WINDOW = 36
 RESTART_DELAY_FRAMES = max(12, FPS // 2)
-# Face workers: formation drain only; main loop owns pulse (skip_global_pulse)
-FACE_TICK_INTERVAL = 0.05  # ~20 Hz (was 0.1 / 10 Hz)
+# Face workers: formation drain only; main owns pulse
+FACE_TICK_INTERVAL = 0.1  # was 0.05 (~10 Hz; 0.0.64 20 Hz overloaded machine)
+# Frame budget shedder (ms): if last frame exceeded this, skip GC / rescore / extra pulse
+FRAME_BUDGET_MS = 25.0
+PERF_LOG_EVERY = 30  # frames; log ms_frame + shed flags
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -285,6 +285,11 @@ def _geo_intent_for_target(world: TetrisWorld, coach: TetrisCoach) -> str | None
     return "hard"
 
 
+def frame_over_budget(last_frame_ms: float, *, budget_ms: float = FRAME_BUDGET_MS) -> bool:
+    """True when the previous frame exceeded the soft wall-clock budget."""
+    return float(last_frame_ms) > float(budget_ms) > 0.0
+
+
 def cached_graph_intent(
     s: Symbioid,
     world: TetrisWorld,
@@ -292,6 +297,7 @@ def cached_graph_intent(
     frame: int,
     *,
     place_every: int = PLACE_EVERY,
+    force_geo_only: bool = False,
 ) -> tuple[str | None, float, list, str]:
     """
     Placement control (v0.0.58): **always** refresh left/right/hard from current
@@ -299,6 +305,9 @@ def cached_graph_intent(
 
     Expensive ``choose_target`` only on new piece, stuck lateral, or
     ``TARGET_RESCORE_EVERY`` interval — not every frame.
+
+    ``force_geo_only`` (v0.0.65): skip expensive rescore when frame-budget shedder
+    trips — keep existing target / geo walk only (new piece still scores once).
     """
     _ = place_every  # kept for API compatibility; geo is always fresh
     net = bool(getattr(coach, "network_primary", True))
@@ -331,6 +340,9 @@ def cached_graph_intent(
         or stuck
         or (rescore_iv > 0 and (frame - last_score_f) >= rescore_iv)
     )
+    # Shedder: drop interval rescores (keep new-piece / missing-target / stuck)
+    if force_geo_only and not new_piece and coach._target is not None and not stuck:
+        need_rescore = False
 
     if need_rescore and world.active is not None and (
         play or (net and coach.graph_placement_bonus is not None)
@@ -537,24 +549,23 @@ def game_boundary_gc(
     extra_ids = policy_packing_protect_ids(s)
     old_extra = getattr(s, "_gc_extra_protect_ids", None)
     s._gc_extra_protect_ids = extra_ids  # type: ignore[attr-defined]
+    # Pause face workers during GC (v0.0.65) — reduces lock thrash / soft-hang
+    faces = (getattr(s, "interface", None), getattr(s, "innerface", None), getattr(s, "outerface", None))
+    face_was: list[tuple[Any, bool]] = []
+    for face in faces:
+        if face is None:
+            continue
+        face_was.append((face, bool(getattr(face, "enabled", True))))
+        face.enabled = False
     try:
-        if hasattr(mind, "purge_ephemeral_registry"):
+        if use_full and hasattr(mind, "purge_ephemeral_registry"):
             protect_ck = set(_ensure_credit_protect(s).keys())
-            if use_full:
-                # Boundary: full cell+packing purge, but honor credit-TTL keys
-                purged = int(
-                    mind.purge_ephemeral_registry(protect_keys=protect_ck) or 0
-                )
-            else:
-                # Mid-game soft: only low-valence cell_r keys; keep :place / packing
-                purged = int(
-                    mind.purge_ephemeral_registry(
-                        drop_substrings=("cell_r",),
-                        min_keep_valence=float(CREDIT_PROTECT_MIN_VALENCE),
-                        protect_keys=protect_ck,
-                    )
-                    or 0
-                )
+            # Boundary only: full cell+packing purge (honor credit-TTL keys)
+            purged = int(
+                mind.purge_ephemeral_registry(protect_keys=protect_ck) or 0
+            )
+        # Light mid-game (v0.0.65 anti-remint): NO registry purge — cell_r purge
+        # + SAMPLE_EVERY caused remint thrash that hung the machine at low scores.
         if hasattr(s.innerface, "prune_inactive_thoughts"):
             pruned = int(s.innerface.prune_inactive_thoughts() or 0)
         for _ in range(max(1, int(max_forget_passes))):
@@ -598,6 +609,8 @@ def game_boundary_gc(
                 s._gc_extra_protect_ids = None  # type: ignore[attr-defined]
         else:
             s._gc_extra_protect_ids = old_extra  # type: ignore[attr-defined]
+        for face, was in face_was:
+            face.enabled = was
     with s.graph_lock:
         after = len(s.thoughts)
     return {
@@ -622,10 +635,8 @@ def maybe_mid_game_gc(
     force: bool = False,
 ) -> dict[str, int] | None:
     """
-    Mid-game **light** GC (v0.0.63): prune + forget + hard-cap, no full purge.
-
-    Full purge_ephemeral runs only via ``game_boundary_gc(tier=\"full\")`` at
-    top-out / restart. Keeps packing/place learning surface mid-game.
+    Mid-game **light** GC (v0.0.63+): prune + forget + hard-cap; no registry purge
+    (v0.0.65 anti-remint). Full purge only at game boundary.
     """
     if not force:
         if MID_GAME_GC_EVERY <= 0 or frame <= 0 or frame % MID_GAME_GC_EVERY != 0:
@@ -641,6 +652,26 @@ def maybe_mid_game_gc(
         max_forget_passes=3,
         hard_cap=MID_GAME_HARD_CAP,
         max_inactive_archives=48,
+    )
+
+
+def maybe_mid_game_gc_budgeted(
+    s: Symbioid,
+    frame: int,
+    *,
+    last_frame_ms: float = 0.0,
+    inactive_count: int | None = None,
+    force: bool = False,
+) -> dict[str, int] | None:
+    """Like maybe_mid_game_gc but skips when previous frame was over budget."""
+    if frame_over_budget(last_frame_ms) and not force:
+        return None
+    # force + over budget: still allow only if inactive is extreme
+    if force and frame_over_budget(last_frame_ms):
+        if inactive_count is None or int(inactive_count) < MID_GAME_INACTIVE_TRIGGER * 2:
+            return None
+    return maybe_mid_game_gc(
+        s, frame, inactive_count=inactive_count, force=force
     )
 
 
@@ -2520,9 +2551,16 @@ def main(argv: list[str] | None = None) -> None:
             if len(hist) > PLOT_HISTORY:
                 del hist[: len(hist) - PLOT_HISTORY]
 
+    last_frame_ms = 0.0
+    shed_count = 0
     try:
         running = True
         while running:
+            frame_t0 = time.perf_counter()
+            shed = frame_over_budget(last_frame_ms)
+            if shed:
+                shed_count += 1
+
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
@@ -2543,19 +2581,25 @@ def main(argv: list[str] | None = None) -> None:
             # --- Network / game clocks (sense ≥ cmd; pulse settles before decide) ---
             is_cmd = (not world.game_over) and (frame % CMD_EVERY == 0)
             is_sample = frame % sample_every == 0
+            # When overloaded, sample half as often (anti-remint / anti-thrash)
+            if shed and is_sample and (frame // max(1, sample_every)) % 2 == 1:
+                is_sample = False
 
             # 1) Sense: refresh cell map + meta before any command on this frame
             if is_sample:
                 sample_into_symbioid(s, world, tick=frame)
 
-            # 2) Baseline dynamics
-            if s.mind.dynamics_enabled and frame % PULSE_EVERY == 0:
+            # 2) Baseline dynamics (skip entire pulse when shedding)
+            if (
+                not shed
+                and s.mind.dynamics_enabled
+                and frame % PULSE_EVERY == 0
+            ):
                 s.pulse_tick()
 
-            # 2b) Mid-game GC (v0.0.61): was headless-only — GUI never cleared
-            # Inactive during a long game, only on top-out / R restart.
+            # 2b) Mid-game GC — skipped when previous frame over budget
             if not world.game_over:
-                gc_stats = maybe_mid_game_gc(s, frame)
+                gc_stats = maybe_mid_game_gc_budgeted(s, frame, last_frame_ms=last_frame_ms)
                 if gc_stats and int(gc_stats.get("removed", 0) or 0) > 50:
                     log(
                         f"[mid-gc] t={frame} th={gc_stats.get('thoughts_before')}→"
@@ -2567,24 +2611,34 @@ def main(argv: list[str] | None = None) -> None:
 
             # 3) Command: extra settle pulses, then intent + byte
             if is_cmd:
-                if s.mind.dynamics_enabled and PULSES_PRE_CMD > 0:
+                if (
+                    not shed
+                    and s.mind.dynamics_enabled
+                    and PULSES_PRE_CMD > 0
+                ):
                     for _ in range(int(PULSES_PRE_CMD)):
                         s.pulse_tick()
                 prev_event = world.last_event
                 prev_pieces = world.pieces_placed
-                # Symbioid-primary control: throttled network placement
+                # Symbioid-primary control; force_geo_only when shedding
                 preferred, g_bias, poles, _g_hint = cached_graph_intent(
-                    s, world, coach, frame, place_every=PLACE_EVERY
-                )
-                # Foresight: how many holes the current target placement frees
-                update_pred_pack_for_target(s, world, coach)
-                sample_packing_meta_into_symbioid(
                     s,
                     world,
-                    tick=frame,
-                    coach=coach,
-                    labels=_FORESIGHT_META_LABELS,
+                    coach,
+                    frame,
+                    place_every=PLACE_EVERY,
+                    force_geo_only=shed,
                 )
+                # Foresight / packing meta: skip when shedding (geo still works)
+                if not shed:
+                    update_pred_pack_for_target(s, world, coach)
+                    sample_packing_meta_into_symbioid(
+                        s,
+                        world,
+                        tick=frame,
+                        coach=coach,
+                        labels=_FORESIGHT_META_LABELS,
+                    )
                 last_cmd_poles = poles
                 code = coach.tick(
                     world,
@@ -2599,8 +2653,6 @@ def main(argv: list[str] | None = None) -> None:
                 # One sample per game turn (piece lock)
                 if world.pieces_placed > prev_pieces:
                     coach.last_lock_frame = frame  # type: ignore[attr-defined]
-                    # Phase A: label outcomes with true lock effect when known
-                    # (e.g. hard), not coach last_intent=="explore"
                     lock_eff = getattr(coach, "last_lock_effect", "") or ""
                     intent = (
                         lock_eff
@@ -2618,36 +2670,37 @@ def main(argv: list[str] | None = None) -> None:
                             reward=float(coach.last_reward),
                             host=s,
                         )
-                    # Feeling bridge: coach board reward → Mind valence on recent obs
                     s.mind.note_valence(
                         channel="board",
                         delta=max(-2.0, min(2.0, float(coach.last_reward) / 50.0)),
                     )
-                    # P1: landing-cell (0.0.33) + eligibility-window credit
                     apply_lock_credit(
                         s, coach, eligibility, poles=last_cmd_poles
                     )
-                    # Network insight: mint Observations of holes_n / last_d_holes
                     s._last_d_holes = float(  # type: ignore[attr-defined]
                         getattr(coach, "last_d_holes", 0.0) or 0.0
                     )
-                    sample_packing_meta_into_symbioid(
-                        s, world, tick=frame, coach=coach
-                    )
-                    # Burst pulse so outcome valence can spread before next cmd
-                    if s.mind.dynamics_enabled and PULSES_ON_LOCK > 0:
+                    if not shed:
+                        sample_packing_meta_into_symbioid(
+                            s, world, tick=frame, coach=coach
+                        )
+                    # Lock pulse only when not shedding
+                    if (
+                        not shed
+                        and s.mind.dynamics_enabled
+                        and PULSES_ON_LOCK > 0
+                    ):
                         for _ in range(int(PULSES_ON_LOCK)):
                             s.pulse_tick()
                     _record_thought_sample()
-                    # Long high-score games: Inactive only fell at top-out before
-                    # v0.0.61. Force GC when inactive crosses trigger mid-game.
                     if (
                         inactive_history
                         and inactive_history[-1] >= MID_GAME_INACTIVE_TRIGGER
                     ):
-                        gc_stats = maybe_mid_game_gc(
+                        gc_stats = maybe_mid_game_gc_budgeted(
                             s,
                             frame,
+                            last_frame_ms=last_frame_ms,
                             inactive_count=inactive_history[-1],
                             force=True,
                         )
@@ -2694,8 +2747,6 @@ def main(argv: list[str] | None = None) -> None:
                     )
                 elapsed = frame - game_over_at
                 pause_left = max(0.0, (RESTART_DELAY_FRAMES - elapsed) / FPS)
-                # Sensors still sample above each frame%sample_every so Innerface
-                # can drain the formation queue during the pause.
                 if elapsed >= RESTART_DELAY_FRAMES:
                     gc_stats = game_boundary_gc(s)
                     entry = coach.on_new_game(world, record=True)
@@ -2717,6 +2768,18 @@ def main(argv: list[str] | None = None) -> None:
                     f"| {coach.map_progress()}",
                     flush=True,
                 )
+            if (
+                frame > 0
+                and PERF_LOG_EVERY > 0
+                and frame % PERF_LOG_EVERY == 0
+                and not world.game_over
+            ):
+                log(
+                    f"[perf] t={frame} ms_frame={last_frame_ms:.1f} "
+                    f"shed={int(shed)} shed_n={shed_count} "
+                    f"th={thought_count(s)} score={world.score}",
+                    flush=True,
+                )
 
             draw(
                 screen,
@@ -2732,6 +2795,7 @@ def main(argv: list[str] | None = None) -> None:
             )
             pygame.display.flip()
             clock.tick(FPS)
+            last_frame_ms = (time.perf_counter() - frame_t0) * 1000.0
             frame += 1
     finally:
         s.stop_processes()
