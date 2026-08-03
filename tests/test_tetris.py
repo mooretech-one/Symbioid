@@ -352,20 +352,23 @@ def test_packing_meta_sensors_and_last_d_holes_insight():
 
 
 def test_demo_timing_sense_not_slower_than_command():
-    """Multi-game survival clocks: sense ≤ cmd; throttled pulse/place; faces drain-only."""
+    """Memory-first clocks (v0.0.64): sense ≤ cmd; denser pulse; slower gravity."""
     import tetris_demo as mod
 
     assert mod.PULSE_EVERY >= 1
     assert mod.PULSES_PRE_CMD >= 0
     assert mod.PULSES_ON_LOCK >= 0
     assert mod.PLACE_EVERY >= 1
-    # Survival profile (v0.0.57): throttled sample/pulse/place; faces drain-only
     assert mod.SAMPLE_EVERY >= 1 and mod.CMD_EVERY == 1
     assert mod.SAMPLE_EVERY <= 4
     assert mod.PULSE_EVERY >= 2
     assert mod.PLACE_EVERY >= 1
     assert 0.0 < mod.FACE_TICK_INTERVAL <= 0.15
-    assert mod.GRAVITY_INTERVAL >= mod.FPS // 2  # not free-fall every frame
+    # ~2× slower than 1s/row survival default (30 @ 30 FPS)
+    assert mod.GRAVITY_INTERVAL >= mod.FPS  # ≥1s/row
+    assert mod.GRAVITY_INTERVAL >= 2 * (mod.FPS // 2)
+    assert mod.GRAPH_PLACEMENT_WEIGHT >= 0.60
+    assert mod.DEFAULT_ELIGIBILITY_WINDOW >= 24
     w = TetrisWorld(rng=Random(0))
     s = mod.build_symbioid(w)
     assert s.interface.tick_interval == mod.FACE_TICK_INTERVAL

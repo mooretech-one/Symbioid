@@ -89,29 +89,34 @@ H = (
     + MARGIN_Y
 )
 FPS = 30
-# Multi-game survival (v0.0.57): throttle dynamics/placement so N growth does not
-# peg CPU by game ~6. Order: sample → sparse pulse → decide (optional settle).
+# v0.0.64 memory-first profile: pieces fall ~2× slower than v0.0.57 survival
+# clocks so sample/pulse/placement credit get more wall-time per lock.
+# Order: sample → pulse → decide (optional settle). Still below free-fall.
 CMD_EVERY = 1
-SAMPLE_EVERY = 2  # was 1 — fewer cell admits per second
-PULSE_EVERY = 4  # was 1 — full-graph pulse less often
-PULSES_PRE_CMD = 0  # was 1 — main settle optional
-PULSES_ON_LOCK = 1  # was 2
-PLACE_EVERY = 1  # recompute geo intent every cmd frame (was 3 — caused overshoot)
-# Expensive choose_target re-score only when piece is new / stuck / interval
-TARGET_RESCORE_EVERY = 12  # frames while same piece; 0 = only on new piece / stuck
-# Two-tier GC (v0.0.63): light mid-game (no full purge) vs full at game boundary.
-# Keep pulse/placement throttles (PULSE_EVERY etc.) — loosen GC, not dynamics.
-MID_GAME_GC_EVERY = 60  # frames (~2s @ 30 FPS); was 45 — less frequent light GC
-MID_GAME_HARD_CAP = 10000  # was 8000; end-of-game still 11k
-MID_GAME_INACTIVE_TRIGGER = 4000  # force light GC after lock if inactive exceeds this
+SAMPLE_EVERY = 1  # full board refresh (was 2)
+PULSE_EVERY = 2  # denser dynamics (was 4)
+PULSES_PRE_CMD = 1  # settle before intent (was 0)
+PULSES_ON_LOCK = 2  # more credit spread after lock (was 1)
+PLACE_EVERY = 1  # geo always fresh; rescore interval below
+# Expensive choose_target re-score while same piece (more often = better packing)
+TARGET_RESCORE_EVERY = 6  # was 12 — re-score ~2× with slower gravity budget
+# Two-tier GC (v0.0.63+): light mid-game keeps packing; full purge at boundary.
+MID_GAME_GC_EVERY = 90  # was 60 — fewer light GC passes per second of play
+MID_GAME_HARD_CAP = 12000  # was 10k
+END_GAME_HARD_CAP = 14000  # was 11k — full boundary retains more than mid light
+MID_GAME_INACTIVE_TRIGGER = 5000  # was 4k
 # Protect landing / eligibility content keys for this many *locks* after credit
-CREDIT_PROTECT_LOCKS = 12
-CREDIT_PROTECT_MIN_VALENCE = 0.35  # also protect high-valence place/packing/act poles
-GRAVITY_INTERVAL = 30  # ~1.0 s/row at 30 FPS with cmd every frame
+CREDIT_PROTECT_LOCKS = 24  # was 12 — remember credit longer
+CREDIT_PROTECT_MIN_VALENCE = 0.25  # was 0.35 — protect slightly colder packing heat
+GRAVITY_INTERVAL = 60  # ~2.0 s/row at 30 FPS (was 30 / ~1 s) — ~2× slower drop
+# Network vs coach blend (higher → packing score leans on Mind heat more)
+GRAPH_PLACEMENT_WEIGHT = 0.70  # was 0.60
+# Default trajectory eligibility depth (cmd ticks before lock)
+DEFAULT_ELIGIBILITY_WINDOW = 36  # was 24
 # Top-out: half second for Innerface queue (was 1.0 s)
 RESTART_DELAY_FRAMES = max(12, FPS // 2)
 # Face workers: formation drain only; main loop owns pulse (skip_global_pulse)
-FACE_TICK_INTERVAL = 0.1  # was 0.02 (~50 Hz) → ~10 Hz
+FACE_TICK_INTERVAL = 0.05  # ~20 Hz (was 0.1 / 10 Hz)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -180,8 +185,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--eligibility-window",
         type=int,
-        default=24,
-        help="Cmd-tick eligibility depth for lock credit (default 24). 0 disables.",
+        default=DEFAULT_ELIGIBILITY_WINDOW,
+        help=(
+            "Cmd-tick eligibility depth for lock credit "
+            f"(default {DEFAULT_ELIGIBILITY_WINDOW}). 0 disables."
+        ),
     )
     p.add_argument(
         "--no-eligibility",
@@ -496,11 +504,11 @@ def game_boundary_gc(
     *,
     tier: str = "full",
     max_forget_passes: int = 16,
-    hard_cap: int = 11000,
+    hard_cap: int = END_GAME_HARD_CAP,
     max_inactive_archives: int = 64,
 ) -> dict[str, int]:
     """
-    Multi-game survival GC (v0.0.57+; two-tier v0.0.63).
+    Multi-game survival GC (v0.0.57+; two-tier v0.0.63; caps v0.0.64).
 
     **tier=\"full\"** (game boundary / top-out / R restart):
       purge_ephemeral cell+packing registry, prune, cold-forget, hard-cap.
@@ -673,18 +681,17 @@ def build_symbioid(
     s.innerface.tick_interval = float(FACE_TICK_INTERVAL)
     s.outerface.tick_interval = float(FACE_TICK_INTERVAL)
     s.interface.skip_global_pulse = True  # type: ignore[attr-defined]
-    # Multi-game survival: forget sooner + larger batches when GC runs
-    s.mind.forget_cold_cycles = 24
+    # Memory-first (v0.0.64): colder poles linger longer before forget_cold
+    s.mind.forget_cold_cycles = 40  # was 24
     s.mind.forget_max_per_pass = 256
     # Learning structure (P0): avoid cell co-fire storms / zombie syncs.
-    # Band B (research active-thoughts theory): serious network-primary WM +
-    # larger policy registries with act:-preferring hard eviction.
+    # Band B+: slightly larger WM for packing credit under slower gravity.
     s.innerface.cofire_meta_only = True
     s.innerface.allow_cross_channel_follows = False
-    s.innerface.max_active_syncs = 112
-    s.innerface.max_active_senses = 224
-    s.innerface.max_active_integrates = 112
-    s.innerface.max_active_integrates_per_channel = 8
+    s.innerface.max_active_syncs = 128  # was 112
+    s.innerface.max_active_senses = 256  # was 224
+    s.innerface.max_active_integrates = 128  # was 112
+    s.innerface.max_active_integrates_per_channel = 10  # was 8
     # Packing meta participates in co-fire / policy poles
     s.innerface.cofire_meta_labels = tuple(
         dict.fromkeys(
@@ -1328,7 +1335,7 @@ def run_multi_game_metric(
     games: int = 3,
     max_frames: int = 12000,
     seed: int = 1,
-    eligibility_window: int = 24,
+    eligibility_window: int = DEFAULT_ELIGIBILITY_WINDOW,
     use_eligibility: bool = True,
     spectral: bool = False,
     spectral_primary: bool = False,
@@ -1368,7 +1375,7 @@ def run_multi_game_metric(
     )
     if callable(mind_setup):
         mind_setup(s)
-    coach.graph_placement_weight = 0.60
+    coach.graph_placement_weight = float(GRAPH_PLACEMENT_WEIGHT)
     coach.graph_placement_bonus = CachedGraphPlacementBonus(s)
     win_n = int(eligibility_window) if use_eligibility else 0
     elig = EligibilityWindow(max_ticks=win_n)
@@ -2418,7 +2425,7 @@ def main(argv: list[str] | None = None) -> None:
     # Co-lead blend: network heat + coach residual (research 2026-07-26).
     # Floor clamp in choose_target is 0.35 so 0.60 is honored.
     # Phase 3: batch Mind/field locks once per choose_target via prepare().
-    coach.graph_placement_weight = 0.60
+    coach.graph_placement_weight = float(GRAPH_PLACEMENT_WEIGHT)
     coach.graph_placement_bonus = CachedGraphPlacementBonus(s)
 
     mem_path = Path(args.memory)
@@ -2482,7 +2489,9 @@ def main(argv: list[str] | None = None) -> None:
     last_cmd_poles: list = []
     last_cmd_intent: str = "explore"
     use_elig = not bool(getattr(args, "no_eligibility", False))
-    elig_n = int(getattr(args, "eligibility_window", 24) or 0)
+    elig_n = int(
+        getattr(args, "eligibility_window", DEFAULT_ELIGIBILITY_WINDOW) or 0
+    )
     if not use_elig:
         elig_n = 0
     eligibility = EligibilityWindow(max_ticks=elig_n)
