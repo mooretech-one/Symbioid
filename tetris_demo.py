@@ -67,12 +67,13 @@ CELL = 28
 COLS, ROWS = 10, 20
 BOARD_W, BOARD_H = COLS * CELL, ROWS * CELL
 SIDE = 280
-# Plots under the board: Active / Inactive / Minted Thoughts vs game turns
-PLOT_H = 88  # height per plot panel
-PLOT_GAP = 6
+# Plots under the board: Active / Inactive / Mint rate / Live residual (v0.0.62)
+# Cumulative admits_mint is NOT plotted (monotonic event counter — not GC'd).
+PLOT_H = 72  # height per plot panel (4 panels; was 88×3)
+PLOT_GAP = 5
 PLOT_MARGIN = 10
 PLOT_HISTORY = 1024  # game turns (piece locks) on the x-axis window
-N_PLOTS = 3
+N_PLOTS = 4
 MARGIN_X = 20
 MARGIN_Y = 20
 FOOTER_H = 28
@@ -198,6 +199,35 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def thought_count(s: Symbioid) -> int:
     return len(s.thoughts)
+
+
+def live_observation_registry_count(mind) -> int:
+    """
+    Live residual: Observation content keys still registered on Mind.
+
+    Falls when ``purge_ephemeral_registry`` / eviction unregisters poles
+    (mid-game GC). Not the same as ``admits_mint`` (lifetime mint events).
+    """
+    obs = getattr(mind, "_observations", None)
+    if obs is None:
+        return 0
+    lock = getattr(mind, "_lock", None)
+    if lock is not None:
+        with lock:
+            return len(obs)
+    return len(obs)
+
+
+def mint_rate_delta(admits_now: int, admits_prev: int | None) -> int:
+    """
+    Mint events since last sample (Δ ``admits_mint``).
+
+    Never decrements ``admits_mint`` — rate is a derived series only.
+    First sample returns 0 (no prior baseline).
+    """
+    if admits_prev is None:
+        return 0
+    return max(0, int(admits_now) - int(admits_prev))
 
 
 def thought_counts_active_inactive(s: Symbioid) -> tuple[int, int]:
@@ -1978,7 +2008,8 @@ def draw(
     coach: TetrisCoach,
     active_history: list[int],
     inactive_history: list[int],
-    mint_history: list[int],
+    mint_rate_history: list[int],
+    live_residual_history: list[int],
     font: pygame.font.Font,
     font_sm: pygame.font.Font,
     *,
@@ -2085,8 +2116,10 @@ def draw(
             (sx, oy + BOARD_H - 24),
         )
 
-    # Plots under the board: Active / Inactive / Minted Thoughts over turns
+    # Plots: Active / Inactive / Mint rate (Δ) / Live obs residual (v0.0.62)
+    # Cumulative admits_mint is a monotonic audit counter — not plotted as "GC-able".
     plot_oy = oy + BOARD_H + PLOT_MARGIN
+    step = PLOT_H + PLOT_GAP
     draw_thought_plot(
         screen,
         active_history,
@@ -2105,7 +2138,7 @@ def draw(
         inactive_history,
         font_sm,
         ox=ox,
-        oy=plot_oy + PLOT_H + PLOT_GAP,
+        oy=plot_oy + step,
         width=BOARD_W,
         height=PLOT_H,
         title="Inactive Thoughts",
@@ -2115,15 +2148,28 @@ def draw(
     )
     draw_thought_plot(
         screen,
-        mint_history,
+        mint_rate_history,
         font_sm,
         ox=ox,
-        oy=plot_oy + 2 * (PLOT_H + PLOT_GAP),
+        oy=plot_oy + 2 * step,
         width=BOARD_W,
         height=PLOT_H,
-        title="Minted Thoughts",
+        title="Mint rate (Δ/turn)",
         line_color=(240, 180, 80),
         marker_color=(255, 210, 120),
+        show_x_labels=False,
+    )
+    draw_thought_plot(
+        screen,
+        live_residual_history,
+        font_sm,
+        ox=ox,
+        oy=plot_oy + 3 * step,
+        width=BOARD_W,
+        height=PLOT_H,
+        title="Live obs registry",
+        line_color=(220, 140, 200),
+        marker_color=(255, 180, 230),
         show_x_labels=True,
     )
 
@@ -2276,10 +2322,12 @@ def main(argv: list[str] | None = None) -> None:
     log_every = 90
     game_over_at: int | None = None
     was_mapped = False
-    # Thought counts once per game turn (piece lock) — under-board plots
+    # Thought metrics once per game turn (piece lock) — under-board plots
     active_history: list[int] = []
     inactive_history: list[int] = []
-    mint_history: list[int] = []
+    mint_rate_history: list[int] = []
+    live_residual_history: list[int] = []
+    _prev_admits_mint: int | None = None  # for Δ mint rate (never mutates admits_mint)
     # State poles at last command (for outcome write on lock)
     last_cmd_poles: list = []
     last_cmd_intent: str = "explore"
@@ -2294,16 +2342,24 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     def _record_thought_sample() -> None:
+        nonlocal _prev_admits_mint
         a, i = thought_counts_active_inactive(s)
+        admits = int(s.mind.admits_mint)
+        rate = mint_rate_delta(admits, _prev_admits_mint)
+        residual = live_observation_registry_count(s.mind)
+        _prev_admits_mint = admits  # baseline only — never write back to Mind
         active_history.append(a)
         inactive_history.append(i)
-        mint_history.append(int(s.mind.admits_mint))
-        if len(active_history) > PLOT_HISTORY:
-            del active_history[: len(active_history) - PLOT_HISTORY]
-        if len(inactive_history) > PLOT_HISTORY:
-            del inactive_history[: len(inactive_history) - PLOT_HISTORY]
-        if len(mint_history) > PLOT_HISTORY:
-            del mint_history[: len(mint_history) - PLOT_HISTORY]
+        mint_rate_history.append(rate)
+        live_residual_history.append(residual)
+        for hist in (
+            active_history,
+            inactive_history,
+            mint_rate_history,
+            live_residual_history,
+        ):
+            if len(hist) > PLOT_HISTORY:
+                del hist[: len(hist) - PLOT_HISTORY]
 
     try:
         running = True
@@ -2509,7 +2565,8 @@ def main(argv: list[str] | None = None) -> None:
                 coach,
                 active_history,
                 inactive_history,
-                mint_history,
+                mint_rate_history,
+                live_residual_history,
                 font,
                 font_sm,
                 pause_seconds_left=pause_left,

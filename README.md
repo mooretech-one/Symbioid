@@ -543,7 +543,7 @@ TetrisCoach.tick ──writes──► actuator "byte".output = code/255
 
 The coach does **not** use `Actuator.request_fire` for moves; it writes the byte channel and steps the world directly. Symbioid still forms Thoughts/Beliefs from board sensors. Placement search uses world physics (`simulate_placement`) scored by a height-shaped + learned evaluator; the secret control map is learned from observation only (never from reading `cipher`).
 
-**UI extras (Tetris):** pause after top-out for Innerface catch-up; plots of **Active**, **Inactive**, and **Minted** Thought counts over a 1024-turn window; highscores sorted best-first (`#ddd ssssss`). Superseded Rodin sense/sync scaffolding (Links + relation types) is GC'd from the live graph after integrate/depth-fold.
+**UI extras (Tetris):** pause after top-out for Innerface catch-up; plots of **Active**, **Inactive**, **Mint rate (Δ/turn)**, and **Live obs registry** over a 1024-turn window (v0.0.62 — cumulative `admits_mint` is an audit counter, not GC'd or plotted as inventory); highscores sorted best-first (`#ddd ssssss`). Superseded Rodin sense/sync scaffolding (Links + relation types) is GC'd from the live graph after integrate/depth-fold.
 
 ## Single-file executables (Pong + Tetris)
 
