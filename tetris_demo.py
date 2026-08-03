@@ -90,39 +90,36 @@ H = (
     + FOOTER_H
     + MARGIN_Y
 )
-FPS = 30
-# v0.0.65 hang-harden: keep slower gravity (memory time) but ease concurrent
-# density + shed expensive work when last frame over budget (research 2026-08-03).
-# Order: sample → pulse → decide. Still below free-fall.
+FPS = 24  # slightly lower draw rate (v0.0.67) — free CPU for placement reasoning
+# v0.0.67: slower pieces + process-level ≤50% CPU + more placement rescores when cool.
 CMD_EVERY = 1
-SAMPLE_EVERY = 2  # was 1 (0.0.64) — less remint pressure with mid-GC
-PULSE_EVERY = 3  # was 2 — less stack with pre/on-lock
-PULSES_PRE_CMD = 0  # was 1 — avoid multi-pulse stacking on cmd frames
-PULSES_ON_LOCK = 1  # was 2
-PLACE_EVERY = 1  # geo always fresh; rescore interval below
-# Expensive choose_target re-score while same piece
-TARGET_RESCORE_EVERY = 10  # was 6 — shedder can skip further when overloaded
-# Two-tier GC (v0.0.63+): light mid-game = prune/forget only (no cell purge 0.0.65)
+SAMPLE_EVERY = 2
+PULSE_EVERY = 3
+PULSES_PRE_CMD = 0
+PULSES_ON_LOCK = 1
+PLACE_EVERY = 1
+# More placement reasoning when under CPU cap (shedder still skips when hot)
+TARGET_RESCORE_EVERY = 6  # was 10 — re-score more often; gravity is slower so cost ok
+TARGET_RESCORE_EVERY_HOT = 14  # when over CPU cap / frame budget
 MID_GAME_GC_EVERY = 90
 MID_GAME_HARD_CAP = 12000
 END_GAME_HARD_CAP = 14000
 MID_GAME_INACTIVE_TRIGGER = 5000
 CREDIT_PROTECT_LOCKS = 24
 CREDIT_PROTECT_MIN_VALENCE = 0.25
-GRAVITY_INTERVAL = 60  # ~2.0 s/row — keep slower play for learning wall-time
-GRAPH_PLACEMENT_WEIGHT = 0.70
+GRAVITY_INTERVAL = 120  # ~5.0 s/row @ 24 FPS — trade play speed for reasoning time
+GRAPH_PLACEMENT_WEIGHT = 0.75  # lean more on network packing heat
 DEFAULT_ELIGIBILITY_WINDOW = 36
 RESTART_DELAY_FRAMES = max(12, FPS // 2)
-# Face workers: formation drain only; main owns pulse
-FACE_TICK_INTERVAL = 0.1  # was 0.05 (~10 Hz; 0.0.64 20 Hz overloaded machine)
-# Frame budget shedder (ms): if last frame exceeded this, skip GC / rescore / extra pulse
-FRAME_BUDGET_MS = 25.0
-# Network CPU governor (v0.0.66): keep Symbioid network work ≤ this fraction of
-# wall time by sleeping / shedding (pulse, placement, faces, mid-GC, sampling).
+FACE_TICK_INTERVAL = 0.15  # ~6.7 Hz faces (was 0.1)
+FRAME_BUDGET_MS = 20.0  # tighter per-frame busy target (~ half of 1/24 s)
+# Network + process CPU caps (v0.0.66/67)
 NETWORK_CPU_FRACTION = 0.50
-NETWORK_CPU_WINDOW_S = 0.50  # sliding accounting window (seconds)
-NETWORK_CPU_MAX_SLEEP_S = 0.05  # cap per yield so UI stays responsive
-PERF_LOG_EVERY = 30  # frames; log ms_frame + shed flags
+NETWORK_CPU_WINDOW_S = 0.50
+NETWORK_CPU_MAX_SLEEP_S = 0.12  # allow catching up to 50% (was 0.05)
+# Whole-process busy fraction (draw+coach+network): sleep so busy/wall ≤ this
+PROCESS_CPU_FRACTION = 0.50
+PERF_LOG_EVERY = 30
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -351,11 +348,20 @@ class NetworkCpuGovernor:
         need = self.network_s / frac - wall
         if need <= 0:
             return 0.0
-        sleep_s = min(float(self.max_sleep_s), need)
-        time.sleep(sleep_s)
-        self.sleep_s_total += sleep_s
+        # Loop sleeps until under cap (bounded per iteration)
+        slept_total = 0.0
+        for _ in range(8):
+            chunk = min(float(self.max_sleep_s), need - slept_total)
+            if chunk <= 0.0005:
+                break
+            time.sleep(chunk)
+            slept_total += chunk
+            wall = self.wall_s()
+            if self.network_s <= frac * wall:
+                break
+        self.sleep_s_total += slept_total
         self._maybe_slide_window(self.wall_s())
-        return sleep_s
+        return slept_total
 
     def _maybe_slide_window(self, wall: float) -> None:
         win = max(0.1, float(self.window_s))
@@ -375,22 +381,47 @@ class NetworkCpuGovernor:
             self.charge(time.perf_counter() - t0)
 
 
+def process_cpu_yield(
+    busy_s: float,
+    *,
+    fraction: float = PROCESS_CPU_FRACTION,
+    min_period_s: float | None = None,
+) -> float:
+    """
+    Sleep so busy/(busy+idle) ≤ fraction (process-level ~%CPU on one core).
+
+    ``busy_s`` should exclude prior sleep in this frame. Returns seconds slept.
+    """
+    frac = max(0.05, min(0.95, float(fraction)))
+    busy = max(0.0, float(busy_s))
+    if busy <= 0:
+        return 0.0
+    # busy <= frac * period  =>  period >= busy/frac  =>  sleep >= busy*(1/frac - 1)
+    need = busy * (1.0 / frac - 1.0)
+    if min_period_s is not None:
+        # Also honor min frame period (e.g. 1/FPS) if longer than 50% yield
+        need = max(need, float(min_period_s) - busy)
+    if need <= 0.0005:
+        return 0.0
+    # Cap single sleep so we can still process events (~200ms max)
+    sleep_s = min(0.20, need)
+    time.sleep(sleep_s)
+    return sleep_s
+
+
 def apply_face_cpu_throttle(s: Symbioid, *, over_cap: bool) -> None:
     """
-    When network is over CPU cap, slow face workers (~4× tick) and skip ticks
-    when severely over; restore base interval when under cap.
+    When over CPU cap: slow faces a lot; if still hot, disable face workers
+    until under cap again (main loop still runs placement).
     """
     base = float(FACE_TICK_INTERVAL)
-    slow = base * 4.0
+    slow = base * 6.0  # ~1 Hz when base is 0.15
     for face in (s.interface, s.innerface, s.outerface):
         if face is None:
             continue
         if over_cap:
             face.tick_interval = slow
-            # If still over after sleep, disable for a stretch (re-enabled next frame)
-            if getattr(face, "enabled", True) and over_cap:
-                # Keep enabled but slow; hard-disable only when heavily over
-                pass
+            face.enabled = False  # v0.0.67: hard pause faces under CPU pressure
         else:
             face.tick_interval = base
             face.enabled = True
@@ -404,13 +435,14 @@ def cached_graph_intent(
     *,
     place_every: int = PLACE_EVERY,
     force_geo_only: bool = False,
+    rescore_every: int | None = None,
 ) -> tuple[str | None, float, list, str]:
     """
     Placement control (v0.0.58): **always** refresh left/right/hard from current
     col vs target (fixes overshoot from caching "right" for N frames).
 
     Expensive ``choose_target`` only on new piece, stuck lateral, or
-    ``TARGET_RESCORE_EVERY`` interval — not every frame.
+    ``rescore_every`` / ``TARGET_RESCORE_EVERY`` interval — not every frame.
 
     ``force_geo_only`` (v0.0.65): skip expensive rescore when frame-budget shedder
     trips — keep existing target / geo walk only (new piece still scores once).
@@ -439,7 +471,9 @@ def cached_graph_intent(
 
     stuck = int(getattr(coach, "_stuck_lateral", 0) or 0) >= 2
     last_score_f = int(getattr(coach, "_target_score_frame", -999) or -999)
-    rescore_iv = int(TARGET_RESCORE_EVERY)
+    rescore_iv = int(
+        TARGET_RESCORE_EVERY if rescore_every is None else rescore_every
+    )
     need_rescore = (
         coach._target is None
         or new_piece
@@ -2687,10 +2721,12 @@ def main(argv: list[str] | None = None) -> None:
         max_sleep_s=float(NETWORK_CPU_MAX_SLEEP_S),
     )
     log(
-        f"(Network CPU cap: {NETWORK_CPU_FRACTION * 100:.0f}% wall — "
-        f"sleep/shed pulse·place·GC·faces)",
+        f"(CPU caps: process≤{PROCESS_CPU_FRACTION * 100:.0f}% · "
+        f"network≤{NETWORK_CPU_FRACTION * 100:.0f}% · "
+        f"gravity={GRAVITY_INTERVAL}f · rescore={TARGET_RESCORE_EVERY}/{TARGET_RESCORE_EVERY_HOT})",
         flush=True,
     )
+    process_sleep_s_total = 0.0
     try:
         running = True
         while running:
@@ -2699,7 +2735,7 @@ def main(argv: list[str] | None = None) -> None:
             shed = frame_over_budget(last_frame_ms) or net_gov.over_cap()
             if shed:
                 shed_count += 1
-            apply_face_cpu_throttle(s, over_cap=net_gov.over_cap())
+            apply_face_cpu_throttle(s, over_cap=shed or net_gov.over_cap())
 
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -2767,7 +2803,10 @@ def main(argv: list[str] | None = None) -> None:
                             s.pulse_tick()
                 prev_event = world.last_event
                 prev_pieces = world.pieces_placed
-                # Symbioid-primary control; force_geo_only when shedding
+                # More placement reasoning when cool; fewer rescores when hot
+                rescore_iv = (
+                    TARGET_RESCORE_EVERY_HOT if shed else TARGET_RESCORE_EVERY
+                )
                 with net_gov.work():
                     preferred, g_bias, poles, _g_hint = cached_graph_intent(
                         s,
@@ -2776,6 +2815,7 @@ def main(argv: list[str] | None = None) -> None:
                         frame,
                         place_every=PLACE_EVERY,
                         force_geo_only=shed,
+                        rescore_every=rescore_iv,
                     )
                 # Foresight / packing meta: skip when shedding (geo still works)
                 if not shed:
@@ -2936,6 +2976,7 @@ def main(argv: list[str] | None = None) -> None:
                     f"shed={int(shed)} shed_n={shed_count} "
                     f"net_cpu={net_gov.ratio() * 100:.0f}% "
                     f"net_sleep_ms={net_gov.sleep_s_total * 1000:.0f} "
+                    f"proc_sleep_ms={process_sleep_s_total * 1000:.0f} "
                     f"th={thought_count(s)} score={world.score}",
                     flush=True,
                 )
@@ -2953,10 +2994,21 @@ def main(argv: list[str] | None = None) -> None:
                 pause_seconds_left=pause_left,
             )
             pygame.display.flip()
-            clock.tick(FPS)
-            # Final yield so network never ends a frame above cap
+            # Busy time this frame (before process-level idle sleep)
+            busy_s = time.perf_counter() - frame_t0
+            # Network yield (may already have slept during work())
             net_gov.yield_if_needed()
-            last_frame_ms = (time.perf_counter() - frame_t0) * 1000.0
+            # Process-level ≤50% CPU: sleep so busy/wall ≤ PROCESS_CPU_FRACTION
+            # (includes coach + draw; this is what `top` mostly sees)
+            ps = process_cpu_yield(
+                busy_s,
+                fraction=float(PROCESS_CPU_FRACTION),
+                min_period_s=1.0 / max(1, int(FPS)),
+            )
+            process_sleep_s_total += ps
+            # clock.tick only if we still need a floor for snappy input
+            clock.tick(FPS)
+            last_frame_ms = busy_s * 1000.0
             frame += 1
     finally:
         s.stop_processes()

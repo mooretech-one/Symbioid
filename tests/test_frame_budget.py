@@ -7,7 +7,9 @@ import time
 from tetris_demo import (
     FRAME_BUDGET_MS,
     FACE_TICK_INTERVAL,
+    GRAVITY_INTERVAL,
     NETWORK_CPU_FRACTION,
+    PROCESS_CPU_FRACTION,
     PULSE_EVERY,
     PULSES_PRE_CMD,
     SAMPLE_EVERY,
@@ -19,6 +21,7 @@ from tetris_demo import (
     frame_over_budget,
     game_boundary_gc,
     maybe_mid_game_gc_budgeted,
+    process_cpu_yield,
     sample_into_symbioid,
 )
 from symbioid.world.tetris import TetrisWorld
@@ -87,11 +90,15 @@ def test_force_geo_only_skips_interval_rescore():
 
 
 def test_hang_harden_density_not_worse_than_064():
-    """v0.0.65 must not re-introduce 0.0.64 ultra-dense concurrent load."""
+    """v0.0.65+ must not re-introduce 0.0.64 ultra-dense concurrent load."""
+    from tetris_demo import TARGET_RESCORE_EVERY_HOT
+
     assert SAMPLE_EVERY >= 2
     assert PULSE_EVERY >= 3
     assert PULSES_PRE_CMD == 0
-    assert TARGET_RESCORE_EVERY >= 10
+    # Cool path rescores more for placement quality; hot path is sparse
+    assert TARGET_RESCORE_EVERY_HOT >= TARGET_RESCORE_EVERY
+    assert TARGET_RESCORE_EVERY_HOT >= 10
     assert FACE_TICK_INTERVAL >= 0.1
 
 
@@ -115,11 +122,24 @@ def test_network_cpu_governor_work_context():
     assert gov.charge_count >= 1
 
 
-def test_face_cpu_throttle_slows_interval():
+def test_face_cpu_throttle_slows_and_disables():
     w = TetrisWorld()
     s = build_symbioid(w)
     base = float(FACE_TICK_INTERVAL)
     apply_face_cpu_throttle(s, over_cap=True)
-    assert s.interface.tick_interval >= base * 3.9
+    assert s.interface.tick_interval >= base * 5.0
+    assert s.interface.enabled is False
     apply_face_cpu_throttle(s, over_cap=False)
     assert abs(s.interface.tick_interval - base) < 1e-9
+    assert s.interface.enabled is True
+
+
+def test_process_cpu_yield_sleeps_for_half_busy():
+    """50% process cap: ~busy seconds of sleep for busy work."""
+    t0 = time.perf_counter()
+    slept = process_cpu_yield(0.02, fraction=0.5, min_period_s=None)
+    elapsed = time.perf_counter() - t0
+    assert slept >= 0.015
+    assert elapsed >= 0.015
+    assert PROCESS_CPU_FRACTION == 0.50
+    assert GRAVITY_INTERVAL >= 90  # slower play for placement reasoning
