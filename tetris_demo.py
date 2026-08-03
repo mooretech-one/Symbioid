@@ -98,7 +98,9 @@ PULSES_ON_LOCK = 1  # was 2
 PLACE_EVERY = 1  # recompute geo intent every cmd frame (was 3 — caused overshoot)
 # Expensive choose_target re-score only when piece is new / stuck / interval
 TARGET_RESCORE_EVERY = 12  # frames while same piece; 0 = only on new piece / stuck
-MID_GAME_GC_EVERY = 80  # frames; hard-cap GC while playing
+MID_GAME_GC_EVERY = 45  # frames (~1.5s @ 30 FPS); was 80 — long games never hit end-GC
+MID_GAME_HARD_CAP = 8000  # tighter than end-of-game 11k so single long game cannot balloon
+MID_GAME_INACTIVE_TRIGGER = 3000  # force GC after lock if inactive plot would exceed this
 GRAVITY_INTERVAL = 30  # ~1.0 s/row at 30 FPS with cmd every frame
 # Top-out: half second for Innerface queue (was 1.0 s)
 RESTART_DELAY_FRAMES = max(12, FPS // 2)
@@ -316,17 +318,56 @@ def cached_graph_intent(
     return preferred, float(g_bias), poles, str(hint or "")
 
 
+def _trim_inactive_archives(inner, *, max_inactive_sets: int = 64) -> int:
+    """
+    Drop oldest *inactive* completed six-set archive entries past ``max_inactive_sets``.
+
+    Host Thoughts are not removed here — call ``prune_inactive_thoughts`` first so
+    poles that only lived in those sets can leave the graph. Archives are metadata
+    for inactive sets; unbounded growth keeps pointing at long-dead structure.
+    Returns number of set archives removed.
+    """
+    dropped = 0
+    with inner._local_lock:
+        active = set(inner.active_ids.keys())
+        for store_map in (
+            inner.completed_formations,
+            inner.completed_syncs,
+            inner.completed_integrates,
+        ):
+            inactive_sids = [sid for sid in list(store_map.keys()) if sid not in active]
+            # Preserve insertion order: drop oldest excess
+            excess = len(inactive_sids) - int(max_inactive_sets)
+            if excess <= 0:
+                continue
+            for sid in inactive_sids[:excess]:
+                store_map.pop(sid, None)
+                dropped += 1
+            # Keep _active_order clean if it tracks completed ids
+            order = getattr(inner, "_active_order", None)
+            if isinstance(order, list):
+                kill = set(inactive_sids[:excess])
+                inner._active_order = [x for x in order if x not in kill]
+    return dropped
+
+
 def game_boundary_gc(
     s: Symbioid,
     *,
     max_forget_passes: int = 16,
     hard_cap: int = 11000,
+    max_inactive_archives: int = 64,
 ) -> dict[str, int]:
     """
-    Multi-game survival GC (v0.0.57): unprotect cell-map registry, prune scaffolds,
-    cold-forget, then hard-cap host graph if still above ``hard_cap``.
+    Multi-game survival GC (v0.0.57+): unprotect cell-map registry, prune scaffolds,
+    cold-forget, trim inactive archives, then hard-cap host graph if still above
+    ``hard_cap``.
 
-    Call on top-out / between headless games. Returns removal stats.
+    Call on top-out / between headless games **and mid-game** (GUI + headless).
+    Mid-game is required for long high-score single games (~15k+): end-of-game
+    clear never runs until top-out, so Inactive can only climb during play.
+
+    Returns removal stats.
     """
     with s.graph_lock:
         before = len(s.thoughts)
@@ -339,13 +380,10 @@ def game_boundary_gc(
     pruned = 0
     forgotten = 0
     hard = 0
+    archives = 0
     try:
         if hasattr(mind, "purge_ephemeral_registry"):
             purged = int(mind.purge_ephemeral_registry() or 0)
-        # Drop inactive six-set membership so prune can free poles
-        with s.innerface._local_lock:
-            # Keep only a small active window; clear archived inactive stores' poles via prune
-            pass
         if hasattr(s.innerface, "prune_inactive_thoughts"):
             pruned = int(s.innerface.prune_inactive_thoughts() or 0)
         for _ in range(max(1, int(max_forget_passes))):
@@ -355,6 +393,10 @@ def game_boundary_gc(
                 break
         if hasattr(s.innerface, "prune_inactive_thoughts"):
             pruned += int(s.innerface.prune_inactive_thoughts() or 0)
+        # After poles are freed, drop excess inactive six-set archives (metadata)
+        archives = int(_trim_inactive_archives(
+            s.innerface, max_inactive_sets=int(max_inactive_archives)
+        ) or 0)
         # Hard cap: remove oldest cold unprotected Thoughts
         with s.graph_lock:
             n_now = len(s.thoughts)
@@ -388,9 +430,44 @@ def game_boundary_gc(
         "pruned": pruned,
         "forgotten": forgotten,
         "purged_registry": purged,
+        "archives_trimmed": archives,
         "hard_cap": hard,
         "removed": max(0, before - after),
     }
+
+
+def maybe_mid_game_gc(
+    s: Symbioid,
+    frame: int,
+    *,
+    inactive_count: int | None = None,
+    force: bool = False,
+) -> dict[str, int] | None:
+    """
+    Mid-game GC for long single games (v0.0.61).
+
+    Runs when:
+    - ``force`` (e.g. inactive plot above trigger after a lock), or
+    - every ``MID_GAME_GC_EVERY`` frames while playing.
+
+    Uses a tighter hard_cap than end-of-game so ~15k-score marathons cannot
+    pin the host at 11k+ Thoughts for thousands of frames.
+    """
+    if not force:
+        if MID_GAME_GC_EVERY <= 0 or frame <= 0 or frame % MID_GAME_GC_EVERY != 0:
+            return None
+    if inactive_count is not None and not force:
+        # Optional early exit if graph is still small
+        if inactive_count < (MID_GAME_INACTIVE_TRIGGER // 2) and thought_count(s) < (
+            MID_GAME_HARD_CAP // 2
+        ):
+            return None
+    return game_boundary_gc(
+        s,
+        max_forget_passes=4,
+        hard_cap=MID_GAME_HARD_CAP,
+        max_inactive_archives=48,
+    )
 
 
 def build_symbioid(
@@ -1131,8 +1208,7 @@ def run_multi_game_metric(
                 if s.mind.dynamics_enabled and PULSES_PRE_CMD > 0:
                     for _ in range(int(PULSES_PRE_CMD)):
                         s.pulse_tick()
-                if MID_GAME_GC_EVERY > 0 and frame > 0 and frame % MID_GAME_GC_EVERY == 0:
-                    game_boundary_gc(s, max_forget_passes=4, hard_cap=11000)
+                maybe_mid_game_gc(s, frame)
                 prev_pieces = world.pieces_placed
                 preferred, g_bias, poles, _hint = cached_graph_intent(
                     s, world, coach, frame, place_every=PLACE_EVERY
@@ -2261,6 +2337,19 @@ def main(argv: list[str] | None = None) -> None:
             if s.mind.dynamics_enabled and frame % PULSE_EVERY == 0:
                 s.pulse_tick()
 
+            # 2b) Mid-game GC (v0.0.61): was headless-only — GUI never cleared
+            # Inactive during a long game, only on top-out / R restart.
+            if not world.game_over:
+                gc_stats = maybe_mid_game_gc(s, frame)
+                if gc_stats and int(gc_stats.get("removed", 0) or 0) > 50:
+                    log(
+                        f"[mid-gc] t={frame} th={gc_stats.get('thoughts_before')}→"
+                        f"{gc_stats.get('thoughts_after')} "
+                        f"rm={gc_stats.get('removed')} "
+                        f"prune={gc_stats.get('pruned')}",
+                        flush=True,
+                    )
+
             # 3) Command: extra settle pulses, then intent + byte
             if is_cmd:
                 if s.mind.dynamics_enabled and PULSES_PRE_CMD > 0:
@@ -2335,6 +2424,28 @@ def main(argv: list[str] | None = None) -> None:
                         for _ in range(int(PULSES_ON_LOCK)):
                             s.pulse_tick()
                     _record_thought_sample()
+                    # Long high-score games: Inactive only fell at top-out before
+                    # v0.0.61. Force GC when inactive crosses trigger mid-game.
+                    if (
+                        inactive_history
+                        and inactive_history[-1] >= MID_GAME_INACTIVE_TRIGGER
+                    ):
+                        gc_stats = maybe_mid_game_gc(
+                            s,
+                            frame,
+                            inactive_count=inactive_history[-1],
+                            force=True,
+                        )
+                        if gc_stats and int(gc_stats.get("removed", 0) or 0) > 0:
+                            log(
+                                f"[mid-gc/lock] th={gc_stats.get('thoughts_before')}→"
+                                f"{gc_stats.get('thoughts_after')} "
+                                f"rm={gc_stats.get('removed')} "
+                                f"prune={gc_stats.get('pruned')} "
+                                f"forget={gc_stats.get('forgotten')}",
+                                flush=True,
+                            )
+                            _record_thought_sample()
                 if coach.map_complete() and not was_mapped:
                     was_mapped = True
                     log(

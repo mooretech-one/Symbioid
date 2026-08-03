@@ -25,7 +25,6 @@ if str(ROOT) not in sys.path:
 from tetris_demo import (  # noqa: E402
     COLS,
     GRAVITY_INTERVAL,
-    MID_GAME_GC_EVERY,
     PLACE_EVERY,
     PULSE_EVERY,
     PULSES_ON_LOCK,
@@ -38,6 +37,7 @@ from tetris_demo import (  # noqa: E402
     build_symbioid,
     cached_graph_intent,
     game_boundary_gc,
+    maybe_mid_game_gc,
     poles_to_content_keys,
     sample_into_symbioid,
     sample_packing_meta_into_symbioid,
@@ -102,8 +102,7 @@ def main(argv: list[str] | None = None) -> int:
                         s.pulse_tick()
                         t_pulse += time.perf_counter() - t0
                         n_pulse += 1
-                if MID_GAME_GC_EVERY > 0 and frame > 0 and frame % MID_GAME_GC_EVERY == 0:
-                    game_boundary_gc(s, max_forget_passes=4, hard_cap=11000)
+                maybe_mid_game_gc(s, frame)
                 prev_pieces = world.pieces_placed
                 t0 = time.perf_counter()
                 preferred, g_bias, poles, _ = cached_graph_intent(
