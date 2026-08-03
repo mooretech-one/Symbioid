@@ -99,9 +99,14 @@ PULSES_ON_LOCK = 1  # was 2
 PLACE_EVERY = 1  # recompute geo intent every cmd frame (was 3 — caused overshoot)
 # Expensive choose_target re-score only when piece is new / stuck / interval
 TARGET_RESCORE_EVERY = 12  # frames while same piece; 0 = only on new piece / stuck
-MID_GAME_GC_EVERY = 45  # frames (~1.5s @ 30 FPS); was 80 — long games never hit end-GC
-MID_GAME_HARD_CAP = 8000  # tighter than end-of-game 11k so single long game cannot balloon
-MID_GAME_INACTIVE_TRIGGER = 3000  # force GC after lock if inactive plot would exceed this
+# Two-tier GC (v0.0.63): light mid-game (no full purge) vs full at game boundary.
+# Keep pulse/placement throttles (PULSE_EVERY etc.) — loosen GC, not dynamics.
+MID_GAME_GC_EVERY = 60  # frames (~2s @ 30 FPS); was 45 — less frequent light GC
+MID_GAME_HARD_CAP = 10000  # was 8000; end-of-game still 11k
+MID_GAME_INACTIVE_TRIGGER = 4000  # force light GC after lock if inactive exceeds this
+# Protect landing / eligibility content keys for this many *locks* after credit
+CREDIT_PROTECT_LOCKS = 12
+CREDIT_PROTECT_MIN_VALENCE = 0.35  # also protect high-valence place/packing/act poles
 GRAVITY_INTERVAL = 30  # ~1.0 s/row at 30 FPS with cmd every frame
 # Top-out: half second for Innerface queue (was 1.0 s)
 RESTART_DELAY_FRAMES = max(12, FPS // 2)
@@ -381,39 +386,167 @@ def _trim_inactive_archives(inner, *, max_inactive_sets: int = 64) -> int:
     return dropped
 
 
+# Content-key fragments that carry packing / placement credit (keep mid-game).
+_POLICY_PACKING_FRAGMENTS = (
+    ":place",
+    "holes_",
+    "well_",
+    "pred_",
+    "holes_freed",
+    "holes_fill",
+    "last_d_holes",
+)
+
+
+def _ensure_credit_protect(s: Symbioid) -> dict[str, int]:
+    """content_key → locks remaining before GC may treat as unprotected."""
+    m = getattr(s, "_credit_protect_ttl", None)
+    if not isinstance(m, dict):
+        m = {}
+        s._credit_protect_ttl = m  # type: ignore[attr-defined]
+    return m
+
+
+def note_credit_protect(
+    s: Symbioid,
+    keys: Iterable[str],
+    *,
+    locks: int = CREDIT_PROTECT_LOCKS,
+) -> int:
+    """
+    Protect landing / eligibility content keys for ``locks`` subsequent locks.
+
+    Does not change ``admits_mint``. Used so mid-game hard-cap / forget skip
+    recently credited poles (v0.0.63).
+    """
+    if locks <= 0:
+        return 0
+    ttl = _ensure_credit_protect(s)
+    n = 0
+    for ck in keys:
+        cks = str(ck).strip()
+        if not cks:
+            continue
+        prev = int(ttl.get(cks, 0) or 0)
+        ttl[cks] = max(prev, int(locks))
+        n += 1
+    return n
+
+
+def tick_credit_protect(s: Symbioid) -> int:
+    """Age credit TTL by one lock. Returns keys expired this tick."""
+    ttl = getattr(s, "_credit_protect_ttl", None)
+    if not isinstance(ttl, dict) or not ttl:
+        return 0
+    expired = 0
+    dead: list[str] = []
+    for ck, left in list(ttl.items()):
+        n = int(left) - 1
+        if n <= 0:
+            dead.append(ck)
+            expired += 1
+        else:
+            ttl[ck] = n
+    for ck in dead:
+        ttl.pop(ck, None)
+    return expired
+
+
+def policy_packing_protect_ids(
+    s: Symbioid,
+    *,
+    min_valence: float = CREDIT_PROTECT_MIN_VALENCE,
+) -> set[str]:
+    """
+    Thought ids to keep during soft/hard GC: credit TTL + act: + high-valence
+    packing/place poles still on Mind registries.
+    """
+    protect: set[str] = set()
+    mind = s.mind
+    ttl = getattr(s, "_credit_protect_ttl", None) or {}
+    with mind._lock:
+        for ck, left in list(ttl.items()):
+            if int(left) <= 0:
+                continue
+            obs = mind._observations.get(ck)
+            if obs is None:
+                obs = mind._actions.get(ck)
+            if obs is not None:
+                protect.add(obs.id)
+        for ck, th in mind._actions.items():
+            if th is not None:
+                protect.add(th.id)
+        for ck, th in mind._observations.items():
+            if th is None:
+                continue
+            cks = str(ck)
+            if cks.startswith("act:"):
+                protect.add(th.id)
+                continue
+            v = float(mind._valence.get(ck, 0.0) or 0.0)
+            if v < float(min_valence):
+                continue
+            if any(f in cks for f in _POLICY_PACKING_FRAGMENTS):
+                protect.add(th.id)
+    return protect
+
+
 def game_boundary_gc(
     s: Symbioid,
     *,
+    tier: str = "full",
     max_forget_passes: int = 16,
     hard_cap: int = 11000,
     max_inactive_archives: int = 64,
 ) -> dict[str, int]:
     """
-    Multi-game survival GC (v0.0.57+): unprotect cell-map registry, prune scaffolds,
-    cold-forget, trim inactive archives, then hard-cap host graph if still above
-    ``hard_cap``.
+    Multi-game survival GC (v0.0.57+; two-tier v0.0.63).
 
-    Call on top-out / between headless games **and mid-game** (GUI + headless).
-    Mid-game is required for long high-score single games (~15k+): end-of-game
-    clear never runs until top-out, so Inactive can only climb during play.
+    **tier=\"full\"** (game boundary / top-out / R restart):
+      purge_ephemeral cell+packing registry, prune, cold-forget, hard-cap.
 
-    Returns removal stats.
+    **tier=\"light\"** (mid-game only):
+      prune scaffolds + cold junk + hard-cap **without** full purge_ephemeral,
+      so act: / high-valence packing / :place registry keys stay for credit.
+      Hard-cap also skips credit-TTL + policy packing poles.
+
+    Pulse/placement throttles stay in module constants (skill/CPU: loosen GC first).
     """
+    use_full = str(tier).lower() != "light"
     with s.graph_lock:
         before = len(s.thoughts)
     mind = s.mind
     old_need = int(getattr(mind, "forget_cold_cycles", 64) or 64)
     old_max = int(getattr(mind, "forget_max_per_pass", 64) or 64)
-    mind.forget_cold_cycles = 4
-    mind.forget_max_per_pass = max(old_max, 4096)
+    # Light: milder forget so recently hot packing poles are less likely culled
+    mind.forget_cold_cycles = 4 if use_full else 12
+    mind.forget_max_per_pass = max(old_max, 4096 if use_full else 1024)
     purged = 0
     pruned = 0
     forgotten = 0
     hard = 0
     archives = 0
+    extra_ids = policy_packing_protect_ids(s)
+    old_extra = getattr(s, "_gc_extra_protect_ids", None)
+    s._gc_extra_protect_ids = extra_ids  # type: ignore[attr-defined]
     try:
         if hasattr(mind, "purge_ephemeral_registry"):
-            purged = int(mind.purge_ephemeral_registry() or 0)
+            protect_ck = set(_ensure_credit_protect(s).keys())
+            if use_full:
+                # Boundary: full cell+packing purge, but honor credit-TTL keys
+                purged = int(
+                    mind.purge_ephemeral_registry(protect_keys=protect_ck) or 0
+                )
+            else:
+                # Mid-game soft: only low-valence cell_r keys; keep :place / packing
+                purged = int(
+                    mind.purge_ephemeral_registry(
+                        drop_substrings=("cell_r",),
+                        min_keep_valence=float(CREDIT_PROTECT_MIN_VALENCE),
+                        protect_keys=protect_ck,
+                    )
+                    or 0
+                )
         if hasattr(s.innerface, "prune_inactive_thoughts"):
             pruned = int(s.innerface.prune_inactive_thoughts() or 0)
         for _ in range(max(1, int(max_forget_passes))):
@@ -423,16 +556,14 @@ def game_boundary_gc(
                 break
         if hasattr(s.innerface, "prune_inactive_thoughts"):
             pruned += int(s.innerface.prune_inactive_thoughts() or 0)
-        # After poles are freed, drop excess inactive six-set archives (metadata)
         archives = int(_trim_inactive_archives(
             s.innerface, max_inactive_sets=int(max_inactive_archives)
         ) or 0)
-        # Hard cap: remove oldest cold unprotected Thoughts
         with s.graph_lock:
             n_now = len(s.thoughts)
         if n_now > int(hard_cap):
             protected = s.innerface._protected_thought_ids()
-            # Always keep actions / twin-ish ids
+            protected |= extra_ids
             with mind._lock:
                 for t in mind._actions.values():
                     if t is not None:
@@ -444,7 +575,7 @@ def game_boundary_gc(
                         continue
                     last = int(getattr(th, "last_hot_cycle", -1) or -1)
                     victims.append((last, tid))
-                victims.sort(key=lambda x: x[0])  # oldest hot first (-1 first)
+                victims.sort(key=lambda x: x[0])
                 need = n_now - int(hard_cap)
                 for _, tid in victims[: max(0, need)]:
                     if s._remove_thought_unlocked(tid) is not None:
@@ -452,6 +583,13 @@ def game_boundary_gc(
     finally:
         mind.forget_cold_cycles = old_need
         mind.forget_max_per_pass = old_max
+        if old_extra is None:
+            try:
+                delattr(s, "_gc_extra_protect_ids")
+            except AttributeError:
+                s._gc_extra_protect_ids = None  # type: ignore[attr-defined]
+        else:
+            s._gc_extra_protect_ids = old_extra  # type: ignore[attr-defined]
     with s.graph_lock:
         after = len(s.thoughts)
     return {
@@ -463,6 +601,8 @@ def game_boundary_gc(
         "archives_trimmed": archives,
         "hard_cap": hard,
         "removed": max(0, before - after),
+        "tier": 1 if use_full else 0,
+        "tier_name": "full" if use_full else "light",
     }
 
 
@@ -474,27 +614,23 @@ def maybe_mid_game_gc(
     force: bool = False,
 ) -> dict[str, int] | None:
     """
-    Mid-game GC for long single games (v0.0.61).
+    Mid-game **light** GC (v0.0.63): prune + forget + hard-cap, no full purge.
 
-    Runs when:
-    - ``force`` (e.g. inactive plot above trigger after a lock), or
-    - every ``MID_GAME_GC_EVERY`` frames while playing.
-
-    Uses a tighter hard_cap than end-of-game so ~15k-score marathons cannot
-    pin the host at 11k+ Thoughts for thousands of frames.
+    Full purge_ephemeral runs only via ``game_boundary_gc(tier=\"full\")`` at
+    top-out / restart. Keeps packing/place learning surface mid-game.
     """
     if not force:
         if MID_GAME_GC_EVERY <= 0 or frame <= 0 or frame % MID_GAME_GC_EVERY != 0:
             return None
     if inactive_count is not None and not force:
-        # Optional early exit if graph is still small
         if inactive_count < (MID_GAME_INACTIVE_TRIGGER // 2) and thought_count(s) < (
             MID_GAME_HARD_CAP // 2
         ):
             return None
     return game_boundary_gc(
         s,
-        max_forget_passes=4,
+        tier="light",
+        max_forget_passes=3,
         hard_cap=MID_GAME_HARD_CAP,
         max_inactive_archives=48,
     )
@@ -1023,6 +1159,9 @@ def apply_lock_credit(
     Callers that already ``window.push`` each cmd tick should leave
     ``push_poles=False`` (default) to avoid duplicate last-frame entries.
     Clears the window after apply so the next piece starts fresh.
+
+    v0.0.63: ages credit-protect TTL then re-protects landing/eligibility keys
+    for ``CREDIT_PROTECT_LOCKS`` locks so light mid-game GC does not wipe them.
     """
     stats: dict[str, Any] = {
         "landing": 0,
@@ -1034,7 +1173,11 @@ def apply_lock_credit(
         "grudge_keys": [],
         "forgiven": 0,
         "round": "",
+        "credit_protect": 0,
+        "credit_protect_expired": 0,
     }
+    # Age previous lock's protect set before applying this lock's credit
+    stats["credit_protect_expired"] = tick_credit_protect(s)
     reward = float(getattr(coach, "last_reward", 0.0) or 0.0)
     topped = bool(getattr(coach, "last_topped_out", False))
     if topped:
@@ -1069,6 +1212,13 @@ def apply_lock_credit(
     else:
         stats["eligibility"] = 0
     stats["place_leak"] = leak_place_valence(s, rate=place_leak)
+    # Protect just-credited keys for N locks (before window clear)
+    protect_keys: set[str] = set(grudge)
+    protect_keys.update(window.credited_keys().keys())
+    if not topped and protect_keys:
+        stats["credit_protect"] = note_credit_protect(
+            s, protect_keys, locks=CREDIT_PROTECT_LOCKS
+        )
     window.clear()
     # v0.0.53 iterated twin: C/D round labels + forgiveness
     if topped:

@@ -718,6 +718,10 @@ class Innerface(SpikingEngine):
             mind = getattr(host, "mind", None)
             if mind is not None:
                 protected.update(mind.registered_observation_ids())
+            # Demo / host-level GC extras (e.g. credit-protect Thought ids)
+            extra = getattr(host, "_gc_extra_protect_ids", None)
+            if extra:
+                protected.update(extra)
 
         with self._local_lock:
             # All thoughts still in an *active* six-set

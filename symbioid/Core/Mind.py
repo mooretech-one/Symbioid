@@ -597,22 +597,33 @@ class Mind(System):
         *,
         keep_prefixes: tuple[str, ...] = ("act:",),
         drop_substrings: tuple[str, ...] = ("cell_r", ":place", "holes_", "well_", "pred_"),
+        min_keep_valence: float | None = None,
+        protect_keys: set[str] | frozenset[str] | None = None,
     ) -> int:
         """
         Drop cell-map / packing Observation registry entries so host GC can remove poles.
 
         Keeps Action policy keys (``act:``) and any key not matching drop_substrings.
+        Optional ``min_keep_valence``: skip keys with valence ≥ threshold (soft mid-game).
+        Optional ``protect_keys``: never drop these content keys (credit TTL).
         Returns number of content keys unregistered (Thoughts may still be on host
         until prune/forget).
         """
         dropped = 0
+        protect = protect_keys or set()
         with self._lock:
             for ck in list(self._observations.keys()):
                 cks = str(ck)
+                if cks in protect or ck in protect:
+                    continue
                 if any(cks.startswith(p) for p in keep_prefixes):
                     continue
                 if not any(s in cks for s in drop_substrings):
                     continue
+                if min_keep_valence is not None:
+                    v = float(self._valence.get(ck, 0.0) or 0.0)
+                    if v >= float(min_keep_valence):
+                        continue
                 obs = self._observations.pop(ck, None)
                 self._valence.pop(ck, None)
                 if obs is not None:
@@ -626,11 +637,18 @@ class Mind(System):
             # Drop synthetic place valence without Observation pole
             for ck in list(self._valence.keys()):
                 cks = str(ck)
+                if cks in protect or ck in protect:
+                    continue
                 if cks in self._observations or cks in self._actions:
                     continue
-                if any(s in cks for s in drop_substrings):
-                    self._valence.pop(ck, None)
-                    dropped += 1
+                if not any(s in cks for s in drop_substrings):
+                    continue
+                if min_keep_valence is not None:
+                    v = float(self._valence.get(ck, 0.0) or 0.0)
+                    if v >= float(min_keep_valence):
+                        continue
+                self._valence.pop(ck, None)
+                dropped += 1
         return dropped
 
     def __post_init__(self) -> None:
